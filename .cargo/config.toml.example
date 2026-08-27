@@ -1,0 +1,18 @@
+# Local build overrides. Copy to `.cargo/config.toml`, which is gitignored.
+#
+# compressr depends on `boostr = { path = "../boostr" }`, and local boostr uses
+# numr APIs that the published numr does not have. Without this patch cargo
+# resolves numr from crates.io and boostr fails to compile with a wall of
+# "no `var_embedding_lookup` in `autograd`" errors that look like boostr's fault.
+# `.cargo/config.toml` applies to the directory cargo is INVOKED from, so
+# boostr's own copy does not cover a build started here.
+[patch.crates-io]
+numr = { path = "../numr" }
+splintr = { path = "../splintr" }
+regexr = { path = "../regexr" }
+nexar = { path = "../nexar/nexar" }
+
+# Model fixtures live outside the repo; tests skip when this is unset.
+# Point it at your own checkpoint directory.
+[env]
+BOOSTR_MODELS_DIR = "/path/to/models"

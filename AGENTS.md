@@ -1,0 +1,131 @@
+# compressr - Model Conversion & Compression
+
+## Project Overview
+
+compressr converts LLM checkpoints between SafeTensors and GGUF, casts their element type, and quantizes them into GGUF block formats. It is a thin CLI/API layer: all quantization kernels live in boostr.
+
+**Core Philosophy:**
+
+- **Unified Pipeline**: Single entry point for all conversion needs (no switching between llama.cpp scripts, AutoGPTQ Python modules, exllamav2 converters)
+- **Performance First**: Pure Rust for bare-metal performance, no Python runtime in the conversion path
+- **Minimal Footprint**: One tensor is read, converted and written at a time, so peak memory is bounded by the largest tensor plus its converted copy, not by the model size
+- **Hardware Acceleration**: Direct boostr integration for GPU-accelerated quantization
+
+## Implemented vs Roadmap
+
+This section is the SINGLE source of truth on what works. Everything below assumes it. NEVER describe a roadmap item as working, in code comments, docs, or replies.
+
+**Implemented and tested:**
+
+| Capability         | Detail                                                     |
+| :----------------- | :--------------------------------------------------------- |
+| SafeTensors input  | Single file, or sharded via `model.safetensors.index.json` |
+| GGUF input         | Read back for re-conversion                                |
+| SafeTensors output | Sharded at `--max-shard-size`, with a matching index       |
+| GGUF output        | GGUF v3, one self-contained file                           |
+| dtype cast         | F32, F16, BF16, round-to-nearest-even                      |
+| GGUF quantization  | Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K                         |
+| Sidecar copying    | Tokenizer and config files follow the weights              |
+
+**Roadmap. Each has an enum variant and each is REFUSED before any output file is created:**
+
+| Capability          | What is missing                                                         |
+| :------------------ | :---------------------------------------------------------------------- |
+| GPTQ, AWQ           | Calibration, plus the `qweight`/`scales`/`qzeros`/`g_idx` tensor layout |
+| NF4, FP8            | An on-disk home for the side-band scales the packed payload omits       |
+| EXL2                | The whole format driver                                                 |
+| PyTorch, ONNX input | `.bin` / `.pt` / `.onnx` readers                                        |
+| Python API          | The PyO3 module exports `__version__` only                              |
+| Triple-buffered I/O | A prefetch/compute/write pipeline; reads and writes are serial today    |
+| Parallel shard I/O  | Reads are sequential; there is no rayon in the dependency tree          |
+
+The `optimize` subcommand parses its flags but every method it accepts is a roadmap item, so it always errors.
+
+Quantization writes GGUF ONLY. A SafeTensors header records an element type and a shape, which cannot describe a block-quantized tensor.
+
+## Build Commands
+
+```bash
+cd compressr
+cargo build --release                            # CPU-only build
+cargo build --release --features cuda            # With CUDA support
+cargo test                                       # Run tests
+cargo test --features cuda                       # CUDA tests
+
+# CLI usage
+compressr convert ./llama-3-8b --format gguf --quantization q4_k_m
+compressr convert ./llama-3-8b --format safetensors --dtype bf16
+compressr info ./llama-3-8b --verbose
+```
+
+`.cargo/config.toml` is gitignored but REQUIRED to build: it patches numr, splintr, regexr and nexar to their monorepo paths. Copy `.cargo/config.toml.example` to `.cargo/config.toml` on a fresh checkout. Without it cargo resolves numr from crates.io and boostr fails to compile.
+
+## Architecture
+
+### Core Components
+
+- `src/loader/` - Format detection and reading; headers up front, then one tensor per call (NOT memory-mapped)
+- `src/policy/` - Per-tensor plan: quantize, fall back to F32, or pass through
+- `src/quantization/` - Config types and dispatch into boostr's kernels
+- `src/cast/` - Element-type conversion, round-to-nearest-even
+- `src/formats/` - GGUF and SafeTensors writers, sharding, sidecar copying
+- `src/python/` - PyO3 bindings
+
+### Invariants
+
+- The per-tensor plan is computed ONCE and read by both the registration loop and the write loop. If they disagreed by one tensor, every later offset in the file would be wrong with no error raised.
+- GGUF stores dimensions REVERSED, so the row length `ne[0]` is the LAST dimension of a standard-order shape. A rank-1 tensor or a row that is not a whole number of blocks is stored as F32, as llama.cpp does.
+- `ConversionConfig::validate` rejects every unwritable configuration BEFORE a file is opened. A mismatch caught by the writer instead aborts mid-loop and leaves a truncated file.
+- SafeTensors headers are padded with spaces to a multiple of 8 bytes, so the data block starts 8-byte aligned and a reader can map an F32 tensor in place.
+- The loader COPIES tensor bytes out of the file. NEVER describe it as zero-copy or memory-mapped.
+
+### Streaming
+
+Tensors are processed one at a time: read, quantize or cast, write, drop both buffers. Peak resident memory is roughly the largest tensor plus its converted copy — bounded by the widest layer, not constant, and not proportional to the model size.
+
+## Feature Flags
+
+- `cuda` - Enable CUDA GPU acceleration
+- `python` - Build Python bindings via PyO3
+
+## Architecture Philosophy: Thin Layer on boostr
+
+**CRITICAL**: compressr is a thin, user-friendly CLI/API layer. **ALL quantization kernels and algorithms live in boostr**.
+
+### Development Rule
+
+If you're implementing a quantization feature, ask:
+
+- "Is this a kernel/algorithm?" → **boostr**
+- "Is this file I/O or CLI?" → **compressr**
+
+NEVER add a second copy of a block layout to compressr. A writer checked against a reader that sits beside it proves nothing: Q6_K once shipped with the wrong field order and compressr's own reader agreed with it while every real reader produced NaN. `tests/gguf_roundtrip.rs` decodes with boostr's reader kernels for exactly this reason.
+
+### Why This Matters
+
+1. **Reusability**: oxidizr and blazr can use boostr quantization directly
+2. **No vendor lock-in**: boostr's `Runtime` trait works for CPU, CUDA, ROCm, etc.
+3. **Single source of truth**: One optimized implementation for all tools
+4. **Focused optimization**: All kernel work happens in one place
+
+## Performance Targets
+
+Targets, not measurements. NEVER quote one as an achieved result.
+
+1. **Throughput**: 5x faster than AutoGPTQ
+2. **Peak RAM**: bounded by the largest tensor plus its converted copy, not by the model size
+3. **Perplexity**: Zero degradation vs reference implementations
+
+## Testing
+
+```bash
+cargo test                    # Rust unit and integration tests
+cargo test --features cuda    # CUDA-accelerated tests
+```
+
+## Integration with Ecosystem
+
+- **Input**: Models trained with oxidizr or HuggingFace
+- **Output**: GGUF for blazr or llama.cpp; SafeTensors checkpoints for HuggingFace loaders
+- **Compute**: boostr's multi-backend GPU acceleration
+- **Tokenization**: Compatible with splintr vocabularies

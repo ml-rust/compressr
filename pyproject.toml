@@ -1,0 +1,35 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "compressr"
+version = "0.1.0"
+description = "High-performance model conversion and compression suite"
+authors = [{name = "Farhan Syah"}]
+license = {text = "Apache-2.0"}
+readme = "README.md"
+requires-python = ">=3.8"
+keywords = ["llm", "quantization", "compression", "gguf", "gptq"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/ml-rust/compressr"
+Repository = "https://github.com/ml-rust/compressr"
+
+[tool.maturin]
+features = ["python"]
+module-name = "compressr"

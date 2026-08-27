@@ -1,0 +1,74 @@
+[package]
+name = "compressr"
+version = "0.1.0"
+edition = "2021"
+authors = ["Farhan Syah"]
+description = "High-performance model conversion and compression suite for LLMs"
+license = "Apache-2.0"
+repository = "https://github.com/ml-rust/compressr"
+homepage = "https://github.com/ml-rust/compressr"
+readme = "README.md"
+keywords = ["llm", "quantization", "compression", "gguf", "gptq"]
+categories = ["command-line-utilities", "compression", "science"]
+exclude = [
+    "tmp/",
+    "research/",
+    "benchmarks/",
+    ".github/",
+]
+
+[lib]
+name = "compressr"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# CUDA GPU acceleration (via boostr)
+cuda = ["boostr/cuda"]
+# Python bindings via PyO3
+python = ["dep:pyo3"]
+
+[dependencies]
+# boostr: ML framework providing ALL quantization kernels and algorithms
+# compressr is just a thin user-friendly layer - all heavy lifting happens in boostr
+# This includes: GPTQ Hessian computation, AWQ scale search, NF4 codebook generation,
+# FP8 conversion, cross-layer equalization, etc.
+# Both CPU and GPU implementations live in boostr
+boostr = { path = "../boostr" }
+
+# JSON: config.json sidecars and the SafeTensors shard index
+serde_json = "1.0"
+
+# Error handling
+anyhow = "1.0"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Half-precision float types, for dtype casts and side-band scales
+half = "2.7"
+
+# Python bindings (optional)
+pyo3 = { version = "0.23", features = ["extension-module"], optional = true }
+
+[dev-dependencies]
+# boostr is a normal dependency, but integration tests are separate crates and
+# need it declared here to call its dequant kernels as an independent reader.
+boostr = { path = "../boostr" }
+half = "2.7"
+tempfile = "3.23"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+
+[[bin]]
+name = "compressr"
+path = "src/main.rs"
+required-features = []
