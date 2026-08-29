@@ -11,6 +11,11 @@
 //! - GGUF v3 out, one self-contained file
 //! - Element-type casts between F32, F16 and BF16, round-to-nearest-even
 //! - GGUF block quantization: Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K
+//! - TCF v1 out, quantized once from the full-precision source
+//!
+//! TCF is produced from a full-precision checkpoint only. Converting a GGUF
+//! into one would quantize already-quantized weights a second time, so that
+//! path does not exist.
 //!
 //! GPTQ, AWQ, NF4, FP8 and EXL2 are NOT implemented. Each has a
 //! [`QuantizationMethod`] or [`OutputFormat`] variant, and each is refused
@@ -67,13 +72,14 @@ pub mod python;
 
 pub use cast::{cast_bytes, parse_target_dtype, torch_dtype_name, ACCEPTED_DTYPE_NAMES};
 pub use formats::{
-    parse_shard_size, FormatWriter, GgufBatchWriter, GgufFormatWriter, SafeTensorsFormatWriter,
-    StreamingGgufWriter, DEFAULT_MAX_SHARD_SIZE,
+    parse_shard_size, parse_tcf_encoding, FormatWriter, GgufBatchWriter, GgufFormatWriter,
+    SafeTensorsFormatWriter, StreamingGgufWriter, TcfFormatWriter, TcfOptions,
+    DEFAULT_MAX_SHARD_SIZE, TCF_ENCODING_NAMES,
 };
 pub use loader::{
     LayerGroup, LoadedModel, ModelLoader, ModelMetadata, UnifiedDType, UnifiedTensorInfo,
 };
-pub use policy::{plan_tensor, FallbackReason, PlanCounts, TensorPlan};
+pub use policy::{plan_tcf_tensor, plan_tensor, FallbackReason, PlanCounts, TcfPlan, TensorPlan};
 pub use quantization::{
     QuantType, QuantizationConfig, QuantizationMethod, QuantizedTensor, Quantizer,
 };
@@ -112,6 +118,8 @@ pub enum OutputFormat {
     Fp8,
     /// Hugging Face Safetensors
     Safetensors,
+    /// Tensor Contract Format v1
+    Tcf,
 }
 
 impl OutputFormat {
@@ -124,6 +132,7 @@ impl OutputFormat {
             OutputFormat::Exl2 => "safetensors",
             OutputFormat::Fp8 => "safetensors",
             OutputFormat::Safetensors => "safetensors",
+            OutputFormat::Tcf => "tcf",
         }
     }
 }
@@ -159,6 +168,12 @@ pub struct ConversionConfig {
     /// Overrides the `model_type` of the checkpoint's `config.json` and any
     /// architecture the input itself carried. GGUF only.
     pub arch: Option<String>,
+    /// TCF encoding, and the encoding its module declares as preferred
+    ///
+    /// Required by [`OutputFormat::Tcf`] and rejected by every other format.
+    /// Neither value has a source of truth in a checkpoint, so compressr asks
+    /// for both rather than defaulting them.
+    pub tcf: Option<TcfOptions>,
     /// Verbose logging
     pub verbose: bool,
 }
@@ -175,8 +190,15 @@ impl ConversionConfig {
             target_dtype: None,
             max_shard_size: Some(DEFAULT_MAX_SHARD_SIZE),
             arch: None,
+            tcf: None,
             verbose: false,
         }
+    }
+
+    /// Set the TCF encoding and the encoding its module prefers
+    pub fn with_tcf(mut self, options: TcfOptions) -> Self {
+        self.tcf = Some(options);
+        self
     }
 
     /// Set the architecture written to GGUF's `general.architecture`
@@ -260,6 +282,34 @@ impl ConversionConfig {
                 );
             }
         }
+        if self.output_format == OutputFormat::Tcf {
+            // A TCF module record ranks the encodings its producer prefers,
+            // and TCF requires a `fallback_reason` on every tensor whose
+            // encoding differs from the top-ranked one. Nothing in a
+            // checkpoint names that preference, and compressr does I/O and
+            // CLI rather than algorithm policy, so it is asked for.
+            if self.tcf.is_none() {
+                bail!(
+                    "--format tcf needs --tcf-encoding and --tcf-preferred-encoding. \
+                     Neither has a default: the encoding fixes the stored weights, and the \
+                     preferred encoding decides which tensors record a fallback reason. \
+                     Accepted: {}",
+                    TCF_ENCODING_NAMES.join(", ")
+                );
+            }
+            if self.target_dtype.is_some() {
+                bail!(
+                    "--dtype and --format tcf are mutually exclusive: TCF records an \
+                     encoding per tensor, set by --tcf-encoding, so a cast target has no \
+                     meaning beside it."
+                );
+            }
+        } else if self.tcf.is_some() {
+            bail!(
+                "--tcf-encoding applies to --format tcf only, but --format is {:?}.",
+                self.output_format
+            );
+        }
         if let Some(dtype) = self.target_dtype {
             if !matches!(
                 dtype,
@@ -298,7 +348,7 @@ pub struct OutputLayout {
 
 /// Resolve `output_path` into a weights file plus a sidecar directory.
 ///
-/// GGUF is a single self-describing file and carries no sidecars. Every
+/// GGUF and TCF are each a single self-describing file and carry no sidecars. Every
 /// SafeTensors-based format is a *checkpoint directory*: a bare weights file
 /// with no tokenizer beside it is not loadable. So an output path that does not
 /// already name a `.safetensors` file is treated as the checkpoint directory,
@@ -306,7 +356,8 @@ pub struct OutputLayout {
 pub fn resolve_output_layout(output_path: &str, output_format: OutputFormat) -> OutputLayout {
     let path = PathBuf::from(output_path);
 
-    if output_format == OutputFormat::Gguf {
+    // GGUF and TCF are each one self-contained file and carry no sidecars.
+    if matches!(output_format, OutputFormat::Gguf | OutputFormat::Tcf) {
         return OutputLayout {
             weights_path: path,
             sidecar_dir: None,
@@ -421,6 +472,19 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
         .load()
         .with_context(|| format!("Failed to load model from: {}", config.input_path))?;
 
+    // TCF is quantized once, from full-precision weights. A GGUF input is
+    // already quantized, so writing TCF from one would quantize twice and
+    // would need a GGML dequantizer per block format. Refused here, before
+    // any output file exists.
+    if config.output_format == OutputFormat::Tcf && model.format() == InputFormat::Gguf {
+        bail!(
+            "TCF is produced from a full-precision checkpoint, and '{}' is GGUF. Convert \
+             from the SafeTensors source instead: quantizing an already-quantized tensor \
+             loses accuracy twice.",
+            config.input_path
+        );
+    }
+
     let tensor_count = model.tensor_count();
     let input_size = model.total_size_bytes();
 
@@ -527,6 +591,31 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
         }
 
         writer = Box::new(gguf_writer);
+    }
+
+    if config.output_format == OutputFormat::Tcf {
+        // TCF quantizes from the full-precision source itself, so the writer
+        // needs the input path as well as the encoding: its payload pass
+        // re-reads one tensor at a time instead of holding every payload.
+        let options = config
+            .tcf
+            .context("Internal error: --format tcf reached convert with no encoding")?;
+        let mut tcf_writer = TcfFormatWriter::new()
+            .with_options(options)
+            .with_source(&config.input_path);
+        if let Some(name) = policy::model_name(Path::new(&config.input_path)) {
+            tcf_writer = tcf_writer.with_module_name(&name);
+        }
+        log::info!(
+            "TCF encoding: {:?}, module preferred encoding: {:?}",
+            options.encoding,
+            options.preferred_encoding
+        );
+        log::info!(
+            "TCF calibration_id, activation_contract_id and workload_profile_id are left \
+             unset: compressr runs no calibration and measures no workload."
+        );
+        writer = Box::new(tcf_writer);
     }
 
     // Collect tensor info for registration (need to collect because we iterate twice)
@@ -637,6 +726,20 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
     writer
         .finalize()
         .with_context(|| "Failed to finalize output file")?;
+
+    // The loop above counted the SOURCE bytes it planned each TCF tensor
+    // from; the payload the writer produced from them is a different size, so
+    // the finished file is the only honest answer.
+    if config.output_format == OutputFormat::Tcf {
+        output_size = std::fs::metadata(&layout.weights_path)
+            .with_context(|| {
+                format!(
+                    "Failed to measure the output file: {}",
+                    layout.weights_path.display()
+                )
+            })?
+            .len();
+    }
 
     // Step 7: Copy the sidecars that make the output a loadable checkpoint
     if let Some(ref sidecar_dir) = layout.sidecar_dir {
@@ -767,6 +870,62 @@ mod tests {
         assert_eq!(OutputFormat::Gguf.extension(), "gguf");
         assert_eq!(OutputFormat::Safetensors.extension(), "safetensors");
         assert_eq!(OutputFormat::Gptq.extension(), "safetensors");
+        assert_eq!(OutputFormat::Tcf.extension(), "tcf");
+    }
+
+    fn tcf_options() -> TcfOptions {
+        TcfOptions {
+            encoding: tcf_core::NativeEncoding::Q4S32T64,
+            preferred_encoding: tcf_core::NativeEncoding::Q4S32T64,
+        }
+    }
+
+    /// The module's preferred encoding decides which tensors record a
+    /// fallback reason, and no checkpoint carries it. Guessing one would put
+    /// a policy compressr never made into the file, so the configuration is
+    /// refused BEFORE any file is opened.
+    #[test]
+    fn test_tcf_without_an_encoding_is_refused_before_any_file_is_opened() {
+        let config = ConversionConfig::new("input/".into(), "out.tcf".into(), OutputFormat::Tcf);
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("--tcf-preferred-encoding"), "{err}");
+        assert!(err.contains("q4s32t64"), "{err}");
+        assert!(!Path::new("out.tcf").exists());
+    }
+
+    #[test]
+    fn test_tcf_with_both_encodings_validates() {
+        let config = ConversionConfig::new("input/".into(), "out.tcf".into(), OutputFormat::Tcf)
+            .with_tcf(tcf_options());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_tcf_encoding_is_refused_for_another_format() {
+        let config = ConversionConfig::new("input/".into(), "out.gguf".into(), OutputFormat::Gguf)
+            .with_tcf(tcf_options());
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("--format tcf only"), "{err}");
+    }
+
+    /// A cast target names one element type for every float tensor, which is
+    /// what --tcf-encoding already does for a TCF file.
+    #[test]
+    fn test_tcf_and_dtype_are_mutually_exclusive() {
+        let config = ConversionConfig::new("input/".into(), "out.tcf".into(), OutputFormat::Tcf)
+            .with_tcf(tcf_options())
+            .with_target_dtype(UnifiedDType::BF16);
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("mutually exclusive"), "{err}");
+    }
+
+    /// TCF is one self-contained file, as GGUF is: an output path names the
+    /// file, not a checkpoint directory.
+    #[test]
+    fn test_tcf_output_layout_is_a_single_file() {
+        let layout = resolve_output_layout("model.tcf", OutputFormat::Tcf);
+        assert_eq!(layout.weights_path, PathBuf::from("model.tcf"));
+        assert_eq!(layout.sidecar_dir, None);
     }
 
     #[test]

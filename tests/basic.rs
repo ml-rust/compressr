@@ -31,10 +31,11 @@ fn test_output_format_variants() {
         OutputFormat::Exl2,
         OutputFormat::Fp8,
         OutputFormat::Safetensors,
+        OutputFormat::Tcf,
     ];
 
     // Just verify they can be created
-    assert_eq!(formats.len(), 6);
+    assert_eq!(formats.len(), 7);
 }
 
 // ============================================================================

@@ -36,6 +36,11 @@ python = ["dep:pyo3"]
 # Both CPU and GPU implementations live in boostr
 boostr = { path = "../boostr" }
 
+# tcf-core: TCF v1 layout schema, quantizer and file writer.
+# compressr produces TCF; every bit position, tile order and plane order stays
+# in tcf-core, exactly as the GGUF block layouts stay in boostr.
+tcf-core = { path = "../hats/tcf/tcf-core" }
+
 # JSON: config.json sidecars and the SafeTensors shard index
 serde_json = "1.0"
 
@@ -61,6 +66,7 @@ pyo3 = { version = "0.23", features = ["extension-module"], optional = true }
 boostr = { path = "../boostr" }
 half = "2.7"
 tempfile = "3.23"
+tcf-core = { path = "../hats/tcf/tcf-core" }
 
 [profile.release]
 opt-level = 3

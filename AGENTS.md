@@ -23,6 +23,8 @@ This section is the SINGLE source of truth on what works. Everything below assum
 | GGUF input         | Read back for re-conversion                                |
 | SafeTensors output | Sharded at `--max-shard-size`, with a matching index       |
 | GGUF output        | GGUF v3, one self-contained file                           |
+| TCF output         | TCF v1, one self-contained file, written through tcf-core  |
+| TCF quantization   | Q4S32_T64, Q4AS32_T64, Q4AS64_T64, Q6S32_T64, Q8S32_T64    |
 | dtype cast         | F32, F16, BF16, round-to-nearest-even                      |
 | GGUF quantization  | Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K                         |
 | Sidecar copying    | Tokenizer and config files follow the weights              |
@@ -41,7 +43,9 @@ This section is the SINGLE source of truth on what works. Everything below assum
 
 The `optimize` subcommand parses its flags but every method it accepts is a roadmap item, so it always errors.
 
-Quantization writes GGUF ONLY. A SafeTensors header records an element type and a shape, which cannot describe a block-quantized tensor.
+SafeTensors output is NEVER quantized: its header records an element type and a shape, which cannot describe a block-quantized tensor. GGUF block quantization writes GGUF; `--tcf-encoding` writes TCF.
+
+TCF is produced from a full-precision source ONLY. NEVER add a GGUF-to-TCF path: it would quantize already-quantized weights a second time, and would need a GGML dequantizer per format.
 
 ## Build Commands
 
@@ -55,6 +59,7 @@ cargo test --features cuda                       # CUDA tests
 # CLI usage
 compressr convert ./llama-3-8b --format gguf --quantization q4_k_m
 compressr convert ./llama-3-8b --format safetensors --dtype bf16
+compressr convert ./llama-3-8b --format tcf --tcf-encoding q4s32t64 --tcf-preferred-encoding q4s32t64
 compressr info ./llama-3-8b --verbose
 ```
 
@@ -68,7 +73,7 @@ compressr info ./llama-3-8b --verbose
 - `src/policy/` - Per-tensor plan: quantize, fall back to F32, or pass through
 - `src/quantization/` - Config types and dispatch into boostr's kernels
 - `src/cast/` - Element-type conversion, round-to-nearest-even
-- `src/formats/` - GGUF and SafeTensors writers, sharding, sidecar copying
+- `src/formats/` - GGUF, SafeTensors and TCF writers, sharding, sidecar copying
 - `src/python/` - PyO3 bindings
 
 ### Invariants
@@ -99,7 +104,7 @@ If you're implementing a quantization feature, ask:
 - "Is this a kernel/algorithm?" → **boostr**
 - "Is this file I/O or CLI?" → **compressr**
 
-NEVER add a second copy of a block layout to compressr. A writer checked against a reader that sits beside it proves nothing: Q6_K once shipped with the wrong field order and compressr's own reader agreed with it while every real reader produced NaN. `tests/gguf_roundtrip.rs` decodes with boostr's reader kernels for exactly this reason.
+NEVER add a second copy of a block layout to compressr — GGUF blocks live in boostr, and TCF bit positions, tile order and plane order live in tcf-core. A writer checked against a reader that sits beside it proves nothing: Q6_K once shipped with the wrong field order and compressr's own reader agreed with it while every real reader produced NaN. `tests/gguf_roundtrip.rs` decodes with boostr's reader kernels for exactly this reason, and the TCF tests read back through `tcf-core`'s own reader.
 
 ### Why This Matters
 
@@ -126,6 +131,6 @@ cargo test --features cuda    # CUDA-accelerated tests
 ## Integration with Ecosystem
 
 - **Input**: Models trained with oxidizr or HuggingFace
-- **Output**: GGUF for blazr or llama.cpp; SafeTensors checkpoints for HuggingFace loaders
+- **Output**: GGUF for blazr or llama.cpp; SafeTensors checkpoints for HuggingFace loaders; TCF for boostr, which reads TCF and never writes it
 - **Compute**: boostr's multi-backend GPU acceleration
 - **Tokenization**: Compatible with splintr vocabularies

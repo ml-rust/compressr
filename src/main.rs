@@ -14,6 +14,10 @@
 //! # Cast an fp32 checkpoint to bf16, keeping it loadable
 //! compressr convert model/ --format safetensors --dtype bf16
 //!
+//! # Quantize a full-precision checkpoint into TCF v1
+//! compressr convert model/ --format tcf --tcf-encoding q4s32t64 \
+//!     --tcf-preferred-encoding q4s32t64
+//!
 //! # Shard the output at 2 GB instead of the 5 GB default
 //! compressr convert model/ --format safetensors --dtype bf16 --max-shard-size 2GB
 //!
@@ -27,7 +31,10 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use compressr::{ConversionConfig, OutputFormat, QuantizationConfig, QuantizationMethod};
+use compressr::{
+    parse_tcf_encoding, ConversionConfig, OutputFormat, QuantizationConfig, QuantizationMethod,
+    TcfOptions,
+};
 
 #[derive(Parser)]
 #[command(name = "compressr")]
@@ -46,7 +53,7 @@ enum Commands {
         #[arg(value_name = "INPUT")]
         input: String,
 
-        /// Output format (gguf, safetensors, awq, gptq, exl2, fp8)
+        /// Output format (gguf, safetensors, tcf, awq, gptq, exl2, fp8)
         #[arg(long, value_name = "FORMAT")]
         format: String,
 
@@ -75,6 +82,22 @@ enum Commands {
         /// index. Pass "none" to write one file however large. GGUF ignores it.
         #[arg(long, value_name = "SIZE", default_value = "5GB")]
         max_shard_size: String,
+
+        /// TCF encoding (q4s32t64, q4as32t64, q4as64t64, q6s32t64, q8s32t64)
+        ///
+        /// Required by --format tcf. Bit width alone does not name an
+        /// encoding: symmetry and group size are part of it, so this is a
+        /// separate flag from --quantization, which names GGUF block formats.
+        #[arg(long, value_name = "ENCODING")]
+        tcf_encoding: Option<String>,
+
+        /// Encoding the TCF module records as preferred
+        ///
+        /// Required by --format tcf. TCF records a fallback reason on every
+        /// tensor whose encoding differs from this one, and no checkpoint
+        /// carries the preference, so compressr never defaults it.
+        #[arg(long, value_name = "ENCODING")]
+        tcf_preferred_encoding: Option<String>,
 
         /// Architecture written to GGUF's general.architecture (e.g. llama, qwen2)
         ///
@@ -163,6 +186,8 @@ fn main() -> Result<()> {
             quantization,
             dtype,
             max_shard_size,
+            tcf_encoding,
+            tcf_preferred_encoding,
             arch,
             verbose,
         } => {
@@ -179,6 +204,8 @@ fn main() -> Result<()> {
                 .as_deref()
                 .map(parse_quantization)
                 .transpose()?;
+            let tcf_options =
+                parse_tcf_options(tcf_encoding.as_deref(), tcf_preferred_encoding.as_deref())?;
 
             let output_path = output.unwrap_or_else(|| {
                 default_output_path(
@@ -202,9 +229,18 @@ fn main() -> Result<()> {
             if let Some(arch) = arch {
                 config = config.with_arch(arch);
             }
+            if let Some(tcf_options) = tcf_options {
+                config = config.with_tcf(tcf_options);
+            }
 
             let stats = compressr::convert(config)?;
             println!("\n{}", stats);
+            if output_format == OutputFormat::Tcf {
+                println!(
+                    "TCF calibration_id, activation_contract_id and workload_profile_id are \
+                     unset: compressr runs no calibration and measures no workload."
+                );
+            }
         }
 
         Commands::Optimize {
@@ -330,7 +366,8 @@ fn default_output_path(
 ) -> String {
     let base = input.trim_end_matches('/');
 
-    if output_format == OutputFormat::Gguf {
+    // GGUF and TCF are each one self-contained file, named by its extension.
+    if matches!(output_format, OutputFormat::Gguf | OutputFormat::Tcf) {
         return format!("{}.{}", base, output_format.extension());
     }
 
@@ -350,9 +387,36 @@ fn parse_format(s: &str) -> Result<OutputFormat> {
         "exl2" => Ok(OutputFormat::Exl2),
         "fp8" => Ok(OutputFormat::Fp8),
         "safetensors" | "st" => Ok(OutputFormat::Safetensors),
+        "tcf" => Ok(OutputFormat::Tcf),
         _ => anyhow::bail!(
-            "Unsupported format: {}. Supported: gguf, safetensors, awq, gptq, exl2, fp8",
+            "Unsupported format: {}. Supported: gguf, safetensors, tcf, awq, gptq, exl2, fp8",
             s
+        ),
+    }
+}
+
+/// Parse the two TCF encoding flags, which are set together or not at all.
+///
+/// Returning `None` for neither leaves `ConversionConfig::validate` to refuse
+/// `--format tcf` by name, so one message covers the CLI and the library API.
+fn parse_tcf_options(
+    encoding: Option<&str>,
+    preferred: Option<&str>,
+) -> Result<Option<TcfOptions>> {
+    match (encoding, preferred) {
+        (None, None) => Ok(None),
+        (Some(encoding), Some(preferred)) => Ok(Some(TcfOptions {
+            encoding: parse_tcf_encoding(encoding)?,
+            preferred_encoding: parse_tcf_encoding(preferred)?,
+        })),
+        (Some(_), None) => anyhow::bail!(
+            "--tcf-encoding was given without --tcf-preferred-encoding. TCF records a \
+             fallback reason on every tensor whose encoding differs from its module's \
+             preferred one, so both are required."
+        ),
+        (None, Some(_)) => anyhow::bail!(
+            "--tcf-preferred-encoding was given without --tcf-encoding, so nothing names \
+             the encoding the weights are written in."
         ),
     }
 }
@@ -490,6 +554,79 @@ mod tests {
             Commands::Convert { arch, .. } => assert_eq!(arch.as_deref(), Some("voxcpm2")),
             _ => panic!("expected the convert subcommand"),
         }
+    }
+
+    #[test]
+    fn test_convert_parses_the_tcf_encoding_flags() {
+        let cli = Cli::try_parse_from([
+            "compressr",
+            "convert",
+            "model/",
+            "--format",
+            "tcf",
+            "--tcf-encoding",
+            "q4as64t64",
+            "--tcf-preferred-encoding",
+            "q6s32t64",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Convert {
+                tcf_encoding,
+                tcf_preferred_encoding,
+                ..
+            } => {
+                let options =
+                    parse_tcf_options(tcf_encoding.as_deref(), tcf_preferred_encoding.as_deref())
+                        .unwrap()
+                        .expect("both flags given");
+                assert_eq!(options.encoding, parse_tcf_encoding("q4as64t64").unwrap());
+                assert_eq!(
+                    options.preferred_encoding,
+                    parse_tcf_encoding("q6s32t64").unwrap()
+                );
+            }
+            _ => panic!("expected the convert subcommand"),
+        }
+    }
+
+    /// Bit width alone names no TCF encoding, so an unknown value is refused
+    /// with the accepted names rather than resolved to a near match.
+    #[test]
+    fn test_unknown_tcf_encoding_is_refused() {
+        let err = parse_tcf_options(Some("q4"), Some("q4s32t64"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Unsupported TCF encoding: q4"), "{err}");
+    }
+
+    #[test]
+    fn test_the_two_tcf_flags_are_set_together() {
+        assert!(parse_tcf_options(None, None).unwrap().is_none());
+        let err = parse_tcf_options(Some("q4s32t64"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--tcf-preferred-encoding"), "{err}");
+        let err = parse_tcf_options(None, Some("q4s32t64"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--tcf-encoding"), "{err}");
+    }
+
+    #[test]
+    fn test_default_output_path_tcf_is_a_file() {
+        assert_eq!(
+            default_output_path("llama-3-8b/", OutputFormat::Tcf, None, None),
+            "llama-3-8b.tcf"
+        );
+    }
+
+    #[test]
+    fn test_parse_format_accepts_tcf() {
+        assert_eq!(parse_format("tcf").unwrap(), OutputFormat::Tcf);
+        let err = parse_format("tcf2").unwrap_err().to_string();
+        assert!(err.contains("Supported: gguf, safetensors, tcf"), "{err}");
     }
 
     #[test]

@@ -42,6 +42,72 @@ pub enum FallbackReason {
     Rank,
     /// Row length (the last dimension) is not a multiple of the block size
     RowLength,
+    /// The source element type has no quantized form: token ids, masks
+    SourceDtype,
+    /// The source values contain a NaN or an infinity
+    ///
+    /// Only the quantizer can report this, so a tensor carrying it was
+    /// re-planned while the conversion loop ran. See [`TcfPlan`].
+    SourceNonfinite,
+    /// A group's scale is not representable at the requested geometry
+    ///
+    /// Value-dependent like [`FallbackReason::SourceNonfinite`], and decided
+    /// at the same point.
+    NumericRange,
+}
+
+/// The TCF `fallback_reason` a compressr reason maps to.
+///
+/// TCF requires a reason on every tensor whose encoding differs from its
+/// module's highest-ranked `preferred_encoding` (SPECIFICATION.md Section 8.6),
+/// so the mapping is total. The names differ because compressr's enum predates
+/// TCF and describes GGUF blocks.
+pub fn tcf_fallback_reason(reason: FallbackReason) -> tcf_core::FallbackReason {
+    match reason {
+        FallbackReason::Rank => tcf_core::FallbackReason::RankLt2,
+        FallbackReason::RowLength => tcf_core::FallbackReason::ShapeIncompatibleWithEncoding,
+        FallbackReason::SourceDtype => tcf_core::FallbackReason::UnsupportedEncoding,
+        FallbackReason::SourceNonfinite => tcf_core::FallbackReason::SourceNonfinite,
+        FallbackReason::NumericRange => tcf_core::FallbackReason::NumericRange,
+    }
+}
+
+/// What a TCF conversion does with one tensor, as far as its shape and its
+/// element type decide.
+///
+/// Two of the five [`FallbackReason`] values are invisible here:
+/// `SourceNonfinite` and `NumericRange` depend on the values themselves, which
+/// no shape check can see. The TCF writer applies this plan first and re-plans
+/// a tensor as [`TcfPlan::Raw`] if the quantizer then rejects its values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcfPlan {
+    /// Quantize into the requested native encoding
+    Quantize,
+    /// Store verbatim in a raw encoding, for this reason
+    Raw(FallbackReason),
+}
+
+/// Decide what a TCF conversion does with one tensor, from its shape alone.
+///
+/// `shape` is in standard order, so the row length is its LAST dimension.
+/// `tile` is the execution tile width of the requested encoding — the writer
+/// reads it from `tcf-core`, and no tile number is written here.
+///
+/// A native quantized TCF tensor MUST have rank 2 or more and a row length
+/// that is a whole number of tiles (SPECIFICATION.md Section 12). Anything
+/// else is stored raw rather than failing the conversion.
+pub fn plan_tcf_tensor(shape: &[usize], dtype: UnifiedDType, tile: u16) -> TcfPlan {
+    if !dtype.is_float() {
+        return TcfPlan::Raw(FallbackReason::SourceDtype);
+    }
+    if shape.len() < 2 {
+        return TcfPlan::Raw(FallbackReason::Rank);
+    }
+    let row_len = shape[shape.len() - 1];
+    if tile == 0 || !row_len.is_multiple_of(usize::from(tile)) {
+        return TcfPlan::Raw(FallbackReason::RowLength);
+    }
+    TcfPlan::Quantize
 }
 
 /// Decide what to do with one tensor.
@@ -80,6 +146,11 @@ pub struct PlanCounts {
     pub fallback_rank: usize,
     /// Float tensors stored as F32 because their row length is not block-aligned
     pub fallback_row_length: usize,
+    /// Tensors stored unquantized because of their element type or their values
+    ///
+    /// Only the TCF path reaches this: the GGUF path filters non-float tensors
+    /// into `passthrough` and its kernels never reject a value.
+    pub fallback_source: usize,
     /// Non-float tensors passed through untouched
     pub passthrough: usize,
 }
@@ -91,7 +162,22 @@ impl PlanCounts {
             TensorPlan::Quantize(_) => self.quantized += 1,
             TensorPlan::StoreF32(FallbackReason::Rank) => self.fallback_rank += 1,
             TensorPlan::StoreF32(FallbackReason::RowLength) => self.fallback_row_length += 1,
+            TensorPlan::StoreF32(FallbackReason::SourceDtype)
+            | TensorPlan::StoreF32(FallbackReason::SourceNonfinite)
+            | TensorPlan::StoreF32(FallbackReason::NumericRange) => self.fallback_source += 1,
             TensorPlan::StoreAsIs => self.passthrough += 1,
+        }
+    }
+
+    /// Record one TCF plan, once its value-dependent form is known.
+    pub fn record_tcf(&mut self, plan: TcfPlan) {
+        match plan {
+            TcfPlan::Quantize => self.quantized += 1,
+            TcfPlan::Raw(FallbackReason::Rank) => self.fallback_rank += 1,
+            TcfPlan::Raw(FallbackReason::RowLength) => self.fallback_row_length += 1,
+            TcfPlan::Raw(FallbackReason::SourceDtype)
+            | TcfPlan::Raw(FallbackReason::SourceNonfinite)
+            | TcfPlan::Raw(FallbackReason::NumericRange) => self.fallback_source += 1,
         }
     }
 }
@@ -100,12 +186,13 @@ impl std::fmt::Display for PlanCounts {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} tensors quantized, {} stored as F32 ({} rank < 2, {} row length not block-aligned), \
-             {} non-float passed through",
+            "{} tensors quantized, {} stored unquantized ({} rank < 2, {} row length not \
+             block-aligned, {} source dtype or values), {} non-float passed through",
             self.quantized,
-            self.fallback_rank + self.fallback_row_length,
+            self.fallback_rank + self.fallback_row_length + self.fallback_source,
             self.fallback_rank,
             self.fallback_row_length,
+            self.fallback_source,
             self.passthrough
         )
     }
@@ -275,10 +362,67 @@ mod tests {
                 quantized: 1,
                 fallback_rank: 1,
                 fallback_row_length: 1,
+                fallback_source: 0,
                 passthrough: 1,
             }
         );
         assert!(counts.to_string().contains("1 tensors quantized"));
+    }
+
+    /// A native quantized TCF tensor needs a row to tile along, so rank 1
+    /// falls back with the reason TCF spells `RANK_LT_2`.
+    #[test]
+    fn test_tcf_rank_1_tensor_is_raw() {
+        let plan = plan_tcf_tensor(&[64], UnifiedDType::F32, 64);
+        assert_eq!(plan, TcfPlan::Raw(FallbackReason::Rank));
+        assert_eq!(
+            tcf_fallback_reason(FallbackReason::Rank),
+            tcf_core::FallbackReason::RankLt2
+        );
+    }
+
+    /// The row length is the LAST dimension. 96 is not a whole number of
+    /// 64-element tiles, so the tensor cannot be packed at all.
+    #[test]
+    fn test_tcf_row_not_tile_aligned_is_raw() {
+        let plan = plan_tcf_tensor(&[1024, 96], UnifiedDType::BF16, 64);
+        assert_eq!(plan, TcfPlan::Raw(FallbackReason::RowLength));
+        assert_eq!(
+            tcf_fallback_reason(FallbackReason::RowLength),
+            tcf_core::FallbackReason::ShapeIncompatibleWithEncoding
+        );
+        // The leading dimension being tile-aligned decides nothing.
+        assert_eq!(
+            plan_tcf_tensor(&[64, 128], UnifiedDType::BF16, 64),
+            TcfPlan::Quantize
+        );
+    }
+
+    #[test]
+    fn test_tcf_non_float_tensor_is_raw() {
+        assert_eq!(
+            plan_tcf_tensor(&[8, 256], UnifiedDType::I32, 64),
+            TcfPlan::Raw(FallbackReason::SourceDtype)
+        );
+    }
+
+    /// Every reason maps to a TCF value: Section 8.6 makes the field
+    /// mandatory whenever the encoding differs from the module's preference.
+    #[test]
+    fn test_every_fallback_reason_maps_to_tcf() {
+        for reason in [
+            FallbackReason::Rank,
+            FallbackReason::RowLength,
+            FallbackReason::SourceDtype,
+            FallbackReason::SourceNonfinite,
+            FallbackReason::NumericRange,
+        ] {
+            assert_ne!(
+                tcf_fallback_reason(reason),
+                tcf_core::FallbackReason::None,
+                "{reason:?} must name a reason"
+            );
+        }
     }
 
     #[test]

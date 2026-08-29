@@ -12,6 +12,7 @@ pub mod checkpoint;
 pub mod gguf;
 pub mod safetensors;
 pub mod shard;
+pub mod tcf;
 
 pub use checkpoint::{copy_sidecars, rewrite_torch_dtype, SIDECAR_FILES};
 
@@ -30,6 +31,8 @@ pub use safetensors::{
     SafeTensorsDType, SafeTensorsWriter as SafeTensorsBatchWriter, StreamingSafeTensorsWriter,
     TensorEntry,
 };
+
+pub use tcf::{parse_tcf_encoding, PlannedTensor, TcfFormatWriter, TcfOptions, TCF_ENCODING_NAMES};
 
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -574,9 +577,14 @@ pub fn create_writer(
         crate::OutputFormat::Safetensors => Ok(Box::new(
             SafeTensorsFormatWriter::new().with_max_shard_size(max_shard_size),
         )),
+        // Unconfigured, exactly as the GGUF arm is: `convert` replaces it with
+        // a writer carrying the encoding and the input path, and an
+        // unconfigured one errors in `initialize` rather than writing a file
+        // with an invented encoding.
+        crate::OutputFormat::Tcf => Ok(Box::new(TcfFormatWriter::new())),
         other => anyhow::bail!(
-            "Output format {other:?} is not implemented. compressr writes gguf and \
-             safetensors; {other:?} needs its own on-disk layout (separate qweight / \
+            "Output format {other:?} is not implemented. compressr writes gguf, safetensors \
+             and tcf; {other:?} needs its own on-disk layout (separate qweight / \
              scales / qzeros tensors), which is not built yet. Earlier versions silently \
              wrote plain safetensors here, producing a file that claimed to be {other:?}."
         ),
@@ -616,6 +624,12 @@ mod tests {
     fn test_create_writer_safetensors() {
         let writer = create_writer(crate::OutputFormat::Safetensors, None).unwrap();
         // Just verify it doesn't panic
+        drop(writer);
+    }
+
+    #[test]
+    fn test_create_writer_tcf() {
+        let writer = create_writer(crate::OutputFormat::Tcf, None).unwrap();
         drop(writer);
     }
 
