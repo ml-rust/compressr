@@ -102,8 +102,12 @@ pub(super) fn settle(
     registration: &Registration,
     data: &[u8],
 ) -> Result<(TcfPlan, Option<Screen>)> {
-    let geometry = options.encoding.geometry();
-    let plan = plan_tcf_tensor(&registration.shape, registration.dtype, geometry.tile);
+    let layout = options.encoding.layout();
+    let plan = plan_tcf_tensor(
+        &registration.shape,
+        registration.dtype,
+        layout.geometry.tile,
+    );
     if plan != TcfPlan::Quantize {
         return Ok((plan, None));
     }
@@ -119,13 +123,13 @@ pub(super) fn settle(
     // record's wire shape, not the codec's. Passing all eight is
     // `E_INVALID_RANK`.
     let extent = usize::try_from(rank).unwrap_or(dims.len());
-    match quantize(&values, &dims[..extent], rank, geometry) {
+    match quantize(&values, &dims[..extent], rank, layout) {
         Ok(tiles) => {
             // A row that holds a whole number of tiles covers the element
             // space in order, so the reconstruction lines up with `values`
             // one for one. `plan_tcf_tensor` already rejected every other
             // row length.
-            let reconstructed = dequantize(&tiles, geometry)
+            let reconstructed = dequantize(&tiles, layout)
                 .map_err(|e| anyhow!(e))
                 .with_context(|| format!("Failed to screen tensor '{name}'"))?;
             let relative_rms = relative_rms_error(&values, &reconstructed)
@@ -176,7 +180,7 @@ fn bump_accepts(
     let Some(bump) = options.profile.and_then(|profile| profile.bump) else {
         return Ok(false);
     };
-    match quantize(values, dims, rank, bump.geometry()) {
+    match quantize(values, dims, rank, bump.layout()) {
         Ok(_) => Ok(true),
         Err(TcfError::SourceNonfinite { .. }) | Err(TcfError::NumericRange { .. }) => {
             log::warn!(

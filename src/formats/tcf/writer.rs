@@ -179,7 +179,7 @@ impl TcfFormatWriter {
         let rank = rank_of(shape, name)?;
         // Exactly `rank` dims, as in `settle` above.
         let extent = usize::try_from(rank).unwrap_or(dims.len());
-        let tiles = quantize(&values, &dims[..extent], rank, encoding.geometry())
+        let tiles = quantize(&values, &dims[..extent], rank, encoding.layout())
             .map_err(|e| anyhow!(e))
             .with_context(|| format!("Failed to quantize tensor '{name}'"))?;
         Ok(Payload::Quantized(tiles))

@@ -24,7 +24,7 @@ This section is the SINGLE source of truth on what works. Everything below assum
 | SafeTensors output | Sharded at `--max-shard-size`, with a matching index       |
 | GGUF output        | GGUF v3, one self-contained file                           |
 | TCF output         | TCF v1, one self-contained file, written through tcf-core  |
-| TCF quantization   | Q4S32_T64, Q4AS32_T64, Q4AS64_T64, Q6S32_T64, Q8S32_T64    |
+| TCF quantization   | Q4S32_T64, Q4AS32_T64, Q4AS64_T64, Q6S32_T64, Q6S16D_T64, Q8S32_T64 |
 | dtype cast         | F32, F16, BF16, round-to-nearest-even                      |
 | GGUF quantization  | Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K                         |
 | Sidecar copying    | Tokenizer and config files follow the weights              |

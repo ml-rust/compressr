@@ -8,8 +8,14 @@ use super::profile::TcfProfile;
 use crate::loader::UnifiedDType;
 
 /// The `--tcf-encoding` values, in the order the CLI help lists them.
-pub const TCF_ENCODING_NAMES: [&str; 5] =
-    ["q4s32t64", "q4as32t64", "q4as64t64", "q6s32t64", "q8s32t64"];
+pub const TCF_ENCODING_NAMES: [&str; 6] = [
+    "q4s32t64",
+    "q4as32t64",
+    "q4as64t64",
+    "q6s32t64",
+    "q6s16dt64",
+    "q8s32t64",
+];
 
 /// Parse a `NativeEncoding` name.
 ///
@@ -31,6 +37,7 @@ pub fn parse_tcf_encoding(s: &str) -> Result<NativeEncoding> {
         "q4as32t64" => Ok(NativeEncoding::Q4AS32T64),
         "q4as64t64" => Ok(NativeEncoding::Q4AS64T64),
         "q6s32t64" => Ok(NativeEncoding::Q6S32T64),
+        "q6s16dt64" => Ok(NativeEncoding::Q6S16DT64),
         "q8s32t64" => Ok(NativeEncoding::Q8S32T64),
         _ => bail!(
             "Unsupported TCF encoding: {}. Supported: {}",
@@ -187,6 +194,10 @@ mod tests {
         assert_eq!(
             parse_tcf_encoding("q6s32t64").unwrap(),
             NativeEncoding::Q6S32T64
+        );
+        assert_eq!(
+            parse_tcf_encoding("Q6S16D_T64").unwrap(),
+            NativeEncoding::Q6S16DT64
         );
         assert_eq!(
             parse_tcf_encoding("Q8S32T64").unwrap(),

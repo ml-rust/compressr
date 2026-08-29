@@ -86,7 +86,7 @@ enum Commands {
         #[arg(long, value_name = "SIZE", default_value = "5GB")]
         max_shard_size: String,
 
-        /// TCF encoding (q4s32t64, q4as32t64, q4as64t64, q6s32t64, q8s32t64)
+        /// TCF encoding (q4s32t64, q4as32t64, q4as64t64, q6s32t64, q6s16dt64, q8s32t64)
         ///
         /// Required by --format tcf. Bit width alone does not name an
         /// encoding: symmetry and group size are part of it, so this is a
