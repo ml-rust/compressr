@@ -260,12 +260,24 @@ impl LoadedModel {
         }
     }
 
-    /// Get all tensor names
+    /// Get all tensor names, in a deterministic order.
+    ///
+    /// Names are sorted within each shard, and shards keep their own order.
+    /// The safetensors reader hands back `HashMap` keys, and Rust seeds its
+    /// hasher per process, so an unsorted walk gives a different tensor order
+    /// on every run. Every downstream artifact inherits that order, which made
+    /// two conversions of one checkpoint differ in 99.5% of their bytes while
+    /// decoding identically. Determinism is a TCF format guarantee, so the
+    /// order is fixed here, at the one place that enumerates tensors.
     pub fn tensor_names(&self) -> Vec<String> {
         match &self.inner {
             LoadedModelInner::SafeTensors(files) => files
                 .iter()
-                .flat_map(|f| f.tensor_names().map(|s| s.to_string()))
+                .flat_map(|f| {
+                    let mut names: Vec<String> = f.tensor_names().map(|s| s.to_string()).collect();
+                    names.sort_unstable();
+                    names
+                })
                 .collect(),
             LoadedModelInner::Gguf(gguf) => gguf.tensor_names().map(|s| s.to_string()).collect(),
         }
