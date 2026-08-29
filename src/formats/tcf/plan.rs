@@ -17,12 +17,17 @@
 //!
 //! # The screen is hot
 //!
-//! [`settle`] quantizes the whole tensor, and under a profile
-//! [`bump_accepts`] quantizes it a second time at the bump encoding, so the
-//! screen is most of a conversion's arithmetic, not a side cost. Every one of
-//! them goes through [`quantize_tensor`], which splits the tensor's tiles over
-//! rayon's pool. Parallelizing the payload pass alone would have left the rest
-//! of the work single-threaded.
+//! [`settle`] quantizes the whole tensor, so the screen is most of a
+//! conversion's arithmetic, not a side cost. It goes through
+//! [`quantize_tensor`], which splits the tensor's tiles over rayon's pool.
+//! Parallelizing the payload pass alone would have left the rest of the work
+//! single-threaded.
+//!
+//! Under a profile [`bump_accepts`] asks a second question of the same
+//! values — whether the bump encoding can represent them — and that question
+//! is answered by [`accepts_tensor`], not by a second quantize. A quantize
+//! would have run a 19- or 22-candidate scale search plus a sub-scale
+//! refinement over every group and kept one bool.
 //!
 //! The screen's own tiles are no longer thrown away: [`settle`] hands them
 //! back, the writer spills them, and pass 2 reads them instead of quantizing
@@ -34,7 +39,7 @@ use anyhow::{anyhow, Context, Result};
 use tcf_core::{encoding::dequantize, Encoding, LogicalTile, TcfError};
 
 use super::encoding::{raw_encoding_for, values_f32, TcfOptions, TensorShape};
-use super::parallel::quantize_tensor;
+use super::parallel::{accepts_tensor, quantize_tensor};
 use crate::loader::UnifiedDType;
 use crate::policy::{
     plan_tcf_tensor, relative_rms_error, select_bumped, tcf_fallback_reason, FallbackReason,
@@ -199,18 +204,26 @@ pub(super) fn settle(
 /// Whether the profile's bump encoding can represent these values.
 ///
 /// Returns `false` when no profile names a bump encoding, and when the bump
-/// encoding refuses the values a base-encoded quantize accepted. The check
-/// costs one extra quantize per candidate and buys the guarantee that the
-/// payload pass never meets an encoding its record already fixed.
+/// encoding refuses the values a base-encoded quantize accepted. That
+/// guarantees the payload pass never meets an encoding its record already
+/// fixed.
 ///
-/// These tiles ARE dropped, unlike the base encoding's. A profile bumps a
-/// small share of its candidates, so spilling every candidate's bump payload
-/// would write a second model's worth of bytes to save requantizing that
-/// share. The base payload is the opposite trade: every tensor the allocation
-/// leaves alone reads its own back.
+/// This is a representability question, so it is answered by
+/// [`accepts_tensor`] and never by a quantize. `accepts_tensor` reads each
+/// group once for its extremes and decides Section 13.1's two value-dependent
+/// rejections from those; a quantize would have searched 19 or 22 scale
+/// candidates per group, refined a sub-scale, built every tile, and then
+/// dropped all of it to keep one bool. The verdict is the same one, never an
+/// approximation of it: a group the extremes cannot settle runs the full fit.
+///
+/// The bump payload is not produced here, and it was not kept when it was. A
+/// profile bumps a small share of its candidates, so spilling every
+/// candidate's bump payload would write a second model's worth of bytes to
+/// save requantizing that share. The base payload is the opposite trade:
+/// every tensor the allocation leaves alone reads its own back.
 ///
 /// # Errors
-/// The quantizer failed for a reason that is not value-dependent.
+/// The bump layout was refused for a reason that is not value-dependent.
 fn bump_accepts(
     options: TcfOptions,
     values: &[f32],
@@ -220,18 +233,16 @@ fn bump_accepts(
     let Some(bump) = options.profile.and_then(|profile| profile.bump) else {
         return Ok(false);
     };
-    match quantize_tensor(values, shape.extent(), shape.rank(), bump.layout()) {
-        Ok(_) => Ok(true),
-        Err(TcfError::SourceNonfinite { .. }) | Err(TcfError::NumericRange { .. }) => {
-            log::warn!(
-                "Tensor '{name}' cannot be represented at {bump:?}: it stays at the base \
-                 encoding and is no bump candidate"
-            );
-            Ok(false)
-        }
-        Err(other) => Err(anyhow!(other))
-            .with_context(|| format!("Failed to screen tensor '{name}' at {bump:?}")),
+    let accepted = accepts_tensor(values, shape.extent(), shape.rank(), bump.layout())
+        .map_err(|e| anyhow!(e))
+        .with_context(|| format!("Failed to screen tensor '{name}' at {bump:?}"))?;
+    if !accepted {
+        log::warn!(
+            "Tensor '{name}' cannot be represented at {bump:?}: it stays at the base \
+             encoding and is no bump candidate"
+        );
     }
+    Ok(accepted)
 }
 
 /// Keep one settled tensor's plan, at the base encoding.

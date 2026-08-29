@@ -81,8 +81,8 @@ pub mod python;
 pub use cast::{cast_bytes, parse_target_dtype, torch_dtype_name, ACCEPTED_DTYPE_NAMES};
 pub use formats::{
     parse_shard_size, parse_tcf_encoding, parse_tcf_profile, FormatWriter, GgufBatchWriter,
-    GgufFormatWriter, SafeTensorsFormatWriter, StreamingGgufWriter, TcfFormatWriter, TcfOptions,
-    TcfProfile, DEFAULT_MAX_SHARD_SIZE, TCF_ENCODING_NAMES, TCF_PROFILE_NAMES,
+    GgufFormatWriter, PlannedTensor, SafeTensorsFormatWriter, StreamingGgufWriter, TcfFormatWriter,
+    TcfOptions, TcfProfile, DEFAULT_MAX_SHARD_SIZE, TCF_ENCODING_NAMES, TCF_PROFILE_NAMES,
 };
 pub use loader::{
     LayerGroup, LoadedModel, ModelLoader, ModelMetadata, UnifiedDType, UnifiedTensorInfo,

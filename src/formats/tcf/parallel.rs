@@ -28,7 +28,9 @@
 use anyhow::{anyhow, Context, Result};
 use rayon::prelude::*;
 
-use tcf_core::encoding::{quantize, quantize_tile_chunk, tile_count, SUPER_BLOCK_TILES};
+use tcf_core::encoding::{
+    accepts, accepts_tile_chunk, quantize, quantize_tile_chunk, tile_count, SUPER_BLOCK_TILES,
+};
 use tcf_core::{LogicalTile, QuantLayout, TcfError};
 
 /// Tiles below which a tensor is quantized serially, with no rayon call at
@@ -88,20 +90,7 @@ pub(super) fn quantize_tensor(
     let parts: Vec<Result<Vec<LogicalTile>, TcfError>> = bounds
         .into_par_iter()
         .map(|(first, count)| {
-            let offset = usize::try_from(first).map_err(|_| TcfError::TileArithmeticOverflow)?;
-            let held = usize::try_from(count).map_err(|_| TcfError::TileArithmeticOverflow)?;
-            let start = offset
-                .checked_mul(tile)
-                .ok_or(TcfError::TileArithmeticOverflow)?;
-            let span = held
-                .checked_mul(tile)
-                .ok_or(TcfError::TileArithmeticOverflow)?;
-            let end = start
-                .checked_add(span)
-                .ok_or(TcfError::TileArithmeticOverflow)?;
-            let slice = values
-                .get(start..end)
-                .ok_or(TcfError::TileArithmeticOverflow)?;
+            let slice = chunk_slice(values, tile, first, count)?;
             let final_chunk = first.saturating_add(count) == total;
             quantize_tile_chunk(slice, count, first, final_chunk, layout)
         })
@@ -113,6 +102,80 @@ pub(super) fn quantize_tensor(
         out.extend(part?);
     }
     Ok(out)
+}
+
+/// Whether `layout` can represent this tensor, splitting the scan across
+/// rayon's pool.
+///
+/// Exactly what `tcf_core::encoding::accepts` answers for the same arguments,
+/// which is exactly what a full quantize's success or `SourceNonfinite` /
+/// `NumericRange` failure answers — without the scale search. The bump screen
+/// asks this of every candidate and keeps a bool, so the search it used to run
+/// was pure waste.
+///
+/// A chunk needs no super-block alignment: every verdict is one group's own.
+/// The split is still `quantize_tensor`'s, so the two paths cut a tensor the
+/// same way and one threshold governs both.
+///
+/// # Errors
+/// Whatever `tcf_core::encoding::accepts` raises: a geometry or tiling
+/// rejection, never a value-dependent one.
+pub(super) fn accepts_tensor(
+    values: &[f32],
+    dims: &[u64],
+    rank: u32,
+    layout: QuantLayout,
+) -> Result<bool, TcfError> {
+    let tile = usize::from(layout.geometry.tile);
+    let total = tile_count(dims, rank, layout.geometry.tile)?;
+    if total < MIN_PARALLEL_TILES {
+        // The serial path is `accepts` itself, for the same reason the
+        // quantize path calls `quantize`: the two cannot drift.
+        return accepts(values, dims, rank, layout);
+    }
+
+    let chunk = chunk_tiles(total, rayon::current_num_threads());
+    let bounds = chunk_bounds(total, chunk);
+
+    let parts: Vec<Result<bool, TcfError>> = bounds
+        .into_par_iter()
+        .map(|(first, count)| {
+            let slice = chunk_slice(values, tile, first, count)?;
+            accepts_tile_chunk(slice, count, layout)
+        })
+        .collect();
+
+    // Read in tile order and stop at the first refusal, so a serial run and a
+    // split run report the same verdict on a tensor whose chunks disagree.
+    for part in parts {
+        if !part? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The `count` tiles starting at tile `first`, as a sub-slice of a tensor's
+/// row-major values.
+///
+/// Tiles never cross a row boundary and a row holds a whole number of tiles,
+/// so tile `t` covers `t * tile .. (t + 1) * tile` and a chunk is a plain
+/// sub-slice.
+fn chunk_slice(values: &[f32], tile: usize, first: u64, count: u64) -> Result<&[f32], TcfError> {
+    let offset = usize::try_from(first).map_err(|_| TcfError::TileArithmeticOverflow)?;
+    let held = usize::try_from(count).map_err(|_| TcfError::TileArithmeticOverflow)?;
+    let start = offset
+        .checked_mul(tile)
+        .ok_or(TcfError::TileArithmeticOverflow)?;
+    let span = held
+        .checked_mul(tile)
+        .ok_or(TcfError::TileArithmeticOverflow)?;
+    let end = start
+        .checked_add(span)
+        .ok_or(TcfError::TileArithmeticOverflow)?;
+    values
+        .get(start..end)
+        .ok_or(TcfError::TileArithmeticOverflow)
 }
 
 /// Quantize a whole tensor, reporting the tensor name on failure.
@@ -256,6 +319,39 @@ mod tests {
             let left = pack(&parallel, layout).expect("parallel packs");
             let right = pack(&serial, layout).expect("serial packs");
             assert_eq!(left, right, "{encoding:?}");
+        }
+    }
+
+    /// The bump screen's question, answered without the scale search, must
+    /// match what a full quantize answers — on both the split and the serial
+    /// path, and for every encoding.
+    #[test]
+    fn accepts_matches_a_full_quantize() {
+        // 650 tiles: the parallel path. 40 tiles: the serial one.
+        for shape in [[65u64, 640], [4u64, 640]] {
+            let count = usize::try_from(shape[0] * shape[1]).expect("a small fixture");
+            let ordinary = values(count);
+            let tiny: Vec<f32> = ordinary.iter().map(|v| v * 1e-9).collect();
+            let mut nonfinite = values(count);
+            nonfinite[count / 2] = f32::NAN;
+            let mut one_tiny_group = values(count);
+            for slot in one_tiny_group.iter_mut().skip(128).take(64) {
+                *slot *= 1e-9;
+            }
+            let cases = [
+                ("ordinary", ordinary),
+                ("underflowing", tiny),
+                ("one underflowing group", one_tiny_group),
+                ("nonfinite", nonfinite),
+            ];
+            for encoding in ENCODINGS {
+                let layout = encoding.layout();
+                for (name, source) in &cases {
+                    let quantized = quantize_tensor(source, &shape, 2, layout).is_ok();
+                    let accepted = accepts_tensor(source, &shape, 2, layout).expect("decides");
+                    assert_eq!(accepted, quantized, "{encoding:?} {name} {shape:?}");
+                }
+            }
         }
     }
 

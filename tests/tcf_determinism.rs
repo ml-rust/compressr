@@ -12,8 +12,8 @@
 //! by `tcf-core`'s reader, never by anything compressr owns.
 
 use compressr::{
-    parse_tcf_encoding, parse_tcf_profile, FormatWriter, SafeTensorsFormatWriter, TcfFormatWriter,
-    TcfOptions, UnifiedDType,
+    parse_tcf_encoding, parse_tcf_profile, FormatWriter, PlannedTensor, SafeTensorsFormatWriter,
+    TcfFormatWriter, TcfOptions, UnifiedDType,
 };
 use std::path::Path;
 use tcf_core::TcfFile;
@@ -44,6 +44,10 @@ fn values(count: usize, spread: f32) -> Vec<f32> {
 fn fixtures() -> Vec<Fixture> {
     let mut nonfinite = values(4 * 640, 0.5);
     nonfinite[513] = f32::NAN;
+    // Group extremes at +-4e-7.
+    let tiny: Vec<f32> = (0..4 * 640)
+        .map(|i| 1e-7 * ((i % 8) as f32 - 4.0))
+        .collect();
     vec![
         // Above the parallel path's threshold, and a tile count that is not a
         // multiple of the super-block.
@@ -76,6 +80,15 @@ fn fixtures() -> Vec<Fixture> {
             name: "block.2.weight",
             shape: vec![4, 640],
             values: nonfinite,
+        },
+        // `(hi - lo) / 15` is a binary16 subnormal, so `Q4AS32D_T64` carries
+        // these values, while `max_abs / 30.1` is under 2^-25, so
+        // `Q6S16D_T64` cannot. Quantizable at the base and no bump candidate
+        // — the case the bump check exists to find.
+        Fixture {
+            name: "block.3.weight",
+            shape: vec![4, 640],
+            values: tiny,
         },
     ]
 }
@@ -120,6 +133,32 @@ fn convert(source: &Path, out: &Path, options: TcfOptions, tensors: &[Fixture]) 
     }
     writer.finalize().expect("writes the tcf file");
     writer.planned().iter().filter(|plan| plan.bumped).count()
+}
+
+/// Convert the fixture at `out` and answer the plan the writer settled for
+/// every tensor, in registration order.
+fn plans(
+    source: &Path,
+    out: &Path,
+    options: TcfOptions,
+    tensors: &[Fixture],
+) -> Vec<PlannedTensor> {
+    let mut writer = TcfFormatWriter::new()
+        .with_options(options)
+        .with_source(source.to_str().expect("a utf8 fixture path"));
+    writer.initialize(out).expect("initializes the tcf writer");
+    for tensor in tensors {
+        writer
+            .register_tensor(tensor.name, &tensor.shape, UnifiedDType::F32, None)
+            .expect("registers");
+    }
+    for tensor in tensors {
+        writer
+            .write_tensor_data(&f32_bytes(&tensor.values))
+            .expect("settles a plan");
+    }
+    writer.finalize().expect("writes the tcf file");
+    writer.planned().to_vec()
 }
 
 /// Read `path` back through `tcf-core` and check every digest and proof.
@@ -186,4 +225,54 @@ fn two_profile_conversions_produce_the_same_bytes() {
     let left = std::fs::read(&first).expect("reads the first output");
     let right = std::fs::read(&second).expect("reads the second output");
     assert_eq!(left, right, "two identical runs wrote different bytes");
+}
+
+/// The bump set must be the set a full quantize at the bump encoding produces.
+///
+/// The screen answers representability from each group's extremes rather than
+/// from a quantize it throws away. That is a work-elimination change, so the
+/// verdict it reaches for every tensor is checked here against the quantize it
+/// replaced — the oracle, run directly against `tcf-core`.
+#[test]
+fn the_bump_set_matches_a_full_quantize() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let tensors = fixtures();
+    let source = dir.path().join("model.safetensors");
+    write_source(&source, &tensors);
+
+    let profile = parse_tcf_profile("compact").expect("a ladder rung");
+    let bump = profile.bump.expect("the compact rung bumps");
+    let out = dir.path().join("plans.tcf");
+    let settled = plans(&source, &out, TcfOptions::from_profile(profile), &tensors);
+    assert_eq!(settled.len(), tensors.len());
+
+    let mut candidates = 0usize;
+    let mut refused = 0usize;
+    for (plan, fixture) in settled.iter().zip(tensors.iter()) {
+        assert_eq!(plan.name, fixture.name);
+        if plan.fallback.is_some() {
+            // A tensor stored raw has no base encoding to be bumped from.
+            assert!(!plan.bumpable, "{} is raw and no candidate", plan.name);
+            continue;
+        }
+        let dims: Vec<u64> = fixture.shape.iter().map(|d| *d as u64).collect();
+        let rank = u32::try_from(dims.len()).expect("a small rank");
+        let quantized = tcf_core::encoding::quantize(&fixture.values, &dims, rank, bump.layout());
+        let oracle = quantized.is_ok();
+        assert_eq!(
+            plan.bumpable, oracle,
+            "{} disagreed with a full quantize at {bump:?}",
+            plan.name
+        );
+        if oracle {
+            candidates += 1;
+        } else {
+            refused += 1;
+        }
+    }
+    assert!(candidates > 0, "the fixture must hold a bump candidate");
+    assert!(
+        refused > 0,
+        "the fixture must hold a tensor the bump encoding refuses"
+    );
 }
