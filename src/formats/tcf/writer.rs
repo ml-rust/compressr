@@ -618,14 +618,14 @@ mod tests {
         };
 
         let bumped = &records[at("off_grid")];
-        assert_eq!(bumped.encoding, Encoding::Native(NativeEncoding::Q6S32T64));
+        assert_eq!(bumped.encoding, Encoding::Native(NativeEncoding::Q6S16DT64));
         assert_eq!(
             bumped.fallback_reason,
             tcf_core::FallbackReason::TaskSensitivity
         );
 
         let base = &records[at("ramp")];
-        assert_eq!(base.encoding, Encoding::Native(NativeEncoding::Q4AS64T64));
+        assert_eq!(base.encoding, Encoding::Native(NativeEncoding::Q4AS32DT64));
         assert_eq!(base.fallback_reason, tcf_core::FallbackReason::None);
 
         let raw = &records[at("bias")];

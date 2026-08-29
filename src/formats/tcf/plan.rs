@@ -374,7 +374,7 @@ mod tests {
     #[test]
     fn a_bumped_tensor_records_task_sensitivity() {
         let options = TcfOptions::from_profile(TCF_COMPACT);
-        let bumped = planned(Encoding::Native(NativeEncoding::Q6S32T64), true, None);
+        let bumped = planned(Encoding::Native(NativeEncoding::Q6S16DT64), true, None);
         assert_eq!(
             reason_for(&bumped, options),
             tcf_core::FallbackReason::TaskSensitivity
@@ -386,7 +386,7 @@ mod tests {
     #[test]
     fn a_base_encoded_tensor_records_no_reason() {
         let options = TcfOptions::from_profile(TCF_COMPACT);
-        let base = planned(Encoding::Native(NativeEncoding::Q4AS64T64), false, None);
+        let base = planned(Encoding::Native(NativeEncoding::Q4AS32DT64), false, None);
         assert_eq!(reason_for(&base, options), tcf_core::FallbackReason::None);
     }
 
@@ -418,8 +418,8 @@ mod tests {
     #[test]
     fn allocation_excludes_a_raw_tensor_from_the_ranking_and_the_budget() {
         let mut tensors = vec![
-            planned(Encoding::Native(NativeEncoding::Q4AS64T64), false, None),
-            planned(Encoding::Native(NativeEncoding::Q4AS64T64), false, None),
+            planned(Encoding::Native(NativeEncoding::Q4AS32DT64), false, None),
+            planned(Encoding::Native(NativeEncoding::Q4AS32DT64), false, None),
             planned(
                 Encoding::Raw(RawEncoding::F32),
                 false,
@@ -436,7 +436,7 @@ mod tests {
         assert!(tensors[1].bumped, "the worst-reconstructed candidate");
         assert_eq!(
             tensors[1].encoding,
-            Encoding::Native(NativeEncoding::Q6S32T64)
+            Encoding::Native(NativeEncoding::Q6S16DT64)
         );
         assert!(!tensors[2].bumped, "a raw tensor is no candidate");
         assert_eq!(tensors[2].encoding, Encoding::Raw(RawEncoding::F32));
@@ -446,7 +446,7 @@ mod tests {
     /// no more a candidate than a raw one is.
     #[test]
     fn a_tensor_the_bump_encoding_refuses_is_no_candidate() {
-        let base = Encoding::Native(NativeEncoding::Q4AS64T64);
+        let base = Encoding::Native(NativeEncoding::Q4AS32DT64);
         let mut tensors = vec![planned(base, false, None), planned(base, false, None)];
         tensors[0].screen_error = Some(0.9);
         tensors[0].bumpable = false;

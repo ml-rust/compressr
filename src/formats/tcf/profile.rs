@@ -53,31 +53,37 @@ pub const TCF_REF: TcfProfile = TcfProfile {
     ladder_bpw: 8.50,
 };
 
-/// `TCF-HIGH`: `Q6S32_T64` with `Q8S32_T64` on the top 15%.
+/// `TCF-HIGH`: `Q6S16D_T64` with `Q8S32_T64` on the top 15%.
+///
+/// `0.85 * 6.5625 + 0.15 * 8.5000 = 6.853125`.
 pub const TCF_HIGH: TcfProfile = TcfProfile {
     name: "TCF-HIGH",
-    base: NativeEncoding::Q6S32T64,
+    base: NativeEncoding::Q6S16DT64,
     bump: Some(NativeEncoding::Q8S32T64),
     bump_fraction: 0.15,
-    ladder_bpw: 6.80,
+    ladder_bpw: 6.853_125,
 };
 
-/// `TCF-BALANCED`: `Q4AS32_T64` with `Q8S32_T64` on the top 15%.
+/// `TCF-BALANCED`: `Q4AS32D_T64` with `Q8S32_T64` on the top 15%.
+///
+/// `0.85 * 4.5000 + 0.15 * 8.5000 = 5.100000`.
 pub const TCF_BALANCED: TcfProfile = TcfProfile {
     name: "TCF-BALANCED",
-    base: NativeEncoding::Q4AS32T64,
+    base: NativeEncoding::Q4AS32DT64,
     bump: Some(NativeEncoding::Q8S32T64),
     bump_fraction: 0.15,
-    ladder_bpw: 5.53,
+    ladder_bpw: 5.100,
 };
 
-/// `TCF-COMPACT`: `Q4AS64_T64` with `Q6S32_T64` on the top 10%.
+/// `TCF-COMPACT`: `Q4AS32D_T64` with `Q6S16D_T64` on the top 10%.
+///
+/// `0.90 * 4.5000 + 0.10 * 6.5625 = 4.706250`.
 pub const TCF_COMPACT: TcfProfile = TcfProfile {
     name: "TCF-COMPACT",
-    base: NativeEncoding::Q4AS64T64,
-    bump: Some(NativeEncoding::Q6S32T64),
+    base: NativeEncoding::Q4AS32DT64,
+    bump: Some(NativeEncoding::Q6S16DT64),
     bump_fraction: 0.10,
-    ladder_bpw: 4.70,
+    ladder_bpw: 4.706_25,
 };
 
 /// Parse a profile name.
@@ -140,10 +146,11 @@ mod tests {
         assert_eq!(TCF_REF.bump, None);
         assert_eq!(TCF_HIGH.bump, Some(NativeEncoding::Q8S32T64));
         assert_eq!(TCF_HIGH.bump_fraction, 0.15);
-        assert_eq!(TCF_BALANCED.base, NativeEncoding::Q4AS32T64);
+        assert_eq!(TCF_HIGH.base, NativeEncoding::Q6S16DT64);
+        assert_eq!(TCF_BALANCED.base, NativeEncoding::Q4AS32DT64);
         assert_eq!(TCF_BALANCED.bump_fraction, 0.15);
-        assert_eq!(TCF_COMPACT.base, NativeEncoding::Q4AS64T64);
-        assert_eq!(TCF_COMPACT.bump, Some(NativeEncoding::Q6S32T64));
+        assert_eq!(TCF_COMPACT.base, NativeEncoding::Q4AS32DT64);
+        assert_eq!(TCF_COMPACT.bump, Some(NativeEncoding::Q6S16DT64));
         assert_eq!(TCF_COMPACT.bump_fraction, 0.10);
     }
 }

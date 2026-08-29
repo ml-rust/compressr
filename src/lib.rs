@@ -975,7 +975,7 @@ mod tests {
         // from the module preference and records a reason.
         let options = config.tcf_options().unwrap();
         assert_eq!(options.encoding, options.preferred_encoding);
-        assert_eq!(options.encoding, tcf_core::NativeEncoding::Q4AS64T64);
+        assert_eq!(options.encoding, tcf_core::NativeEncoding::Q4AS32DT64);
     }
 
     /// A profile applies to TCF alone, exactly as the encoding flags do.
