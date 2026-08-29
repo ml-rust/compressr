@@ -36,9 +36,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use tcf_core::{encoding::quantize, Encoding, Payload, TcfError, TcfWriter};
+use tcf_core::{Encoding, Payload, TcfError, TcfWriter};
 
 use super::encoding::{dims_of, rank_of, values_f32, TcfOptions, TCF_ENCODING_NAMES};
+use super::parallel::quantize_named;
 use super::plan::{allocate, plan_one, reason_for, settle, PlannedTensor, Registration};
 use super::record::{module_record, tensor_record};
 use crate::formats::FormatWriter;
@@ -179,9 +180,7 @@ impl TcfFormatWriter {
         let rank = rank_of(shape, name)?;
         // Exactly `rank` dims, as in `settle` above.
         let extent = usize::try_from(rank).unwrap_or(dims.len());
-        let tiles = quantize(&values, &dims[..extent], rank, encoding.layout())
-            .map_err(|e| anyhow!(e))
-            .with_context(|| format!("Failed to quantize tensor '{name}'"))?;
+        let tiles = quantize_named(&values, &dims[..extent], rank, encoding.layout(), name)?;
         Ok(Payload::Quantized(tiles))
     }
 

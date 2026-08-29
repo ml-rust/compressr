@@ -14,15 +14,23 @@
 //! a task-metric delta on a calibration set, which compressr cannot run, so
 //! `sensitivity_delta`, `sensitivity_ci95`, `sensitivity_samples` and
 //! `calibration_id` are never written from anything here.
+//!
+//! # The screen is hot
+//!
+//! [`settle`] quantizes the whole tensor, and under a profile
+//! [`bump_accepts`] quantizes it a second time at the bump encoding. With the
+//! writer's payload pass that is two or three FULL quantizes per tensor, so
+//! the screen is most of a conversion's arithmetic, not a side cost. Every one
+//! of them goes through [`quantize_tensor`], which splits the tensor's tiles
+//! over rayon's pool. Parallelizing the payload pass alone would have left two
+//! thirds of the work single-threaded.
 
 use anyhow::{anyhow, Context, Result};
 
-use tcf_core::{
-    encoding::{dequantize, quantize},
-    Encoding, TcfError,
-};
+use tcf_core::{encoding::dequantize, Encoding, TcfError};
 
 use super::encoding::{dims_of, rank_of, raw_encoding_for, values_f32, TcfOptions};
+use super::parallel::quantize_tensor;
 use crate::loader::UnifiedDType;
 use crate::policy::{
     plan_tcf_tensor, relative_rms_error, select_bumped, tcf_fallback_reason, FallbackReason,
@@ -123,7 +131,7 @@ pub(super) fn settle(
     // record's wire shape, not the codec's. Passing all eight is
     // `E_INVALID_RANK`.
     let extent = usize::try_from(rank).unwrap_or(dims.len());
-    match quantize(&values, &dims[..extent], rank, layout) {
+    match quantize_tensor(&values, &dims[..extent], rank, layout) {
         Ok(tiles) => {
             // A row that holds a whole number of tiles covers the element
             // space in order, so the reconstruction lines up with `values`
@@ -180,7 +188,7 @@ fn bump_accepts(
     let Some(bump) = options.profile.and_then(|profile| profile.bump) else {
         return Ok(false);
     };
-    match quantize(values, dims, rank, bump.layout()) {
+    match quantize_tensor(values, dims, rank, bump.layout()) {
         Ok(_) => Ok(true),
         Err(TcfError::SourceNonfinite { .. }) | Err(TcfError::NumericRange { .. }) => {
             log::warn!(

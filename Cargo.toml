@@ -57,6 +57,12 @@ clap = { version = "4.5", features = ["derive"] }
 # Half-precision float types, for dtype casts and side-band scales
 half = "2.7"
 
+# Data parallelism, for quantizing one tensor's tile chunks concurrently.
+# The threading lives here, never in tcf-core: that crate's only permitted
+# dependency is blake3, and CONFORMANCE.md makes its scalar implementation the
+# definition of codec semantics.
+rayon = "1.10"
+
 # Python bindings (optional)
 pyo3 = { version = "0.23", features = ["extension-module"], optional = true }
 

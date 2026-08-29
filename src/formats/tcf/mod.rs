@@ -10,12 +10,16 @@
 //! Layout and packing. Every bit position, nibble index, tile order and plane
 //! order lives in `tcf-core`, which also computes every offset, span and
 //! digest. This module chooses policy — encoding, `fallback_reason`,
-//! residency — and calls [`tcf_core::encoding::quantize`] and
-//! `TcfWriter::finish_streaming` for the rest. GGUF's block layouts stay in
+//! residency — and calls `tcf-core`'s quantizer and
+//! `TcfWriter::finish_streaming` for the rest. The one thing it adds around
+//! that quantizer is scheduling: [`parallel`] splits ONE tensor's tiles over
+//! rayon's pool, because `tcf-core` takes no dependency but blake3 and its
+//! scalar implementation defines codec semantics. GGUF's block layouts stay in
 //! boostr for the same reason: a writer checked against a reader beside it
 //! proves nothing.
 
 mod encoding;
+mod parallel;
 mod plan;
 mod profile;
 mod record;

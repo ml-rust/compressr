@@ -25,6 +25,7 @@ This section is the SINGLE source of truth on what works. Everything below assum
 | GGUF output        | GGUF v3, one self-contained file                           |
 | TCF output         | TCF v1, one self-contained file, written through tcf-core  |
 | TCF quantization   | Q4S32_T64, Q4AS32_T64, Q4AS64_T64, Q6S32_T64, Q6S16D_T64, Q8S32_T64 |
+| TCF threading      | One tensor's tile chunks quantize across rayon's pool, bytes unchanged |
 | dtype cast         | F32, F16, BF16, round-to-nearest-even                      |
 | GGUF quantization  | Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K                         |
 | Sidecar copying    | Tokenizer and config files follow the weights              |
@@ -39,7 +40,7 @@ This section is the SINGLE source of truth on what works. Everything below assum
 | PyTorch, ONNX input | `.bin` / `.pt` / `.onnx` readers                                        |
 | Python API          | The PyO3 module exports `__version__` only                              |
 | Triple-buffered I/O | A prefetch/compute/write pipeline; reads and writes are serial today    |
-| Parallel shard I/O  | Reads are sequential; there is no rayon in the dependency tree          |
+| Parallel shard I/O  | Reads are sequential; rayon parallelizes TCF quantization, never I/O    |
 
 The `optimize` subcommand parses its flags but every method it accepts is a roadmap item, so it always errors.
 
