@@ -18,18 +18,22 @@
 //! # The screen is hot
 //!
 //! [`settle`] quantizes the whole tensor, and under a profile
-//! [`bump_accepts`] quantizes it a second time at the bump encoding. With the
-//! writer's payload pass that is two or three FULL quantizes per tensor, so
-//! the screen is most of a conversion's arithmetic, not a side cost. Every one
-//! of them goes through [`quantize_tensor`], which splits the tensor's tiles
-//! over rayon's pool. Parallelizing the payload pass alone would have left two
-//! thirds of the work single-threaded.
+//! [`bump_accepts`] quantizes it a second time at the bump encoding, so the
+//! screen is most of a conversion's arithmetic, not a side cost. Every one of
+//! them goes through [`quantize_tensor`], which splits the tensor's tiles over
+//! rayon's pool. Parallelizing the payload pass alone would have left the rest
+//! of the work single-threaded.
+//!
+//! The screen's own tiles are no longer thrown away: [`settle`] hands them
+//! back, the writer spills them, and pass 2 reads them instead of quantizing
+//! the same values again. See [`super::spill`] for why that keeps one tensor
+//! in flight.
 
 use anyhow::{anyhow, Context, Result};
 
-use tcf_core::{encoding::dequantize, Encoding, TcfError};
+use tcf_core::{encoding::dequantize, Encoding, LogicalTile, TcfError};
 
-use super::encoding::{dims_of, rank_of, raw_encoding_for, values_f32, TcfOptions};
+use super::encoding::{raw_encoding_for, values_f32, TcfOptions, TensorShape};
 use super::parallel::quantize_tensor;
 use crate::loader::UnifiedDType;
 use crate::policy::{
@@ -90,6 +94,22 @@ pub(super) struct Screen {
     pub(super) bumpable: bool,
 }
 
+/// One tensor's screening verdict, and the payload that verdict came from.
+#[derive(Debug)]
+pub(super) struct Settled {
+    /// What the tensor is stored as
+    pub(super) plan: TcfPlan,
+    /// How the base encoding reconstructs it, `None` for a raw tensor
+    pub(super) screen: Option<Screen>,
+    /// The tiles the screen quantized, at the BASE encoding
+    ///
+    /// `None` for a raw tensor. The writer spills these and pass 2 reads
+    /// them back rather than quantizing the same values again; a tensor a
+    /// profile later bumps needs a different encoding, so its spilled payload
+    /// is refused and requantized.
+    pub(super) tiles: Option<Vec<LogicalTile>>,
+}
+
 /// Settle one tensor's plan from its shape and, when the shape allows
 /// quantization, from its values. A quantized tensor is screened at the
 /// same time.
@@ -105,11 +125,16 @@ pub(super) struct Screen {
 /// for a tensor stored raw. It ranks bump candidates and nothing else — it is
 /// a weight error, not a task-metric delta, so no sensitivity field is ever
 /// written from it.
+///
+/// Those same tiles come back in [`Settled::tiles`]. They are the payload of
+/// every tensor the allocation leaves at the base encoding, which is most of
+/// them, so recomputing them in pass 2 was the single largest avoidable cost
+/// in a conversion.
 pub(super) fn settle(
     options: TcfOptions,
     registration: &Registration,
     data: &[u8],
-) -> Result<(TcfPlan, Option<Screen>)> {
+) -> Result<Settled> {
     let layout = options.encoding.layout();
     let plan = plan_tcf_tensor(
         &registration.shape,
@@ -117,21 +142,22 @@ pub(super) fn settle(
         layout.geometry.tile,
     );
     if plan != TcfPlan::Quantize {
-        return Ok((plan, None));
+        return Ok(Settled {
+            plan,
+            screen: None,
+            tiles: None,
+        });
     }
 
     let name = registration.name.as_str();
     let values = values_f32(data, registration.dtype, name)?;
-    let dims = dims_of(&registration.shape, name)?;
-    let rank = rank_of(&registration.shape, name)?;
-    // The tiles are dropped at the end of this match: pass 2 recomputes
-    // them one tensor at a time, so keeping them would break the
-    // one-tensor-in-flight bound. Only the screen scalar survives.
-    // `quantize` wants EXACTLY `rank` dims; the padded `[u64; 8]` is the
-    // record's wire shape, not the codec's. Passing all eight is
-    // `E_INVALID_RANK`.
-    let extent = usize::try_from(rank).unwrap_or(dims.len());
-    match quantize_tensor(&values, &dims[..extent], rank, layout) {
+    let shape = TensorShape::of(&registration.shape, name)?;
+    let raw = |reason| Settled {
+        plan: TcfPlan::Raw(reason),
+        screen: None,
+        tiles: None,
+    };
+    match quantize_tensor(&values, shape.extent(), shape.rank(), layout) {
         Ok(tiles) => {
             // A row that holds a whole number of tiles covers the element
             // space in order, so the reconstruction lines up with `values`
@@ -142,18 +168,19 @@ pub(super) fn settle(
                 .with_context(|| format!("Failed to screen tensor '{name}'"))?;
             let relative_rms = relative_rms_error(&values, &reconstructed)
                 .with_context(|| format!("Failed to screen tensor '{name}'"))?;
-            let bumpable = bump_accepts(options, &values, &dims[..extent], rank, name)?;
-            Ok((
-                TcfPlan::Quantize,
-                Some(Screen {
+            let bumpable = bump_accepts(options, &values, &shape, name)?;
+            Ok(Settled {
+                plan: TcfPlan::Quantize,
+                screen: Some(Screen {
                     relative_rms,
                     bumpable,
                 }),
-            ))
+                tiles: Some(tiles),
+            })
         }
         Err(TcfError::SourceNonfinite { .. }) => {
             log::warn!("Tensor '{name}' holds a NaN or an infinity: storing it unquantized");
-            Ok((TcfPlan::Raw(FallbackReason::SourceNonfinite), None))
+            Ok(raw(FallbackReason::SourceNonfinite))
         }
         Err(TcfError::NumericRange { .. }) => {
             log::warn!(
@@ -161,7 +188,7 @@ pub(super) fn settle(
                  storing it unquantized",
                 options.encoding
             );
-            Ok((TcfPlan::Raw(FallbackReason::NumericRange), None))
+            Ok(raw(FallbackReason::NumericRange))
         }
         Err(other) => {
             Err(anyhow!(other)).with_context(|| format!("Failed to quantize tensor '{name}'"))
@@ -176,19 +203,24 @@ pub(super) fn settle(
 /// costs one extra quantize per candidate and buys the guarantee that the
 /// payload pass never meets an encoding its record already fixed.
 ///
+/// These tiles ARE dropped, unlike the base encoding's. A profile bumps a
+/// small share of its candidates, so spilling every candidate's bump payload
+/// would write a second model's worth of bytes to save requantizing that
+/// share. The base payload is the opposite trade: every tensor the allocation
+/// leaves alone reads its own back.
+///
 /// # Errors
 /// The quantizer failed for a reason that is not value-dependent.
 fn bump_accepts(
     options: TcfOptions,
     values: &[f32],
-    dims: &[u64],
-    rank: u32,
+    shape: &TensorShape,
     name: &str,
 ) -> Result<bool> {
     let Some(bump) = options.profile.and_then(|profile| profile.bump) else {
         return Ok(false);
     };
-    match quantize_tensor(values, dims, rank, bump.layout()) {
+    match quantize_tensor(values, shape.extent(), shape.rank(), bump.layout()) {
         Ok(_) => Ok(true),
         Err(TcfError::SourceNonfinite { .. }) | Err(TcfError::NumericRange { .. }) => {
             log::warn!(

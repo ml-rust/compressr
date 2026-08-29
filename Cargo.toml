@@ -63,6 +63,12 @@ half = "2.7"
 # definition of codec semantics.
 rayon = "1.10"
 
+# Temporary files, for the TCF payload spill. Pass 1 computes the payload every
+# tensor is written from and pass 2 would otherwise quantize it a second time;
+# holding those payloads in memory would make peak RAM the whole quantized
+# model, so they go to an unlinked temporary file instead.
+tempfile = "3.23"
+
 # Python bindings (optional)
 pyo3 = { version = "0.23", features = ["extension-module"], optional = true }
 

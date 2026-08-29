@@ -11,9 +11,9 @@
 //! afterwards from a reader of its own:
 //!
 //! 1. [`FormatWriter::write_tensor_data`] quantizes the tensor, keeps the
-//!    verdict and the screen error, and drops the tiles. A tensor the
-//!    quantizer rejects is re-planned as raw with the reason it gave, and the
-//!    run continues.
+//!    verdict and the screen error, and appends the tiles to a temporary
+//!    payload spill. A tensor the quantizer rejects is re-planned as raw with
+//!    the reason it gave, and the run continues.
 //! 2. [`FormatWriter::finalize`] runs the profile allocation, registers every
 //!    record, and then lets `TcfWriter::finish_streaming` pull one payload at
 //!    a time, write it at its precomputed offset, and drop it before asking
@@ -23,25 +23,38 @@
 //! comparison across tensors: which tensors carry the bump encoding is unknown
 //! until the last one has been screened.
 //!
-//! Each tensor is therefore read and quantized twice, and at most one tensor's
-//! values are resident at any point. That second read is the price of a
-//! value-dependent `fallback_reason`: the alternative holds every payload
-//! until the directory is complete, which is what the older `add_*_tensor`
-//! path does.
+//! # The payload each tensor is written from
 //!
-//! Nothing is created on disk before pass 2, so a tensor compressr cannot
-//! represent fails with no output file at all rather than truncating one.
+//! Pass 1 already computed the winning tiles for every tensor it settles, so
+//! pass 2 asks [`super::spill`] for them rather than quantizing the same
+//! values a second time. Three tensors miss that and are read from the source
+//! again: one stored raw, whose payload is its own source bytes; one a profile
+//! bumped, whose spilled payload is at the base encoding its record no longer
+//! carries; and one whose spill could not be written or read, which costs time
+//! and never correctness. The bytes are identical either way — `quantize` is
+//! deterministic, and `unpack` is `tcf-core`'s own inverse of the `pack` that
+//! spilled them.
+//!
+//! At most one tensor's values are resident at any point, in both passes, and
+//! the spill holds the rest on disk. That is the one-tensor-in-flight bound
+//! the alternative — holding every payload until the directory is complete,
+//! which is what the older `add_*_tensor` path does — gives up.
+//!
+//! Nothing is created at the output path before pass 2, so a tensor compressr
+//! cannot represent fails with no output file at all rather than truncating
+//! one.
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use tcf_core::{Encoding, Payload, TcfError, TcfWriter};
+use tcf_core::{Encoding, LogicalTile, NativeEncoding, Payload, TcfError, TcfWriter};
 
-use super::encoding::{dims_of, rank_of, values_f32, TcfOptions, TCF_ENCODING_NAMES};
+use super::encoding::{values_f32, TcfOptions, TensorShape, TCF_ENCODING_NAMES};
 use super::parallel::quantize_named;
 use super::plan::{allocate, plan_one, reason_for, settle, PlannedTensor, Registration};
 use super::record::{module_record, tensor_record};
+use super::spill::PayloadSpill;
 use crate::formats::FormatWriter;
 use crate::loader::{LoadedModel, ModelLoader, UnifiedDType};
 use crate::policy::TcfPlan;
@@ -60,6 +73,12 @@ pub struct TcfFormatWriter {
     path: Option<PathBuf>,
     registrations: Vec<Registration>,
     planned: Vec<PlannedTensor>,
+    /// Each tensor's shape in both the forms TCF asks for, filled by
+    /// [`TcfFormatWriter::register_all`] and read again by the payload pass
+    shapes: Vec<TensorShape>,
+    /// Pass 1's payloads, `None` once a spill error has sent every remaining
+    /// tensor back to the quantizer
+    spill: Option<PayloadSpill>,
     writer: Option<TcfWriter>,
 }
 
@@ -77,6 +96,8 @@ impl TcfFormatWriter {
             path: None,
             registrations: Vec::new(),
             planned: Vec::new(),
+            shapes: Vec::new(),
+            spill: None,
             writer: None,
         }
     }
@@ -116,8 +137,12 @@ impl TcfFormatWriter {
     }
 
     /// Register every settled record with `tcf-core`, in directory order.
+    ///
+    /// Each tensor's [`TensorShape`] is derived here and kept, so the payload
+    /// pass reads the same value rather than deriving it again.
     fn register_all(&mut self) -> Result<()> {
         let options = self.options()?;
+        self.shapes.clear();
         for index in 0..self.planned.len() {
             let plan = self
                 .planned
@@ -131,8 +156,9 @@ impl TcfFormatWriter {
                 .ok_or_else(|| anyhow!("TCF planned tensor {index} was never registered"))?;
 
             let name = plan.name.as_str();
-            let dims = dims_of(&shape, name)?;
-            let rank = rank_of(&shape, name)?;
+            let shape = TensorShape::of(&shape, name)?;
+            self.shapes.push(shape);
+            let (dims, rank) = (shape.dims(), shape.rank());
             let tensor_id =
                 u32::try_from(index).context("More tensors than a TCF file can hold")?;
             let reason = reason_for(&plan, options);
@@ -157,15 +183,50 @@ impl TcfFormatWriter {
         Ok(())
     }
 
-    /// Produce one tensor's payload, reading it from the source checkpoint.
+    /// Append pass 1's payload for the tensor just settled, keeping one spill
+    /// slot per tensor whether or not there was anything to append.
+    ///
+    /// A write that fails drops the spill and is reported, never raised: pass
+    /// 2 then quantizes again and produces the same bytes.
+    fn spill_payload(
+        &mut self,
+        tiles: Option<&[LogicalTile]>,
+        encoding: NativeEncoding,
+        name: &str,
+    ) {
+        let Some(spill) = self.spill.as_mut() else {
+            return;
+        };
+        let appended = match tiles {
+            Some(tiles) => spill.push(tiles, encoding),
+            None => {
+                spill.push_absent();
+                Ok(())
+            }
+        };
+        if let Err(error) = appended {
+            log::warn!(
+                "TCF: the payload spill stopped at tensor '{name}' ({error}); the payload pass \
+                 quantizes again instead"
+            );
+            self.spill = None;
+        }
+    }
+
+    /// Produce one tensor's payload, from the spill when pass 1 left one
+    /// there and from the source checkpoint otherwise.
     ///
     /// The payload is returned by value and dropped by `tcf-core` as soon as
     /// it is written, so one tensor is resident at a time.
-    fn payload(model: &mut LoadedModel, plan: &PlannedTensor, shape: &[usize]) -> Result<Payload> {
+    fn payload(
+        source: &str,
+        model: &mut Option<LoadedModel>,
+        spill: &mut Option<PayloadSpill>,
+        plan: &PlannedTensor,
+        shape: &TensorShape,
+        index: usize,
+    ) -> Result<Payload> {
         let name = plan.name.as_str();
-        let bytes = model
-            .read_tensor_bytes(name)
-            .with_context(|| format!("Failed to re-read tensor '{name}'"))?;
         // The plan's own encoding drives this, not the run's base encoding: a
         // profile bumps some tensors, and quantizing one at the base here
         // would write a payload its record does not describe.
@@ -173,15 +234,88 @@ impl TcfFormatWriter {
             Encoding::Native(encoding) => encoding,
             // A raw tensor keeps its source element type, so its bytes are
             // the payload.
-            _ => return Ok(Payload::Raw(bytes)),
+            _ => return Ok(Payload::Raw(Self::reread(source, model, name)?)),
         };
+        if let Some(tiles) = Self::spilled(spill, plan, encoding, index) {
+            return Ok(Payload::Quantized(tiles));
+        }
+        let bytes = Self::reread(source, model, name)?;
         let values = values_f32(&bytes, plan.dtype, name)?;
-        let dims = dims_of(shape, name)?;
-        let rank = rank_of(shape, name)?;
-        // Exactly `rank` dims, as in `settle` above.
-        let extent = usize::try_from(rank).unwrap_or(dims.len());
-        let tiles = quantize_named(&values, &dims[..extent], rank, encoding.layout(), name)?;
+        let tiles = quantize_named(
+            &values,
+            shape.extent(),
+            shape.rank(),
+            encoding.layout(),
+            name,
+        )?;
         Ok(Payload::Quantized(tiles))
+    }
+
+    /// The payload pass 1 spilled for this tensor, if it is the one the
+    /// record now needs.
+    ///
+    /// A spill that cannot be read is dropped and reported, never raised: the
+    /// quantizer is the source of truth and produces the same bytes, so a
+    /// broken temporary file costs a conversion time and nothing else.
+    fn spilled(
+        spill: &mut Option<PayloadSpill>,
+        plan: &PlannedTensor,
+        encoding: NativeEncoding,
+        index: usize,
+    ) -> Option<Vec<LogicalTile>> {
+        // Bound before the match so the `&mut` ends here: an arm clears
+        // `spill`.
+        let read = spill.as_mut().map(|store| store.take(index, encoding));
+        match read {
+            None => None,
+            Some(Ok(tiles)) => tiles,
+            Some(Err(error)) => {
+                log::warn!(
+                    "TCF: the payload spill is unusable ({error}); tensor '{}' and every \
+                     tensor after it is quantized again",
+                    plan.name
+                );
+                *spill = None;
+                None
+            }
+        }
+    }
+
+    /// Whether any tensor's payload still has to come from the source
+    /// checkpoint.
+    ///
+    /// True for a raw tensor, whose payload is its own source bytes, and for
+    /// one a profile bumped, whose spilled payload is at the base encoding.
+    fn needs_source(&self, spill: Option<&PayloadSpill>) -> bool {
+        self.planned
+            .iter()
+            .enumerate()
+            .any(|(index, plan)| match plan.encoding {
+                Encoding::Native(encoding) => {
+                    !spill.is_some_and(|spill| spill.holds(index, encoding))
+                }
+                _ => true,
+            })
+    }
+
+    /// Re-open the input checkpoint the payload pass reads from.
+    fn open_source(source: &str) -> Result<LoadedModel> {
+        ModelLoader::new(source)
+            .load()
+            .with_context(|| format!("Failed to re-open the input checkpoint: {source}"))
+    }
+
+    /// Read one tensor's source bytes, opening the checkpoint on first need.
+    fn reread(source: &str, model: &mut Option<LoadedModel>, name: &str) -> Result<Vec<u8>> {
+        if model.is_none() {
+            *model = Some(Self::open_source(source)?);
+        }
+        let model = model
+            .as_mut()
+            .ok_or_else(|| anyhow!("The TCF source checkpoint vanished after it was opened"))?;
+        model
+            .read_tensor_bytes(name)
+            .with_context(|| format!("Failed to re-read tensor '{name}'"))
     }
 
     /// Log the bits per weight the finished file achieved.
@@ -241,6 +375,20 @@ impl FormatWriter for TcfFormatWriter {
             .add_module(module_record(name, options))
             .map_err(|e| anyhow!(e))?;
 
+        // Beside the output, so the spill lands on the filesystem already
+        // sized for the file being written. A directory that refuses it is no
+        // reason to refuse the conversion: every tensor is then quantized a
+        // second time, as it was before the spill existed.
+        self.spill = match PayloadSpill::create(path) {
+            Ok(spill) => Some(spill),
+            Err(error) => {
+                log::warn!(
+                    "TCF: no payload spill ({error}); every tensor is quantized twice instead"
+                );
+                None
+            }
+        };
+
         self.path = Some(path.to_path_buf());
         self.writer = Some(writer);
         Ok(())
@@ -270,7 +418,8 @@ impl FormatWriter for TcfFormatWriter {
         Ok(())
     }
 
-    /// Settle and screen the next tensor, then drop its values.
+    /// Settle and screen the next tensor, spill the payload that screen
+    /// produced, then drop its values.
     fn write_tensor_data(&mut self, data: &[u8]) -> Result<()> {
         let index = self.planned.len();
         let registration = self
@@ -284,9 +433,18 @@ impl FormatWriter for TcfFormatWriter {
             })?
             .clone();
         let options = self.options()?;
-        let (plan, screen) = settle(options, &registration, data)?;
-        self.planned
-            .push(plan_one(options, &registration, plan, screen)?);
+        let settled = settle(options, &registration, data)?;
+        self.spill_payload(
+            settled.tiles.as_deref(),
+            options.encoding,
+            &registration.name,
+        );
+        self.planned.push(plan_one(
+            options,
+            &registration,
+            settled.plan,
+            settled.screen,
+        )?);
         Ok(())
     }
 
@@ -329,22 +487,46 @@ impl FormatWriter for TcfFormatWriter {
             .clone()
             .ok_or_else(|| anyhow!("TCF writer used before initialize()"))?;
 
-        let mut model = ModelLoader::new(&source)
-            .load()
-            .with_context(|| format!("Failed to re-open the input checkpoint: {source}"))?;
+        let mut spill = self.spill.take();
+        // Bound before the match so the `&mut` ends here: the arms reassign
+        // `spill`.
+        let sealed = spill.as_mut().map(PayloadSpill::seal);
+        match sealed {
+            Some(Ok(())) => {
+                log::info!("TCF: the payload pass reads pass 1's payloads back from a spill")
+            }
+            Some(Err(error)) => {
+                log::warn!(
+                    "TCF: the payload spill could not be sealed ({error}); every tensor is \
+                     quantized again instead"
+                );
+                spill = None;
+            }
+            None => {}
+        }
+
+        // Opened up front when any tensor needs it, so a source that has gone
+        // away fails before the output file exists rather than truncating it.
+        // A run whose every payload is spilled never touches the checkpoint
+        // again, and never reparses its header.
+        let mut model = if self.needs_source(spill.as_ref()) {
+            Some(Self::open_source(&source)?)
+        } else {
+            None
+        };
         let file = std::fs::File::create(&path)
             .with_context(|| format!("Failed to create {}", path.display()))?;
         let mut sink = BufWriter::new(file);
 
         let planned = &self.planned;
-        let registrations = &self.registrations;
+        let shapes = &self.shapes;
         // A `produce` error must reach the caller as itself: TcfError has no
         // room for one, so the real error is kept here and raised below.
         let mut failure: Option<anyhow::Error> = None;
         let result = writer.finish_streaming(&mut sink, |index| {
-            let produced = match (planned.get(index), registrations.get(index)) {
-                (Some(plan), Some(registration)) => {
-                    Self::payload(&mut model, plan, &registration.shape)
+            let produced = match (planned.get(index), shapes.get(index)) {
+                (Some(plan), Some(shape)) => {
+                    Self::payload(&source, &mut model, &mut spill, plan, shape, index)
                 }
                 _ => Err(anyhow!(
                     "TCF asked for tensor {index}, which was never planned"

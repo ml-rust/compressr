@@ -166,13 +166,47 @@ pub fn dims_of(shape: &[usize], name: &str) -> Result<[u64; 8]> {
     Ok(dims)
 }
 
-/// A shape's rank as TCF stores it.
+/// One tensor's shape in the two forms TCF asks for, derived once.
 ///
-/// # Errors
-/// Whatever [`dims_of`] rejects.
-pub fn rank_of(shape: &[usize], name: &str) -> Result<u32> {
-    dims_of(shape, name)?;
-    u32::try_from(shape.len()).with_context(|| format!("Tensor '{name}' has an unstorable rank"))
+/// The record stores the padded eight dimensions; the codec takes exactly
+/// `rank` of them and answers `E_INVALID_RANK` for any other count. Both come
+/// from one [`dims_of`] call, so the registration pass and the payload pass
+/// cannot disagree about a shape and cannot pay for it twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TensorShape {
+    dims: [u64; 8],
+    rank: u32,
+}
+
+impl TensorShape {
+    /// Derive both forms from a standard-order shape.
+    ///
+    /// # Errors
+    /// Whatever [`dims_of`] rejects, plus a rank that does not fit `u32`.
+    pub fn of(shape: &[usize], name: &str) -> Result<Self> {
+        let dims = dims_of(shape, name)?;
+        let rank = u32::try_from(shape.len())
+            .with_context(|| format!("Tensor '{name}' has an unstorable rank"))?;
+        Ok(Self { dims, rank })
+    }
+
+    /// The padded eight dimensions the record's wire shape carries.
+    pub fn dims(&self) -> [u64; 8] {
+        self.dims
+    }
+
+    /// The rank the record carries.
+    pub fn rank(&self) -> u32 {
+        self.rank
+    }
+
+    /// EXACTLY `rank` dimensions, which is what the codec accepts. Handing it
+    /// the padded eight is `E_INVALID_RANK`.
+    pub fn extent(&self) -> &[u64] {
+        let extent = usize::try_from(self.rank).unwrap_or(self.dims.len());
+        let extent = extent.min(self.dims.len());
+        &self.dims[..extent]
+    }
 }
 
 #[cfg(test)]
@@ -236,9 +270,14 @@ mod tests {
     #[test]
     fn dims_pad_to_eight_and_reject_an_unstorable_rank() {
         assert_eq!(dims_of(&[2, 64], "w").unwrap(), [2, 64, 0, 0, 0, 0, 0, 0]);
-        assert_eq!(rank_of(&[2, 64], "w").unwrap(), 2);
+        let shape = TensorShape::of(&[2, 64], "w").unwrap();
+        assert_eq!(shape.rank(), 2);
+        assert_eq!(shape.dims(), [2, 64, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(shape.extent(), &[2, 64]);
         assert!(dims_of(&[], "w").is_err());
         assert!(dims_of(&[1, 1, 1, 1, 1, 1, 1, 1, 1], "w").is_err());
+        assert!(TensorShape::of(&[], "w").is_err());
+        assert!(TensorShape::of(&[1, 1, 1, 1, 1, 1, 1, 1, 1], "w").is_err());
     }
 
     #[test]

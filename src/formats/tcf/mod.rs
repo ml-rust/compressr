@@ -23,6 +23,7 @@ mod parallel;
 mod plan;
 mod profile;
 mod record;
+mod spill;
 mod writer;
 
 pub use encoding::{parse_tcf_encoding, TcfOptions, TCF_ENCODING_NAMES};
