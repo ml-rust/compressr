@@ -15,6 +15,10 @@
 //! writes the bytes). If those two disagreed by a single tensor, every
 //! subsequent tensor offset in the file would be wrong, with no error raised.
 
+pub mod allocation;
+
+pub use allocation::{relative_rms_error, select_bumped, ScreenedTensor};
+
 use crate::loader::UnifiedDType;
 use crate::quantization::QuantType;
 use anyhow::{bail, Context, Result};

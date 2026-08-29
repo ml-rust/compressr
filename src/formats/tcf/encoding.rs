@@ -4,6 +4,7 @@
 use anyhow::{bail, Context, Result};
 use tcf_core::{NativeEncoding, RawEncoding};
 
+use super::profile::TcfProfile;
 use crate::loader::UnifiedDType;
 
 /// The `--tcf-encoding` values, in the order the CLI help lists them.
@@ -44,12 +45,42 @@ pub fn parse_tcf_encoding(s: &str) -> Result<NativeEncoding> {
 /// Both are explicit. `preferred_encoding` has no source of truth in a
 /// checkpoint, and TCF reads it to decide which tensors carry a
 /// `fallback_reason`, so compressr requires it rather than inventing one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `--tcf-encoding` sets one encoding for every tensor. `--tcf-profile` sets
+/// `encoding` and `preferred_encoding` to the profile's base and carries the
+/// profile, which raises the screened tensors to its bump encoding.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TcfOptions {
-    /// The encoding every quantizable tensor is written in
+    /// The encoding a quantizable tensor is written in unless a profile bumps it
     pub encoding: NativeEncoding,
     /// The module's highest-ranked `preferred_encoding`
     pub preferred_encoding: NativeEncoding,
+    /// The profile driving a mixed-precision allocation, if one was named
+    pub profile: Option<TcfProfile>,
+}
+
+impl TcfOptions {
+    /// One encoding for every quantizable tensor, as `--tcf-encoding` sets it.
+    pub fn uniform(encoding: NativeEncoding, preferred_encoding: NativeEncoding) -> Self {
+        Self {
+            encoding,
+            preferred_encoding,
+            profile: None,
+        }
+    }
+
+    /// A profile's allocation, as `--tcf-profile` sets it.
+    ///
+    /// The base encoding is also the module preference, so a tensor left at
+    /// the base records no fallback reason and a bumped one records
+    /// `TaskSensitivity`.
+    pub fn from_profile(profile: TcfProfile) -> Self {
+        Self {
+            encoding: profile.base,
+            preferred_encoding: profile.base,
+            profile: Some(profile),
+        }
+    }
 }
 
 /// The raw encoding a tensor stored unquantized keeps.

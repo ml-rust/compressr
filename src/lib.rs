@@ -12,6 +12,14 @@
 //! - Element-type casts between F32, F16 and BF16, round-to-nearest-even
 //! - GGUF block quantization: Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K
 //! - TCF v1 out, quantized once from the full-precision source
+//! - TCF profile allocation: a base encoding plus a bump encoding on the
+//!   worst-reconstructed share of the parameters
+//!
+//! A TCF profile is allocated from a WEIGHT-ERROR screen. `PROFILES.md`
+//! Section 4 step 2 measures a task-metric delta on a calibration set, which
+//! compressr cannot run, so `sensitivity_delta`, `sensitivity_ci95`,
+//! `sensitivity_samples` and `calibration_id` stay unset and no file compressr
+//! writes is profile-solved in that sense.
 //!
 //! TCF is produced from a full-precision checkpoint only. Converting a GGUF
 //! into one would quantize already-quantized weights a second time, so that
@@ -72,14 +80,17 @@ pub mod python;
 
 pub use cast::{cast_bytes, parse_target_dtype, torch_dtype_name, ACCEPTED_DTYPE_NAMES};
 pub use formats::{
-    parse_shard_size, parse_tcf_encoding, FormatWriter, GgufBatchWriter, GgufFormatWriter,
-    SafeTensorsFormatWriter, StreamingGgufWriter, TcfFormatWriter, TcfOptions,
-    DEFAULT_MAX_SHARD_SIZE, TCF_ENCODING_NAMES,
+    parse_shard_size, parse_tcf_encoding, parse_tcf_profile, FormatWriter, GgufBatchWriter,
+    GgufFormatWriter, SafeTensorsFormatWriter, StreamingGgufWriter, TcfFormatWriter, TcfOptions,
+    TcfProfile, DEFAULT_MAX_SHARD_SIZE, TCF_ENCODING_NAMES, TCF_PROFILE_NAMES,
 };
 pub use loader::{
     LayerGroup, LoadedModel, ModelLoader, ModelMetadata, UnifiedDType, UnifiedTensorInfo,
 };
-pub use policy::{plan_tcf_tensor, plan_tensor, FallbackReason, PlanCounts, TcfPlan, TensorPlan};
+pub use policy::{
+    plan_tcf_tensor, plan_tensor, relative_rms_error, select_bumped, FallbackReason, PlanCounts,
+    ScreenedTensor, TcfPlan, TensorPlan,
+};
 pub use quantization::{
     QuantType, QuantizationConfig, QuantizationMethod, QuantizedTensor, Quantizer,
 };
@@ -170,10 +181,17 @@ pub struct ConversionConfig {
     pub arch: Option<String>,
     /// TCF encoding, and the encoding its module declares as preferred
     ///
-    /// Required by [`OutputFormat::Tcf`] and rejected by every other format.
+    /// One of this and [`ConversionConfig::tcf_profile`] is required by
+    /// [`OutputFormat::Tcf`], and both are rejected by every other format.
     /// Neither value has a source of truth in a checkpoint, so compressr asks
     /// for both rather than defaulting them.
     pub tcf: Option<TcfOptions>,
+    /// TCF allocation profile, the alternative to [`ConversionConfig::tcf`]
+    ///
+    /// A profile names a base encoding, a bump encoding and the share of
+    /// quantizable parameters the bump covers, so it sets one encoding per
+    /// tensor rather than one for the whole model.
+    pub tcf_profile: Option<TcfProfile>,
     /// Verbose logging
     pub verbose: bool,
 }
@@ -191,6 +209,7 @@ impl ConversionConfig {
             max_shard_size: Some(DEFAULT_MAX_SHARD_SIZE),
             arch: None,
             tcf: None,
+            tcf_profile: None,
             verbose: false,
         }
     }
@@ -199,6 +218,25 @@ impl ConversionConfig {
     pub fn with_tcf(mut self, options: TcfOptions) -> Self {
         self.tcf = Some(options);
         self
+    }
+
+    /// Set the TCF allocation profile
+    pub fn with_tcf_profile(mut self, profile: TcfProfile) -> Self {
+        self.tcf_profile = Some(profile);
+        self
+    }
+
+    /// The TCF options a conversion runs with, from either flag.
+    ///
+    /// # Errors
+    /// Neither was given. [`ConversionConfig::validate`] refuses that first,
+    /// so reaching this is an internal error.
+    pub fn tcf_options(&self) -> Result<TcfOptions> {
+        match (self.tcf, self.tcf_profile) {
+            (Some(options), _) => Ok(options),
+            (None, Some(profile)) => Ok(TcfOptions::from_profile(profile)),
+            (None, None) => bail!("Internal error: --format tcf reached convert with no encoding"),
+        }
     }
 
     /// Set the architecture written to GGUF's `general.architecture`
@@ -244,6 +282,9 @@ impl ConversionConfig {
     ///   [`QuantizationMethod::is_writable`].
     /// - Quantization was requested for a non-GGUF output format.
     /// - The target dtype is not a supported float type.
+    /// - `--format tcf` was given with both `--tcf-profile` and
+    ///   `--tcf-encoding`, or with neither. A profile already fixes the base
+    ///   encoding, so the two flags cannot both describe the same file.
     ///
     /// Every check runs BEFORE any output file is created, because a mismatch
     /// caught by the writer instead surfaces halfway through the tensor loop
@@ -288,12 +329,20 @@ impl ConversionConfig {
             // encoding differs from the top-ranked one. Nothing in a
             // checkpoint names that preference, and compressr does I/O and
             // CLI rather than algorithm policy, so it is asked for.
-            if self.tcf.is_none() {
+            if self.tcf.is_some() && self.tcf_profile.is_some() {
                 bail!(
-                    "--format tcf needs --tcf-encoding and --tcf-preferred-encoding. \
-                     Neither has a default: the encoding fixes the stored weights, and the \
-                     preferred encoding decides which tensors record a fallback reason. \
-                     Accepted: {}",
+                    "--tcf-profile and --tcf-encoding are mutually exclusive: a profile \
+                     already names the base encoding, the bump encoding and the share of \
+                     parameters the bump covers. Pick one."
+                );
+            }
+            if self.tcf.is_none() && self.tcf_profile.is_none() {
+                bail!(
+                    "--format tcf needs --tcf-profile, or --tcf-encoding with \
+                     --tcf-preferred-encoding. Neither has a default: the encoding fixes the \
+                     stored weights, and the preferred encoding decides which tensors record \
+                     a fallback reason. Accepted profiles: {}. Accepted encodings: {}",
+                    TCF_PROFILE_NAMES.join(", "),
                     TCF_ENCODING_NAMES.join(", ")
                 );
             }
@@ -304,9 +353,10 @@ impl ConversionConfig {
                      meaning beside it."
                 );
             }
-        } else if self.tcf.is_some() {
+        } else if self.tcf.is_some() || self.tcf_profile.is_some() {
             bail!(
-                "--tcf-encoding applies to --format tcf only, but --format is {:?}.",
+                "--tcf-encoding and --tcf-profile apply to --format tcf only, but --format \
+                 is {:?}.",
                 self.output_format
             );
         }
@@ -597,20 +647,28 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
         // TCF quantizes from the full-precision source itself, so the writer
         // needs the input path as well as the encoding: its payload pass
         // re-reads one tensor at a time instead of holding every payload.
-        let options = config
-            .tcf
-            .context("Internal error: --format tcf reached convert with no encoding")?;
+        let options = config.tcf_options()?;
         let mut tcf_writer = TcfFormatWriter::new()
             .with_options(options)
             .with_source(&config.input_path);
         if let Some(name) = policy::model_name(Path::new(&config.input_path)) {
             tcf_writer = tcf_writer.with_module_name(&name);
         }
-        log::info!(
-            "TCF encoding: {:?}, module preferred encoding: {:?}",
-            options.encoding,
-            options.preferred_encoding
-        );
+        match options.profile {
+            Some(profile) => log::info!(
+                "TCF profile {}: base {:?}, bump {:?} on the top {:.0}% of quantizable \
+                 parameters",
+                profile.name,
+                profile.base,
+                profile.bump,
+                profile.bump_fraction * 100.0
+            ),
+            None => log::info!(
+                "TCF encoding: {:?}, module preferred encoding: {:?}",
+                options.encoding,
+                options.preferred_encoding
+            ),
+        }
         log::info!(
             "TCF calibration_id, activation_contract_id and workload_profile_id are left \
              unset: compressr runs no calibration and measures no workload."
@@ -874,10 +932,10 @@ mod tests {
     }
 
     fn tcf_options() -> TcfOptions {
-        TcfOptions {
-            encoding: tcf_core::NativeEncoding::Q4S32T64,
-            preferred_encoding: tcf_core::NativeEncoding::Q4S32T64,
-        }
+        TcfOptions::uniform(
+            tcf_core::NativeEncoding::Q4S32T64,
+            tcf_core::NativeEncoding::Q4S32T64,
+        )
     }
 
     /// The module's preferred encoding decides which tensors record a
@@ -889,8 +947,44 @@ mod tests {
         let config = ConversionConfig::new("input/".into(), "out.tcf".into(), OutputFormat::Tcf);
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("--tcf-preferred-encoding"), "{err}");
+        assert!(err.contains("--tcf-profile"), "{err}");
         assert!(err.contains("q4s32t64"), "{err}");
+        assert!(err.contains("balanced"), "{err}");
         assert!(!Path::new("out.tcf").exists());
+    }
+
+    /// A profile and a flat encoding describe the same file two ways. There
+    /// is no precedence rule, so both together is refused before any file is
+    /// opened.
+    #[test]
+    fn test_tcf_profile_and_tcf_encoding_are_mutually_exclusive() {
+        let config = ConversionConfig::new("input/".into(), "out.tcf".into(), OutputFormat::Tcf)
+            .with_tcf(tcf_options())
+            .with_tcf_profile(parse_tcf_profile("balanced").unwrap());
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("mutually exclusive"), "{err}");
+        assert!(!Path::new("out.tcf").exists());
+    }
+
+    #[test]
+    fn test_tcf_profile_alone_validates() {
+        let config = ConversionConfig::new("input/".into(), "out.tcf".into(), OutputFormat::Tcf)
+            .with_tcf_profile(parse_tcf_profile("compact").unwrap());
+        assert!(config.validate().is_ok());
+        // A profile is its own preferred encoding, so a bumped tensor differs
+        // from the module preference and records a reason.
+        let options = config.tcf_options().unwrap();
+        assert_eq!(options.encoding, options.preferred_encoding);
+        assert_eq!(options.encoding, tcf_core::NativeEncoding::Q4AS64T64);
+    }
+
+    /// A profile applies to TCF alone, exactly as the encoding flags do.
+    #[test]
+    fn test_tcf_profile_is_refused_for_another_format() {
+        let config = ConversionConfig::new("input/".into(), "out.gguf".into(), OutputFormat::Gguf)
+            .with_tcf_profile(parse_tcf_profile("high").unwrap());
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("--format tcf only"), "{err}");
     }
 
     #[test]

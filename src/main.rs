@@ -18,6 +18,9 @@
 //! compressr convert model/ --format tcf --tcf-encoding q4s32t64 \
 //!     --tcf-preferred-encoding q4s32t64
 //!
+//! # Or let a profile allocate the encodings, mixed precision
+//! compressr convert model/ --format tcf --tcf-profile balanced
+//!
 //! # Shard the output at 2 GB instead of the 5 GB default
 //! compressr convert model/ --format safetensors --dtype bf16 --max-shard-size 2GB
 //!
@@ -32,8 +35,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use compressr::{
-    parse_tcf_encoding, ConversionConfig, OutputFormat, QuantizationConfig, QuantizationMethod,
-    TcfOptions,
+    parse_tcf_encoding, parse_tcf_profile, ConversionConfig, OutputFormat, QuantizationConfig,
+    QuantizationMethod, TcfOptions,
 };
 
 #[derive(Parser)]
@@ -98,6 +101,16 @@ enum Commands {
         /// carries the preference, so compressr never defaults it.
         #[arg(long, value_name = "ENCODING")]
         tcf_preferred_encoding: Option<String>,
+
+        /// TCF allocation profile (ref, high, balanced, compact)
+        ///
+        /// The alternative to --tcf-encoding, and mutually exclusive with it.
+        /// A profile is mixed precision: a base encoding for every quantizable
+        /// tensor, and a bump encoding on the worst-reconstructed share of the
+        /// parameters. compressr ranks that share by a weight-error screen and
+        /// runs no task-metric calibration.
+        #[arg(long, value_name = "PROFILE")]
+        tcf_profile: Option<String>,
 
         /// Architecture written to GGUF's general.architecture (e.g. llama, qwen2)
         ///
@@ -188,6 +201,7 @@ fn main() -> Result<()> {
             max_shard_size,
             tcf_encoding,
             tcf_preferred_encoding,
+            tcf_profile,
             arch,
             verbose,
         } => {
@@ -206,6 +220,7 @@ fn main() -> Result<()> {
                 .transpose()?;
             let tcf_options =
                 parse_tcf_options(tcf_encoding.as_deref(), tcf_preferred_encoding.as_deref())?;
+            let tcf_profile = tcf_profile.as_deref().map(parse_tcf_profile).transpose()?;
 
             let output_path = output.unwrap_or_else(|| {
                 default_output_path(
@@ -232,6 +247,9 @@ fn main() -> Result<()> {
             if let Some(tcf_options) = tcf_options {
                 config = config.with_tcf(tcf_options);
             }
+            if let Some(tcf_profile) = tcf_profile {
+                config = config.with_tcf_profile(tcf_profile);
+            }
 
             let stats = compressr::convert(config)?;
             println!("\n{}", stats);
@@ -239,6 +257,29 @@ fn main() -> Result<()> {
                 println!(
                     "TCF calibration_id, activation_contract_id and workload_profile_id are \
                      unset: compressr runs no calibration and measures no workload."
+                );
+            }
+            if let Some(profile) = tcf_profile {
+                println!(
+                    "TCF profile {}: base {:?}, bump {:?} over the top {:.0}% of quantizable \
+                     parameters, counted in elements.",
+                    profile.name,
+                    profile.base,
+                    profile.bump,
+                    profile.bump_fraction * 100.0
+                );
+                println!(
+                    "That share was ranked by a WEIGHT-ERROR screen: each tensor was quantized \
+                     at the base encoding, dequantized again, and scored by the relative RMS of \
+                     the error. No task-metric calibration was run, so sensitivity_delta, \
+                     sensitivity_ci95, sensitivity_samples and calibration_id are unset and \
+                     this file is NOT profile-solved per PROFILES.md Section 4."
+                );
+                println!(
+                    "The ladder's {:.2} bpw for {} assumes that allocation. The bpw this file \
+                     achieved is measured from the bytes written and is logged as \
+                     \"bpw achieved\".",
+                    profile.ladder_bpw, profile.name
                 );
             }
         }
@@ -405,10 +446,10 @@ fn parse_tcf_options(
 ) -> Result<Option<TcfOptions>> {
     match (encoding, preferred) {
         (None, None) => Ok(None),
-        (Some(encoding), Some(preferred)) => Ok(Some(TcfOptions {
-            encoding: parse_tcf_encoding(encoding)?,
-            preferred_encoding: parse_tcf_encoding(preferred)?,
-        })),
+        (Some(encoding), Some(preferred)) => Ok(Some(TcfOptions::uniform(
+            parse_tcf_encoding(encoding)?,
+            parse_tcf_encoding(preferred)?,
+        ))),
         (Some(_), None) => anyhow::bail!(
             "--tcf-encoding was given without --tcf-preferred-encoding. TCF records a \
              fallback reason on every tensor whose encoding differs from its module's \
@@ -589,6 +630,38 @@ mod tests {
             }
             _ => panic!("expected the convert subcommand"),
         }
+    }
+
+    #[test]
+    fn test_convert_parses_the_tcf_profile_flag() {
+        let cli = Cli::try_parse_from([
+            "compressr",
+            "convert",
+            "model/",
+            "--format",
+            "tcf",
+            "--tcf-profile",
+            "balanced",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Convert { tcf_profile, .. } => {
+                let profile = parse_tcf_profile(tcf_profile.as_deref().expect("the flag")).unwrap();
+                assert_eq!(profile.name, "TCF-BALANCED");
+                assert_eq!(profile.bump_fraction, 0.15);
+            }
+            _ => panic!("expected the convert subcommand"),
+        }
+    }
+
+    /// A profile name is a rung of the ladder, so an unknown one is refused
+    /// with the accepted names.
+    #[test]
+    fn test_unknown_tcf_profile_is_refused() {
+        let err = parse_tcf_profile("tiny").unwrap_err().to_string();
+        assert!(err.contains("Unsupported TCF profile: tiny"), "{err}");
+        assert!(err.contains("balanced"), "{err}");
     }
 
     /// Bit width alone names no TCF encoding, so an unknown value is refused

@@ -11,13 +11,17 @@
 //! afterwards from a reader of its own:
 //!
 //! 1. [`FormatWriter::write_tensor_data`] quantizes the tensor, keeps the
-//!    verdict, drops the tiles, and registers the record. A tensor the
+//!    verdict and the screen error, and drops the tiles. A tensor the
 //!    quantizer rejects is re-planned as raw with the reason it gave, and the
 //!    run continues.
-//! 2. [`FormatWriter::finalize`] adds no records: every one is already
-//!    registered, so `TcfWriter::finish_streaming` pulls one payload at a
-//!    time, writes it at its precomputed offset, and drops it before asking
+//! 2. [`FormatWriter::finalize`] runs the profile allocation, registers every
+//!    record, and then lets `TcfWriter::finish_streaming` pull one payload at
+//!    a time, write it at its precomputed offset, and drop it before asking
 //!    for the next.
+//!
+//! Registration waits for `finalize` because a profile's bump set is a
+//! comparison across tensors: which tensors carry the bump encoding is unknown
+//! until the last one has been screened.
 //!
 //! Each tensor is therefore read and quantized twice, and at most one tensor's
 //! values are resident at any point. That second read is the price of a
@@ -32,38 +36,15 @@ use anyhow::{anyhow, bail, Context, Result};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use tcf_core::{encoding::quantize, Encoding, NativeEncoding, Payload, TcfError, TcfWriter};
+use tcf_core::{encoding::quantize, Encoding, Payload, TcfError, TcfWriter};
 
-use super::encoding::{
-    dims_of, rank_of, raw_encoding_for, values_f32, TcfOptions, TCF_ENCODING_NAMES,
-};
+use super::encoding::{dims_of, rank_of, values_f32, TcfOptions, TCF_ENCODING_NAMES};
+use super::plan::{allocate, plan_one, reason_for, settle, PlannedTensor, Registration};
 use super::record::{module_record, tensor_record};
 use crate::formats::FormatWriter;
 use crate::loader::{LoadedModel, ModelLoader, UnifiedDType};
-use crate::policy::{plan_tcf_tensor, tcf_fallback_reason, FallbackReason, TcfPlan};
+use crate::policy::TcfPlan;
 use crate::quantization::QuantType;
-
-/// One tensor as registered, before its values decide anything.
-#[derive(Debug, Clone)]
-struct Registration {
-    name: String,
-    shape: Vec<usize>,
-    dtype: UnifiedDType,
-}
-
-/// One tensor's settled plan: what its record says, and how pass 2 produces
-/// its payload.
-#[derive(Debug, Clone)]
-pub struct PlannedTensor {
-    /// Tensor name, as the source checkpoint spells it
-    pub name: String,
-    /// Source element type, which the raw path stores verbatim
-    pub dtype: UnifiedDType,
-    /// `None` for a quantized tensor, otherwise why it is stored raw
-    pub fallback: Option<FallbackReason>,
-    /// The encoding written to the record
-    pub encoding: Encoding,
-}
 
 /// TCF format writer.
 ///
@@ -126,116 +107,52 @@ impl TcfFormatWriter {
     fn options(&self) -> Result<TcfOptions> {
         self.options.ok_or_else(|| {
             anyhow!(
-                "TCF output needs an encoding: pass --tcf-encoding and \
-                 --tcf-preferred-encoding. Accepted: {}",
+                "TCF output needs an encoding: pass --tcf-profile, or --tcf-encoding with \
+                 --tcf-preferred-encoding. Accepted encodings: {}",
                 TCF_ENCODING_NAMES.join(", ")
             )
         })
     }
 
-    /// The `fallback_reason` a quantized tensor carries.
-    ///
-    /// SPECIFICATION.md Section 8.6 makes the field mandatory whenever the
-    /// encoding differs from the module's highest-ranked preference, which a
-    /// quantized tensor does whenever the two flags disagree.
-    fn quantized_reason(options: TcfOptions) -> tcf_core::FallbackReason {
-        if options.encoding == options.preferred_encoding {
-            tcf_core::FallbackReason::None
-        } else {
-            tcf_core::FallbackReason::ProducerPolicy
-        }
-    }
-
-    /// Settle one tensor's plan from its shape and, when the shape allows
-    /// quantization, from its values.
-    ///
-    /// The quantizer is the only thing that can see a NaN or a scale that
-    /// underflows binary16, so those two fallbacks are decided here, in the
-    /// conversion loop, and never abort the run.
-    fn settle(&self, registration: &Registration, data: &[u8]) -> Result<TcfPlan> {
+    /// Register every settled record with `tcf-core`, in directory order.
+    fn register_all(&mut self) -> Result<()> {
         let options = self.options()?;
-        let geometry = options.encoding.geometry();
-        let plan = plan_tcf_tensor(&registration.shape, registration.dtype, geometry.tile);
-        if plan != TcfPlan::Quantize {
-            return Ok(plan);
+        for index in 0..self.planned.len() {
+            let plan = self
+                .planned
+                .get(index)
+                .cloned()
+                .ok_or_else(|| anyhow!("TCF plan {index} vanished before registration"))?;
+            let shape = self
+                .registrations
+                .get(index)
+                .map(|registration| registration.shape.clone())
+                .ok_or_else(|| anyhow!("TCF planned tensor {index} was never registered"))?;
+
+            let name = plan.name.as_str();
+            let dims = dims_of(&shape, name)?;
+            let rank = rank_of(&shape, name)?;
+            let tensor_id =
+                u32::try_from(index).context("More tensors than a TCF file can hold")?;
+            let reason = reason_for(&plan, options);
+
+            let writer = self
+                .writer
+                .as_mut()
+                .ok_or_else(|| anyhow!("TCF writer used before initialize()"))?;
+            let interned = writer
+                .intern(name)
+                .map_err(|e| anyhow!(e))
+                .with_context(|| format!("Failed to intern tensor name '{name}'"))?;
+            let record = tensor_record(tensor_id, interned, plan.encoding, reason, dims, rank);
+            let registered = match plan.encoding {
+                Encoding::Native(_) => writer.register_quantized_tensor(record),
+                _ => writer.register_raw_tensor(record),
+            };
+            registered
+                .map_err(|e| anyhow!(e))
+                .with_context(|| format!("Failed to register tensor '{name}'"))?;
         }
-
-        let name = registration.name.as_str();
-        let values = values_f32(data, registration.dtype, name)?;
-        let dims = dims_of(&registration.shape, name)?;
-        let rank = rank_of(&registration.shape, name)?;
-        // The tiles are dropped here: pass 2 recomputes them one tensor at a
-        // time, so keeping them would break the one-tensor-in-flight bound.
-        // `quantize` wants EXACTLY `rank` dims; the padded `[u64; 8]` is the
-        // record's wire shape, not the codec's. Passing all eight is
-        // `E_INVALID_RANK`.
-        let extent = usize::try_from(rank).unwrap_or(dims.len());
-        match quantize(&values, &dims[..extent], rank, geometry) {
-            Ok(_) => Ok(TcfPlan::Quantize),
-            Err(TcfError::SourceNonfinite { .. }) => {
-                log::warn!("Tensor '{name}' holds a NaN or an infinity: storing it unquantized");
-                Ok(TcfPlan::Raw(FallbackReason::SourceNonfinite))
-            }
-            Err(TcfError::NumericRange { .. }) => {
-                log::warn!(
-                    "Tensor '{name}' has a group whose scale is not representable at {:?}: \
-                     storing it unquantized",
-                    options.encoding
-                );
-                Ok(TcfPlan::Raw(FallbackReason::NumericRange))
-            }
-            Err(other) => {
-                Err(anyhow!(other)).with_context(|| format!("Failed to quantize tensor '{name}'"))
-            }
-        }
-    }
-
-    /// Register one settled tensor's record with `tcf-core`.
-    fn register(&mut self, registration: &Registration, plan: TcfPlan) -> Result<()> {
-        let options = self.options()?;
-        let index = self.planned.len();
-        let name = registration.name.as_str();
-        let dims = dims_of(&registration.shape, name)?;
-        let rank = rank_of(&registration.shape, name)?;
-
-        let (encoding, reason) = match plan {
-            TcfPlan::Quantize => (
-                Encoding::Native(options.encoding),
-                Self::quantized_reason(options),
-            ),
-            TcfPlan::Raw(reason) => (
-                Encoding::Raw(raw_encoding_for(registration.dtype, name)?),
-                tcf_fallback_reason(reason),
-            ),
-        };
-
-        let tensor_id = u32::try_from(index).context("More tensors than a TCF file can hold")?;
-        let writer = self
-            .writer
-            .as_mut()
-            .ok_or_else(|| anyhow!("TCF writer used before initialize()"))?;
-        let interned = writer
-            .intern(name)
-            .map_err(|e| anyhow!(e))
-            .with_context(|| format!("Failed to intern tensor name '{name}'"))?;
-        let record = tensor_record(tensor_id, interned, encoding, reason, dims, rank);
-        let registered = match plan {
-            TcfPlan::Quantize => writer.register_quantized_tensor(record),
-            TcfPlan::Raw(_) => writer.register_raw_tensor(record),
-        };
-        registered
-            .map_err(|e| anyhow!(e))
-            .with_context(|| format!("Failed to register tensor '{name}'"))?;
-
-        self.planned.push(PlannedTensor {
-            name: registration.name.clone(),
-            dtype: registration.dtype,
-            fallback: match plan {
-                TcfPlan::Quantize => None,
-                TcfPlan::Raw(reason) => Some(reason),
-            },
-            encoding,
-        });
         Ok(())
     }
 
@@ -243,21 +160,20 @@ impl TcfFormatWriter {
     ///
     /// The payload is returned by value and dropped by `tcf-core` as soon as
     /// it is written, so one tensor is resident at a time.
-    fn payload(
-        model: &mut LoadedModel,
-        plan: &PlannedTensor,
-        encoding: NativeEncoding,
-        shape: &[usize],
-    ) -> Result<Payload> {
+    fn payload(model: &mut LoadedModel, plan: &PlannedTensor, shape: &[usize]) -> Result<Payload> {
         let name = plan.name.as_str();
         let bytes = model
             .read_tensor_bytes(name)
             .with_context(|| format!("Failed to re-read tensor '{name}'"))?;
-        if plan.fallback.is_some() {
+        // The plan's own encoding drives this, not the run's base encoding: a
+        // profile bumps some tensors, and quantizing one at the base here
+        // would write a payload its record does not describe.
+        let encoding = match plan.encoding {
+            Encoding::Native(encoding) => encoding,
             // A raw tensor keeps its source element type, so its bytes are
             // the payload.
-            return Ok(Payload::Raw(bytes));
-        }
+            _ => return Ok(Payload::Raw(bytes)),
+        };
         let values = values_f32(&bytes, plan.dtype, name)?;
         let dims = dims_of(shape, name)?;
         let rank = rank_of(shape, name)?;
@@ -267,6 +183,35 @@ impl TcfFormatWriter {
             .map_err(|e| anyhow!(e))
             .with_context(|| format!("Failed to quantize tensor '{name}'"))?;
         Ok(Payload::Quantized(tiles))
+    }
+
+    /// Log the bits per weight the finished file achieved.
+    ///
+    /// Measured from the bytes on disk over every tensor's element count, raw
+    /// tensors and container overhead included. A profile's ladder bpw is a
+    /// target computed under `PROFILES.md` Section 4's own allocation, so the
+    /// two numbers are never claimed to be equal.
+    fn report_bpw(&self, path: &Path) -> Result<()> {
+        let bytes = std::fs::metadata(path)
+            .with_context(|| format!("Failed to measure {}", path.display()))?
+            .len();
+        let elements: u64 = self
+            .planned
+            .iter()
+            .fold(0u64, |acc, plan| acc.saturating_add(plan.elements));
+        if elements == 0 {
+            return Ok(());
+        }
+        let bpw = bytes as f64 * 8.0 / elements as f64;
+        let target = match self.options.and_then(|options| options.profile) {
+            Some(profile) => format!(
+                ", against the {} ladder target of {:.2} bpw, which assumes its own allocation",
+                profile.name, profile.ladder_bpw
+            ),
+            None => String::new(),
+        };
+        log::info!("TCF: {bytes} bytes over {elements} weights, {bpw:.2} bpw achieved{target}");
+        Ok(())
     }
 }
 
@@ -326,7 +271,7 @@ impl FormatWriter for TcfFormatWriter {
         Ok(())
     }
 
-    /// Settle and register the next tensor's record, then drop its values.
+    /// Settle and screen the next tensor, then drop its values.
     fn write_tensor_data(&mut self, data: &[u8]) -> Result<()> {
         let index = self.planned.len();
         let registration = self
@@ -339,15 +284,19 @@ impl FormatWriter for TcfFormatWriter {
                 )
             })?
             .clone();
-        let plan = self.settle(&registration, data)?;
-        self.register(&registration, plan)
+        let options = self.options()?;
+        let (plan, screen) = settle(options, &registration, data)?;
+        self.planned
+            .push(plan_one(options, &registration, plan, screen)?);
+        Ok(())
     }
 
-    /// Write the file, pulling one payload at a time.
+    /// Allocate, register every record, then write the file one payload at a
+    /// time.
     fn finalize(&mut self) -> Result<()> {
-        let Some(writer) = self.writer.take() else {
+        if self.writer.is_none() {
             return Ok(());
-        };
+        }
         if self.planned.len() != self.registrations.len() {
             bail!(
                 "TCF writer has {} registered tensors but {} payloads",
@@ -365,6 +314,13 @@ impl FormatWriter for TcfFormatWriter {
         log::info!("TCF: {counts}");
 
         let options = self.options()?;
+        allocate(&mut self.planned, options)?;
+        self.register_all()?;
+        let writer = self
+            .writer
+            .take()
+            .ok_or_else(|| anyhow!("TCF writer used before initialize()"))?;
+
         let path = self
             .path
             .clone()
@@ -389,7 +345,7 @@ impl FormatWriter for TcfFormatWriter {
         let result = writer.finish_streaming(&mut sink, |index| {
             let produced = match (planned.get(index), registrations.get(index)) {
                 (Some(plan), Some(registration)) => {
-                    Self::payload(&mut model, plan, options.encoding, &registration.shape)
+                    Self::payload(&mut model, plan, &registration.shape)
                 }
                 _ => Err(anyhow!(
                     "TCF asked for tensor {index}, which was never planned"
@@ -417,6 +373,7 @@ impl FormatWriter for TcfFormatWriter {
         // `finish_streaming` never flushes: the buffer is this writer's.
         sink.flush()
             .with_context(|| format!("Failed to flush {}", path.display()))?;
+        self.report_bpw(&path)?;
         Ok(())
     }
 }
@@ -424,14 +381,12 @@ impl FormatWriter for TcfFormatWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::formats::SafeTensorsFormatWriter;
-    use tcf_core::{RawEncoding, TcfFile};
+    use crate::formats::{parse_tcf_profile, SafeTensorsFormatWriter};
+    use crate::policy::FallbackReason;
+    use tcf_core::{NativeEncoding, RawEncoding, TcfFile};
 
     fn options() -> TcfOptions {
-        TcfOptions {
-            encoding: NativeEncoding::Q4S32T64,
-            preferred_encoding: NativeEncoding::Q4S32T64,
-        }
+        TcfOptions::uniform(NativeEncoding::Q4S32T64, NativeEncoding::Q4S32T64)
     }
 
     fn f32_bytes(values: &[f32]) -> Vec<u8> {
@@ -532,6 +487,155 @@ mod tests {
             err.contains("quantizes from full-precision values"),
             "{err}"
         );
+    }
+
+    /// A ramp spreads evenly over the reconstruction levels. Every value of
+    /// [`off_grid`] but the two endpoints sits halfway between two of them,
+    /// which is the worst place a value can sit.
+    fn ramp() -> Vec<f32> {
+        (0..64).map(|i| i as f32).collect()
+    }
+
+    /// 62 values half a step away from any reconstruction level, between two
+    /// endpoints that fix the range.
+    fn off_grid() -> Vec<f32> {
+        let mut values = vec![0.5f32; 64];
+        values[0] = 0.0;
+        values[1] = 15.0;
+        values
+    }
+
+    /// The screen ranks by how badly the base encoding reconstructs a tensor,
+    /// so the evenly spread ramp scores below the off-grid tensor.
+    #[test]
+    fn the_screen_scores_an_off_grid_tensor_above_a_ramp() {
+        let mut writer = planned_writer();
+        writer
+            .register_tensor("ramp", &[1, 64], UnifiedDType::F32, None)
+            .expect("registers");
+        writer
+            .register_tensor("off_grid", &[1, 64], UnifiedDType::F32, None)
+            .expect("registers");
+        writer
+            .write_tensor_data(&f32_bytes(&ramp()))
+            .expect("settles");
+        writer
+            .write_tensor_data(&f32_bytes(&off_grid()))
+            .expect("settles");
+
+        let planned = writer.planned();
+        let ramp_error = planned[0]
+            .screen_error
+            .expect("a quantized tensor is screened");
+        let off_grid_error = planned[1]
+            .screen_error
+            .expect("a quantized tensor is screened");
+        assert!(
+            off_grid_error > ramp_error,
+            "{off_grid_error} vs {ramp_error}"
+        );
+        assert_eq!(planned[0].elements, 64);
+    }
+
+    /// A raw tensor has no base encoding to be measured against, so it is
+    /// screened not at all and is no bump candidate.
+    #[test]
+    fn a_raw_tensor_carries_no_screen_error() {
+        let mut writer = planned_writer();
+        let plan = plan_one(&mut writer, &[64], &vec![0.5f32; 64]);
+        assert_eq!(plan.fallback, Some(FallbackReason::Rank));
+        assert_eq!(plan.screen_error, None);
+        assert_eq!(plan.elements, 64);
+    }
+
+    /// A profile is mixed precision. The worst-reconstructed share of the
+    /// QUANTIZABLE parameters carries the bump encoding and records
+    /// `TaskSensitivity` for it; a tensor left at the base records no reason
+    /// at all.
+    ///
+    /// The rank-1 tensor here is 4096 elements against the two candidates'
+    /// 64 each. Counted in the budget it would raise `TCF-COMPACT`'s 10% from
+    /// 12.8 elements to 422.4 and bump both candidates, so the ramp staying
+    /// at the base is what proves the exclusion.
+    #[test]
+    fn a_profile_bumps_the_worst_reconstructed_tensors() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("model.safetensors");
+        let ramp = ramp();
+        let off_grid = off_grid();
+        let bias = vec![0.5f32; 4096];
+        let tensors: [(&str, &[usize], &[f32]); 3] = [
+            ("ramp", &[1, 64], &ramp),
+            ("off_grid", &[1, 64], &off_grid),
+            ("bias", &[4096], &bias),
+        ];
+
+        let mut fixture = SafeTensorsFormatWriter::new();
+        for (name, shape, _) in tensors {
+            fixture
+                .register_tensor(name, shape, UnifiedDType::F32, None)
+                .expect("registers");
+        }
+        fixture.initialize(&source).expect("initializes");
+        for (_, _, values) in tensors {
+            fixture
+                .write_tensor_data(&f32_bytes(values))
+                .expect("writes");
+        }
+        fixture.finalize().expect("finalizes");
+
+        let profile = parse_tcf_profile("compact").expect("a ladder rung");
+        let out = dir.path().join("model.tcf");
+        let mut writer = TcfFormatWriter::new()
+            .with_options(TcfOptions::from_profile(profile))
+            .with_source(source.to_str().expect("utf8 path"));
+        writer.initialize(&out).expect("initializes");
+        for (name, shape, _) in tensors {
+            writer
+                .register_tensor(name, shape, UnifiedDType::F32, None)
+                .expect("registers");
+        }
+        for (_, _, values) in tensors {
+            writer
+                .write_tensor_data(&f32_bytes(values))
+                .expect("settles a plan");
+        }
+        writer.finalize().expect("writes");
+
+        assert_eq!(
+            writer.planned().iter().filter(|plan| plan.bumped).count(),
+            1,
+            "one candidate fills TCF-COMPACT's element budget"
+        );
+
+        let bytes = std::fs::read(&out).expect("reads the output back");
+        let file = TcfFile::open(&bytes).expect("tcf-core accepts the file");
+        let records = file.tensors();
+        let at = |wanted: &str| -> usize {
+            records
+                .iter()
+                .position(|tensor| file.string(tensor.name).ok() == Some(wanted))
+                .expect("a tensor of that name")
+        };
+
+        let bumped = &records[at("off_grid")];
+        assert_eq!(bumped.encoding, Encoding::Native(NativeEncoding::Q6S32T64));
+        assert_eq!(
+            bumped.fallback_reason,
+            tcf_core::FallbackReason::TaskSensitivity
+        );
+
+        let base = &records[at("ramp")];
+        assert_eq!(base.encoding, Encoding::Native(NativeEncoding::Q4AS64T64));
+        assert_eq!(base.fallback_reason, tcf_core::FallbackReason::None);
+
+        let raw = &records[at("bias")];
+        assert_eq!(raw.encoding, Encoding::Raw(RawEncoding::F32));
+        assert_eq!(raw.fallback_reason, tcf_core::FallbackReason::RankLt2);
+
+        for tensor in records {
+            file.verify_tensor(tensor).expect("digests and proofs hold");
+        }
     }
 
     /// The file is read back by `tcf-core`'s own reader, never by anything

@@ -16,8 +16,12 @@
 //! proves nothing.
 
 mod encoding;
+mod plan;
+mod profile;
 mod record;
 mod writer;
 
 pub use encoding::{parse_tcf_encoding, TcfOptions, TCF_ENCODING_NAMES};
-pub use writer::{PlannedTensor, TcfFormatWriter};
+pub use plan::PlannedTensor;
+pub use profile::{parse_tcf_profile, TcfProfile, TCF_PROFILE_NAMES};
+pub use writer::TcfFormatWriter;

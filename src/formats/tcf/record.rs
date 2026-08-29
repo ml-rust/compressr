@@ -106,10 +106,7 @@ mod tests {
     use tcf_core::NativeEncoding;
 
     fn options() -> TcfOptions {
-        TcfOptions {
-            encoding: NativeEncoding::Q4S32T64,
-            preferred_encoding: NativeEncoding::Q6S32T64,
-        }
+        TcfOptions::uniform(NativeEncoding::Q4S32T64, NativeEncoding::Q6S32T64)
     }
 
     #[test]
