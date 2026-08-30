@@ -7,6 +7,9 @@
 //!
 //! - SafeTensors in, single file or sharded by `model.safetensors.index.json`
 //! - GGUF in, for re-conversion
+//! - TCF in, read back through boostr's reader: every payload is verified
+//!   against its digests and proof vector, then decoded to f32
+//! - PyTorch in, one `.pt` / `.pth` / `.bin` state dict, F32 and F64 tensors
 //! - SafeTensors out, sharded at a byte limit with a matching index
 //! - GGUF v3 out, one self-contained file
 //! - Element-type casts between F32, F16 and BF16, round-to-nearest-even
@@ -22,13 +25,13 @@
 //! writes is profile-solved in that sense.
 //!
 //! TCF is produced from a full-precision checkpoint only. Converting a GGUF
-//! into one would quantize already-quantized weights a second time, so that
-//! path does not exist.
+//! or a TCF into one would quantize already-quantized weights a second time,
+//! so that path does not exist.
 //!
 //! GPTQ, AWQ, NF4, FP8 and EXL2 are NOT implemented. Each has a
 //! [`QuantizationMethod`] or [`OutputFormat`] variant, and each is refused
 //! before any output file is created — see [`ConversionConfig::validate`] and
-//! [`formats::create_writer`]. PyTorch and ONNX inputs are refused the same way.
+//! [`formats::create_writer`]. ONNX input is refused the same way.
 //!
 //! # Memory
 //!
@@ -85,7 +88,8 @@ pub use formats::{
     TcfOptions, TcfProfile, DEFAULT_MAX_SHARD_SIZE, TCF_ENCODING_NAMES, TCF_PROFILE_NAMES,
 };
 pub use loader::{
-    LayerGroup, LoadedModel, ModelLoader, ModelMetadata, UnifiedDType, UnifiedTensorInfo,
+    LayerGroup, LoadedModel, ModelLoader, ModelMetadata, TcfFileFacts, TcfModuleFacts,
+    TcfTensorFacts, UnifiedDType, UnifiedTensorInfo,
 };
 pub use policy::{
     plan_tcf_tensor, plan_tensor, relative_rms_error, select_bumped, FallbackReason, PlanCounts,
@@ -106,12 +110,14 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub enum InputFormat {
     /// Hugging Face Safetensors (native, single file or sharded with an index)
     Safetensors,
-    /// PyTorch state dict (.bin, .pt)
+    /// PyTorch state dict (.bin, .pt, .pth)
     PyTorch,
     /// ONNX protobuf
     Onnx,
     /// GGUF format (for re-quantization)
     Gguf,
+    /// Tensor Contract Format v1, read back through boostr's reader
+    Tcf,
 }
 
 /// Supported output formats
@@ -522,16 +528,19 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
         .load()
         .with_context(|| format!("Failed to load model from: {}", config.input_path))?;
 
-    // TCF is quantized once, from full-precision weights. A GGUF input is
-    // already quantized, so writing TCF from one would quantize twice and
-    // would need a GGML dequantizer per block format. Refused here, before
-    // any output file exists.
-    if config.output_format == OutputFormat::Tcf && model.format() == InputFormat::Gguf {
+    // TCF is quantized once, from full-precision weights. A GGUF or TCF input
+    // is already quantized, so writing TCF from one would quantize twice: the
+    // second pass would work from values the first pass already rounded.
+    // Refused here, before any output file exists.
+    if config.output_format == OutputFormat::Tcf
+        && matches!(model.format(), InputFormat::Gguf | InputFormat::Tcf)
+    {
         bail!(
-            "TCF is produced from a full-precision checkpoint, and '{}' is GGUF. Convert \
+            "TCF is produced from a full-precision checkpoint, and '{}' is {:?}. Convert \
              from the SafeTensors source instead: quantizing an already-quantized tensor \
              loses accuracy twice.",
-            config.input_path
+            config.input_path,
+            model.format()
         );
     }
 
@@ -842,11 +851,13 @@ pub fn get_model_info(path: &str) -> Result<ModelInfo> {
             shape: info.shape.iter().map(|&x| x as i64).collect(),
             dtype: format!("{:?}", info.dtype),
             size_bytes: info.size_bytes as u64,
+            tcf: info.tcf,
         })
         .collect();
 
     let total_size = model.total_size_bytes();
     let metadata = model.metadata();
+    let tcf = model.tcf_facts().cloned();
 
     Ok(ModelInfo {
         path: path.to_string(),
@@ -855,6 +866,7 @@ pub fn get_model_info(path: &str) -> Result<ModelInfo> {
         total_size_bytes: total_size as u64,
         metadata: Some(metadata),
         tensors,
+        tcf,
     })
 }
 
@@ -873,6 +885,8 @@ pub struct ModelInfo {
     pub metadata: Option<ModelMetadata>,
     /// Per-tensor summaries
     pub tensors: Vec<TensorSummary>,
+    /// TCF's file-level structure, or `None` for every other format
+    pub tcf: Option<TcfFileFacts>,
 }
 
 /// Summary of a single tensor
@@ -884,8 +898,10 @@ pub struct TensorSummary {
     pub shape: Vec<i64>,
     /// Data type
     pub dtype: String,
-    /// Size in bytes
+    /// Size in bytes, as the tensor is stored in its input file
     pub size_bytes: u64,
+    /// What a TCF record states beyond shape and element type
+    pub tcf: Option<TcfTensorFacts>,
 }
 
 impl std::fmt::Display for ModelInfo {
@@ -898,6 +914,62 @@ impl std::fmt::Display for ModelInfo {
             "Size: {:.2} GB",
             self.total_size_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
         )?;
+
+        // A TCF file states more than a tensor list: modules with their own
+        // encoding preference and residency, an encoding per tensor, and the
+        // contract, calibration and workload records the tensors are read
+        // against. Flattening that into the GGUF shape would hide the part of
+        // the file a placement decision is made from.
+        if let Some(ref tcf) = self.tcf {
+            writeln!(f, "\nTCF v{}.{}:", tcf.major, tcf.minor)?;
+            writeln!(f, "  Schema id: {}", tcf.schema_id)?;
+            writeln!(f, "  File length: {} bytes", tcf.file_len)?;
+            writeln!(f, "  Data section starts at: {}", tcf.data_off)?;
+            writeln!(
+                f,
+                "  Contracts: {} | Calibrations: {} | Relations: {} | Workload profiles: {}",
+                tcf.contract_count, tcf.calibration_count, tcf.relation_count, tcf.workload_count
+            )?;
+            writeln!(
+                f,
+                "  Tensors at a fallback encoding: {}",
+                tcf.fallback_tensors
+            )?;
+
+            writeln!(f, "\n  Encodings:")?;
+            for (encoding, count) in &tcf.encoding_histogram {
+                writeln!(f, "    {:<14} {} tensor(s)", encoding, count)?;
+            }
+
+            writeln!(f, "\n  Modules ({}):", tcf.modules.len())?;
+            for module in &tcf.modules {
+                let name = if module.name.is_empty() {
+                    "(unnamed)"
+                } else {
+                    &module.name
+                };
+                writeln!(
+                    f,
+                    "    #{} {} — {}, {} tensor(s), residency {}",
+                    module.module_id,
+                    name,
+                    module.module_role,
+                    module.tensor_count,
+                    module.default_residency
+                )?;
+                if !module.preferred_encodings.is_empty() {
+                    writeln!(
+                        f,
+                        "      preferred: {}",
+                        module.preferred_encodings.join(" > ")
+                    )?;
+                }
+                if let Some(ref fallback) = module.fallback_encoding {
+                    writeln!(f, "      fallback: {}", fallback)?;
+                }
+                writeln!(f, "      policy: {}", module.policy_flags)?;
+            }
+        }
 
         if let Some(ref meta) = self.metadata {
             writeln!(f, "\nMetadata:")?;

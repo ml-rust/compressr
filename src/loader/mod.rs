@@ -1,20 +1,31 @@
 //! Model loading, one tensor at a time
 //!
 //! This module provides a unified interface for loading models from various formats.
-//! It uses boostr's SafeTensors and GGUF loaders under the hood.
+//! It uses boostr's SafeTensors, GGUF, TCF and PyTorch readers under the hood.
 //!
 //! # Memory
 //!
-//! Opening a model reads its headers only, so a checkpoint of any size opens
-//! cheaply. [`LoadedModel::read_tensor_bytes`] then seeks and reads ONE tensor
+//! Opening a SafeTensors, GGUF or TCF model reads its directory only, so a
+//! checkpoint of any size opens cheaply. A PyTorch state dict is the
+//! exception: boostr's handle answers keys but no shape or element type, so
+//! opening one materializes each tensor once to record its shape and drops it
+//! again — one tensor at a time, and the file is read twice over a
+//! conversion. [`LoadedModel::read_tensor_bytes`] then seeks and reads ONE tensor
 //! into an owned buffer per call — it is not a memory map and the bytes are not
 //! shared with the file. Peak resident memory over a conversion is therefore
 //! roughly the largest tensor plus its converted copy, not the model size.
 
+pub mod tcf;
+pub mod torch;
+
 use crate::formats::shard::read_index_shard_files;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::Path;
+
+pub use tcf::{TcfFileFacts, TcfModel, TcfModuleFacts, TcfTensorFacts};
+pub use torch::TorchModel;
 
 /// Name of the index that maps each tensor onto the shard holding it.
 pub const SAFETENSORS_INDEX_FILE: &str = "model.safetensors.index.json";
@@ -43,8 +54,35 @@ impl ModelLoader {
     }
 
     /// Auto-detect the model format
+    ///
+    /// A single file is identified by its CONTENT where the format has a
+    /// magic: an extension is a convention a download or a rename can break,
+    /// and reading eight bytes settles it. TCF opens with `TCF\0\0\0\0\0`
+    /// (Section 4), and a PyTorch archive is a ZIP container. SafeTensors
+    /// opens with a header length, which is any eight bytes, so it keeps its
+    /// extension, and GGUF keeps the extension it always used here.
     pub fn detect_format(&self) -> Result<crate::InputFormat> {
         let path = Path::new(&self.path);
+
+        if path.is_file() {
+            let magic = read_magic(path)?;
+            if magic == Some(tcf_core::MAGIC) {
+                return Ok(crate::InputFormat::Tcf);
+            }
+            // A SafeTensors file opens with a header length, so any eight
+            // bytes are legal there and the ZIP magic is only trusted for a
+            // file that does not already name itself SafeTensors or GGUF.
+            let names_another_format = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| {
+                    ext.eq_ignore_ascii_case("safetensors") || ext.eq_ignore_ascii_case("gguf")
+                })
+                .unwrap_or(false);
+            if !names_another_format && magic.map(|m| m.starts_with(&ZIP_MAGIC)) == Some(true) {
+                return Ok(crate::InputFormat::PyTorch);
+            }
+        }
 
         // Check for GGUF files first (specific extension)
         if let Some(ext) = path.extension() {
@@ -88,6 +126,14 @@ impl ModelLoader {
                 Some("safetensors") => return Ok(crate::InputFormat::Safetensors),
                 Some("bin") | Some("pt") | Some("pth") => return Ok(crate::InputFormat::PyTorch),
                 Some("onnx") => return Ok(crate::InputFormat::Onnx),
+                // The magic check above already refused this file's content,
+                // so the extension is the only thing claiming it is TCF.
+                Some("tcf") => anyhow::bail!(
+                    "{} is named .tcf but does not start with the TCF magic \
+                     54 43 46 00 00 00 00 00 (Section 4). It starts with {}.",
+                    self.path,
+                    describe_magic(read_magic(path)?)
+                ),
                 _ => {}
             }
         }
@@ -103,13 +149,56 @@ impl ModelLoader {
         match format {
             crate::InputFormat::Safetensors => self.load_safetensors(),
             crate::InputFormat::Gguf => self.load_gguf(),
-            crate::InputFormat::PyTorch => {
-                anyhow::bail!("PyTorch format not yet supported. Please convert to SafeTensors first using: python -c \"from transformers import AutoModel; m = AutoModel.from_pretrained('{}'); m.save_pretrained('.', safe_serialization=True)\"", self.path)
-            }
+            crate::InputFormat::Tcf => self.load_tcf(),
+            crate::InputFormat::PyTorch => self.load_torch(),
             crate::InputFormat::Onnx => {
                 anyhow::bail!("ONNX format not yet supported")
             }
         }
+    }
+
+    /// Open a TCF file: its directory only, no payload page.
+    fn load_tcf(&self) -> Result<LoadedModel> {
+        let model = TcfModel::open(Path::new(&self.path))?;
+        Ok(LoadedModel {
+            inner: LoadedModelInner::Tcf(Box::new(model)),
+            format: crate::InputFormat::Tcf,
+        })
+    }
+
+    /// Open a PyTorch state dict.
+    ///
+    /// A directory holds its state dict in `pytorch_model.bin`. A sharded
+    /// `pytorch_model.bin.index.json` names several, and reading only the
+    /// first would silently drop most of the model, so it is refused with the
+    /// shard count it found.
+    fn load_torch(&self) -> Result<LoadedModel> {
+        let path = Path::new(&self.path);
+        let file = if path.is_dir() {
+            let index = path.join("pytorch_model.bin.index.json");
+            let single = path.join("pytorch_model.bin");
+            if index.is_file() && !single.is_file() {
+                anyhow::bail!(
+                    "{} is a sharded PyTorch checkpoint ({}), and compressr reads one .bin \
+                     per model. Convert the shards to a single file, or use the \
+                     SafeTensors copy of the checkpoint.",
+                    self.path,
+                    index.display()
+                );
+            }
+            if !single.is_file() {
+                anyhow::bail!("No pytorch_model.bin in directory: {}", self.path);
+            }
+            single
+        } else {
+            path.to_path_buf()
+        };
+
+        let model = TorchModel::open(&file)?;
+        Ok(LoadedModel {
+            inner: LoadedModelInner::Torch(Box::new(model)),
+            format: crate::InputFormat::PyTorch,
+        })
     }
 
     /// Load a SafeTensors model
@@ -238,6 +327,10 @@ enum LoadedModelInner {
     SafeTensors(Vec<SafeTensors>),
     /// GGUF file
     Gguf(Gguf),
+    /// TCF file, directory decoded
+    Tcf(Box<TcfModel>),
+    /// PyTorch state dict
+    Torch(Box<TorchModel>),
 }
 
 /// An open model: headers in memory, tensor data still on disk
@@ -257,6 +350,17 @@ impl LoadedModel {
         match &self.inner {
             LoadedModelInner::SafeTensors(files) => files.iter().map(|f| f.len()).sum(),
             LoadedModelInner::Gguf(gguf) => gguf.len(),
+            LoadedModelInner::Tcf(tcf) => tcf.len(),
+            LoadedModelInner::Torch(torch) => torch.len(),
+        }
+    }
+
+    /// The file-level structure of a TCF input, or `None` for every other
+    /// format.
+    pub fn tcf_facts(&self) -> Option<&TcfFileFacts> {
+        match &self.inner {
+            LoadedModelInner::Tcf(tcf) => Some(tcf.facts()),
+            _ => None,
         }
     }
 
@@ -280,6 +384,11 @@ impl LoadedModel {
                 })
                 .collect(),
             LoadedModelInner::Gguf(gguf) => gguf.tensor_names().map(|s| s.to_string()).collect(),
+            // Both readers fix their own order: TCF keeps file order, and the
+            // PyTorch state dict is sorted, because a pickle hands back a
+            // `HashMap` exactly as the safetensors reader does.
+            LoadedModelInner::Tcf(tcf) => tcf.tensor_names(),
+            LoadedModelInner::Torch(torch) => torch.tensor_names(),
         }
     }
 
@@ -298,6 +407,8 @@ impl LoadedModel {
                 .tensor_info(name)
                 .ok()
                 .map(UnifiedTensorInfo::from_gguf),
+            LoadedModelInner::Tcf(tcf) => tcf.tensor_info(name),
+            LoadedModelInner::Torch(torch) => torch.tensor_info(name),
         }
     }
 
@@ -331,6 +442,10 @@ impl LoadedModel {
                     .map_err(|e| anyhow::anyhow!("Failed to read tensor '{}': {}", name, e))?;
                 Ok(bytes)
             }
+            // A TCF payload is verified and decoded to f32, which is the
+            // element type `tensor_info` reports for it.
+            LoadedModelInner::Tcf(tcf) => tcf.read_tensor_bytes(name),
+            LoadedModelInner::Torch(torch) => torch.read_tensor_bytes(name),
         }
     }
 
@@ -358,10 +473,12 @@ impl LoadedModel {
                     rope_theta: meta.get_f32("llama.rope.freq_base").map(|v| v as f64),
                 }
             }
-            LoadedModelInner::SafeTensors(_) => {
-                // Try to infer from tensor shapes
-                self.infer_metadata_from_tensors()
-            }
+            // Neither a TCF directory nor a PyTorch pickle carries an
+            // architecture, a head count or a rope base, so the shapes answer
+            // what they can, exactly as they do for SafeTensors.
+            LoadedModelInner::SafeTensors(_)
+            | LoadedModelInner::Tcf(_)
+            | LoadedModelInner::Torch(_) => self.infer_metadata_from_tensors(),
         }
     }
 
@@ -433,6 +550,43 @@ impl LoadedModel {
     }
 }
 
+/// First bytes of every ZIP container, and so of every `torch.save` archive.
+const ZIP_MAGIC: [u8; 4] = [0x50, 0x4b, 0x03, 0x04];
+
+/// Read the first eight bytes of `path`, or `None` when it is shorter.
+///
+/// A short read is not an error here: a file too small to hold a magic is
+/// simply not one of the formats identified by content, and the extension
+/// rules answer for it.
+fn read_magic(path: &Path) -> Result<Option<[u8; 8]>> {
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("Failed to open model file: {}", path.display()))?;
+    let mut magic = [0u8; 8];
+    let mut filled = 0usize;
+    while filled < magic.len() {
+        let read = file
+            .read(&mut magic[filled..])
+            .with_context(|| format!("Failed to read the first bytes of: {}", path.display()))?;
+        if read == 0 {
+            return Ok(None);
+        }
+        filled += read;
+    }
+    Ok(Some(magic))
+}
+
+/// Render a file's first bytes for an error message.
+fn describe_magic(magic: Option<[u8; 8]>) -> String {
+    match magic {
+        Some(magic) => magic
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(" "),
+        None => "fewer than 8 bytes".to_string(),
+    }
+}
+
 /// Extract layer index from tensor name
 fn extract_layer_index(name: &str) -> Option<usize> {
     // Common patterns: "layers.N.", "h.N.", "transformer.h.N.", "model.layers.N."
@@ -461,10 +615,17 @@ pub struct UnifiedTensorInfo {
     pub shape: Vec<usize>,
     /// Data type
     pub dtype: UnifiedDType,
-    /// Size in bytes
+    /// Size in bytes, as the tensor is STORED in its input file
     pub size_bytes: usize,
     /// Number of elements
     pub numel: usize,
+    /// What a TCF file states beyond shape and element type, or `None` for
+    /// every other format.
+    ///
+    /// A TCF record carries a per-tensor encoding, a fallback reason, a
+    /// residency class and the contract, calibration and workload records it
+    /// is read against. Flattening that into `dtype` would drop it.
+    pub tcf: Option<TcfTensorFacts>,
 }
 
 impl UnifiedTensorInfo {
@@ -475,6 +636,7 @@ impl UnifiedTensorInfo {
             dtype: UnifiedDType::from_dtype(info.dtype),
             size_bytes: info.size_bytes(),
             numel: info.numel(),
+            tcf: None,
         }
     }
 
@@ -485,6 +647,7 @@ impl UnifiedTensorInfo {
             dtype: UnifiedDType::from_ggml(info.ggml_type),
             size_bytes: info.size_bytes(),
             numel: info.numel(),
+            tcf: None,
         }
     }
 }

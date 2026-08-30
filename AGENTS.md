@@ -21,6 +21,8 @@ This section is the SINGLE source of truth on what works. Everything below assum
 | :----------------- | :--------------------------------------------------------- |
 | SafeTensors input  | Single file, or sharded via `model.safetensors.index.json` |
 | GGUF input         | Read back for re-conversion                                |
+| TCF input          | Read back through boostr's reader: directory, and payloads verified and decoded |
+| PyTorch input      | One `.pt` / `.pth` / `.bin` state dict, F32 and F64 tensors |
 | SafeTensors output | Sharded at `--max-shard-size`, with a matching index       |
 | GGUF output        | GGUF v3, one self-contained file                           |
 | TCF output         | TCF v1, one self-contained file, written through tcf-core  |
@@ -37,7 +39,9 @@ This section is the SINGLE source of truth on what works. Everything below assum
 | GPTQ, AWQ           | Calibration, plus the `qweight`/`scales`/`qzeros`/`g_idx` tensor layout |
 | NF4, FP8            | An on-disk home for the side-band scales the packed payload omits       |
 | EXL2                | The whole format driver                                                 |
-| PyTorch, ONNX input | `.bin` / `.pt` / `.onnx` readers                                        |
+| ONNX input          | The `.onnx` reader                                                      |
+| Sharded PyTorch     | A `pytorch_model.bin.index.json` walk; one `.bin` per model today       |
+| PyTorch F16, BF16   | boostr's `.pt` reader decodes F32 and F64 only                          |
 | Python API          | The PyO3 module exports `__version__` only                              |
 | Triple-buffered I/O | A prefetch/compute/write pipeline; reads and writes are serial today    |
 | Parallel shard I/O  | Reads are sequential; rayon parallelizes TCF quantization, never I/O    |
@@ -46,7 +50,7 @@ The `optimize` subcommand parses its flags but every method it accepts is a road
 
 SafeTensors output is NEVER quantized: its header records an element type and a shape, which cannot describe a block-quantized tensor. GGUF block quantization writes GGUF; `--tcf-encoding` writes TCF.
 
-TCF is produced from a full-precision source ONLY. NEVER add a GGUF-to-TCF path: it would quantize already-quantized weights a second time, and would need a GGML dequantizer per format.
+TCF is produced from a full-precision source ONLY. NEVER add a GGUF-to-TCF or TCF-to-TCF path: either would quantize already-quantized weights a second time, from values the first pass had already rounded. A TCF input is read for `info` and for conversion to another format; it is never a TCF source.
 
 ## Build Commands
 
@@ -84,6 +88,9 @@ compressr info ./llama-3-8b --verbose
 - `ConversionConfig::validate` rejects every unwritable configuration BEFORE a file is opened. A mismatch caught by the writer instead aborts mid-loop and leaves a truncated file.
 - SafeTensors headers are padded with spaces to a multiple of 8 bytes, so the data block starts 8-byte aligned and a reader can map an F32 tensor in place.
 - The loader COPIES tensor bytes out of the file. NEVER describe it as zero-copy or memory-mapped.
+- A TCF read VERIFIES before it decodes: `payload_digest`, the recomputed logical stream against `semantic_digest`, then the proof vector (Section 15). boostr's reader does this and compressr never bypasses it.
+- A `torch.nn.utils.weight_norm` pair is folded on read, through `boostr::nn::fuse_weight_norm` and nothing else. compressr NEVER holds a second copy of that arithmetic, exactly as it holds no block layout.
+- A `.pth` whose keys ALL start with `state_dict.` has that root stripped. The pickle flattener carries the top-level key into every name, and no consumer of the output expects it.
 
 ### Streaming
 

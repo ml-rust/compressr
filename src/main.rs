@@ -24,8 +24,13 @@
 //! # Shard the output at 2 GB instead of the 5 GB default
 //! compressr convert model/ --format safetensors --dtype bf16 --max-shard-size 2GB
 //!
-//! # Get model info
+//! # Convert a PyTorch state dict, weight-norm pairs folded on read
+//! compressr convert checkpoint.pth --format safetensors
+//!
+//! # Get model info. A TCF file reports its modules, its per-tensor
+//! # encodings, and the records a placement decision reads.
 //! compressr info model/
+//! compressr info model.tcf --verbose
 //! ```
 //!
 //! The `optimize` subcommand parses its flags but every method it accepts —
@@ -359,13 +364,54 @@ fn main() -> Result<()> {
                             .map(|d| d.to_string())
                             .collect::<Vec<_>>()
                             .join("x");
-                        println!(
-                            "  {} [{:>12}] {:>10} {:>12}",
-                            tensor.name,
-                            shape_str,
-                            tensor.dtype,
-                            format_bytes(tensor.size_bytes),
-                        );
+                        // A TCF tensor is described by its encoding, not by an
+                        // element type: `dtype` is the type it DECODES to, so
+                        // printing that instead would say F32 for every
+                        // tensor in a 4-bit file.
+                        match tensor.tcf {
+                            Some(ref tcf) => {
+                                let bpw = tcf
+                                    .bits_per_weight
+                                    .map(|b| format!("{b:.2} bpw"))
+                                    .unwrap_or_else(|| "raw".to_string());
+                                println!(
+                                    "  {} [{:>12}] {:>12} {:>10} {:>12}",
+                                    tensor.name,
+                                    shape_str,
+                                    tcf.encoding,
+                                    bpw,
+                                    format_bytes(tensor.size_bytes),
+                                );
+                                println!(
+                                    "      module {} | role {} | exec {} | residency {}",
+                                    tcf.module, tcf.role, tcf.execution_role, tcf.residency_class
+                                );
+                                if let Some(ref reason) = tcf.fallback_reason {
+                                    println!("      fallback: {}", reason);
+                                }
+                                if let Some((delta, ci95)) = tcf.sensitivity {
+                                    println!("      sensitivity: {delta} +/- {ci95}");
+                                }
+                                if tcf.activation_contract_id != 0
+                                    || tcf.calibration_id != 0
+                                    || tcf.workload_profile_id != 0
+                                {
+                                    println!(
+                                        "      contract {} | calibration {} | workload {}",
+                                        tcf.activation_contract_id,
+                                        tcf.calibration_id,
+                                        tcf.workload_profile_id
+                                    );
+                                }
+                            }
+                            None => println!(
+                                "  {} [{:>12}] {:>10} {:>12}",
+                                tensor.name,
+                                shape_str,
+                                tensor.dtype,
+                                format_bytes(tensor.size_bytes),
+                            ),
+                        }
                     }
                     println!("{:-<80}", "");
                 }

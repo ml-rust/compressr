@@ -10,6 +10,8 @@ Implemented and tested:
 | ------------------ | ---------------------------------------------------------- |
 | SafeTensors input  | Single file, or sharded via `model.safetensors.index.json` |
 | GGUF input         | Read back for re-conversion                                |
+| TCF input          | Read back, verified and decoded, through boostr's reader   |
+| PyTorch input      | One `.pt` / `.pth` / `.bin` state dict, F32 and F64 tensors |
 | SafeTensors output | Sharded at `--max-shard-size`, with a matching index       |
 | GGUF output        | GGUF v3, one self-contained file                           |
 | dtype cast         | `f32`, `f16`, `bf16`, round-to-nearest-even                |
@@ -23,7 +25,9 @@ Not implemented. Each errors out rather than writing a file:
 | GPTQ, AWQ           | Calibration, plus the `qweight`/`scales`/`qzeros`/`g_idx` tensor layout |
 | NF4, FP8            | An on-disk home for the side-band scales the packed payload omits       |
 | EXL2                | The whole format driver                                                 |
-| PyTorch, ONNX input | `.bin` / `.pt` / `.onnx` readers                                        |
+| ONNX input          | The `.onnx` reader                                                      |
+| Sharded PyTorch     | A `pytorch_model.bin.index.json` walk; one `.bin` per model today       |
+| PyTorch F16, BF16   | boostr's `.pt` reader decodes F32 and F64 only                          |
 | Python API          | The PyO3 module exports `__version__` only                              |
 
 The `optimize` subcommand parses its flags but every method it accepts is in the second table, so it always errors. It exists for the CLI surface, not for use.
