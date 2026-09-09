@@ -11,6 +11,11 @@
 //! | `Q6S16DT64`  | Q6_K | 210                  | 6.5625 |
 //! | `Q8S32T64`   | Q8_0 | 272                  | 8.50   |
 //!
+//! The 8.50 row is not two formats. `Q8S32T64` and `Q8_0` are BIT-FOR-BIT the
+//! same layout: 32-element blocks, one binary16 scale, 8-bit codes clamped to
+//! [-127, 127], 34 bytes per 32 elements. That tier compares two ENCODERS of
+//! one format, and the report labels it so wherever it appears.
+//!
 //! Every number is PER TENSOR. A pooled model-wide number averages away the
 //! tensor where a gap actually shows, and attention output projections,
 //! embeddings and FFN-down are exactly the tensors that carry the outlier
@@ -23,8 +28,50 @@
 //!
 //! Bytes compared are PAYLOAD bytes: TCF's packed planes (SPECIFICATION.md
 //! Section 12.2 logical payload, before the file writer's trailing alignment)
-//! against GGUF's packed blocks. Neither side's container overhead is counted,
-//! because neither side's container overhead is per tensor.
+//! against GGUF's packed blocks. Those payload bytes are genuinely matched.
+//! Container overhead is NOT counted, and it is NOT symmetric between the two
+//! sides. Every quantized TCF tensor additionally carries a 128-byte proof
+//! vector (`PROOF_COUNT` = 64 binary16 values, Section 15.3), a 16-byte
+//! semantic digest, a 16-byte payload digest, and padding out to a 64-byte
+//! physical span — roughly 160-190 bytes per tensor that this tool does not
+//! charge TCF for. Read every byte figure here as payload only.
+//!
+//! # Why three error objectives, not one
+//!
+//! The two encoders do not minimize the same thing, so scoring both under one
+//! side's objective decides the result before a tensor is read.
+//!
+//! - TCF's quantizer minimizes UNWEIGHTED squared error, in f64.
+//! - GGUF's quantizers minimize a WEIGHTED squared error. Q6_K weights each
+//!   element by `w = x*x`; Q4_K weights it by `w = sqrt(sum(x^2)/n) + |x|`.
+//!   The weights exist to protect large-magnitude elements, which is a
+//!   deliberate design choice, not an accident of implementation.
+//!
+//! So every tensor is scored under all three, plus max absolute error:
+//!
+//! | column           | weight `w_i`                | whose objective |
+//! |------------------|-----------------------------|-----------------|
+//! | `relRMS`         | 1                           | TCF's           |
+//! | `relRMS w=x^2`   | `x_i^2`                     | GGUF Q6_K's     |
+//! | `relRMS w=s+abs` | `sigma + abs(x_i)`          | GGUF Q4_K's     |
+//! | `maxAbs`         | (worst single element)      | neither's       |
+//!
+//! Each weighted figure is `sqrt(sum(w_i * (src_i - rec_i)^2) / sum(w_i *
+//! src_i^2))`, accumulated in f64, so it stays dimensionless and comparable
+//! across tensors exactly as the unweighted one is. `sigma` is
+//! `sqrt(sum(x^2)/n)` over the WHOLE tensor: the metric has to be identical
+//! for both codecs, and a per-block sigma would have to borrow one codec's
+//! block geometry. Both codecs go through the same metric function over the
+//! same buffer in the same order.
+//!
+//! # The comparison is search-stage-asymmetric
+//!
+//! TCF has a search stage GGUF does not. After rounding the sub-scale, TCF
+//! refines that ROUNDED value against the decoder's own reconstruction grid,
+//! sweeping candidates around it (`refine_symmetric_sub_scale`,
+//! `refine_asymmetric_sub_levels` in `tcf-core`). GGUF's second pass only
+//! re-rounds codes against the scale it already chose. Neither figure below
+//! is a like-for-like measurement of search effort.
 //!
 //! # Usage
 //!
@@ -44,11 +91,21 @@
 //! # Which code actually runs
 //!
 //! No codec is reimplemented here. TCF goes through `tcf_core::encoding`'s
-//! `quantize` / `pack` / `dequantize` — the CONFORMANCE.md reference codec that
-//! `compressr`'s TCF writer calls. GGUF goes through `boostr`'s `QuantizeOps`
-//! and `DequantOps` on `CpuClient` — the same writer and reader kernels
-//! `compressr convert` and every GGUF consumer use. The error metric is
-//! `compressr::relative_rms_error`.
+//! `quantize` / `pack` / `unpack` / `dequantize` — the CONFORMANCE.md reference
+//! codec that `compressr`'s TCF writer calls. GGUF goes through `boostr`'s
+//! `QuantizeOps` and `DequantOps` on `CpuClient` — the same writer and reader
+//! kernels `compressr convert` and every GGUF consumer use.
+//!
+//! Both sides traverse their own BYTES. TCF quantizes to tiles, packs those
+//! tiles to a payload, unpacks that payload back to tiles, and dequantizes
+//! what came out of the unpack — never the tiles the quantizer returned. GGUF
+//! quantizes to packed blocks and dequantizes those blocks. A packing bug on
+//! either side therefore shows up in the error columns instead of hiding
+//! behind an in-memory shortcut.
+//!
+//! The unweighted error metric is `compressr::relative_rms_error`. The
+//! weighted ones are `weighted_relative_rms` below, which accumulates the same
+//! way in f64 and is called with each codec's weight function.
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
@@ -58,7 +115,7 @@ use boostr::quant::{DequantOps, QuantFormat, QuantizeOps};
 use boostr::{CpuClient, CpuDevice, CpuRuntime, DType, Tensor};
 use compressr::loader::{ModelLoader, UnifiedDType};
 use compressr::{cast_bytes, relative_rms_error};
-use tcf_core::encoding::{dequantize, pack, quantize};
+use tcf_core::encoding::{dequantize, pack, quantize, unpack};
 use tcf_core::NativeEncoding;
 
 /// One matched bits-per-weight tier: a TCF encoding and the GGUF format that
@@ -69,6 +126,10 @@ struct Tier {
     bpw: f64,
     tcf: NativeEncoding,
     gguf: QuantFormat,
+    /// Set when the two sides are not two formats but ONE format written by
+    /// two encoders. The text is printed with the tier so no reader takes
+    /// that tier's numbers for a format result.
+    same_format: Option<&'static str>,
 }
 
 // `static`, not `const`: `process_batch` below takes `&'static Tier`
@@ -79,16 +140,24 @@ static TIERS: [Tier; 3] = [
         bpw: 4.50,
         tcf: NativeEncoding::Q4AS32DT64,
         gguf: QuantFormat::Q4K,
+        same_format: None,
     },
     Tier {
         bpw: 6.5625,
         tcf: NativeEncoding::Q6S16DT64,
         gguf: QuantFormat::Q6K,
+        same_format: None,
     },
     Tier {
         bpw: 8.50,
         tcf: NativeEncoding::Q8S32T64,
         gguf: QuantFormat::Q8_0,
+        same_format: Some(
+            "SAME FORMAT, TWO ENCODERS: Q8S32T64 and Q8_0 are bit-for-bit the \
+             same layout — 32-element blocks, one binary16 scale, 8-bit codes \
+             clamped to [-127, 127], 34 bytes per 32 elements. Any gap here is \
+             encoder work, NOT a format result.",
+        ),
     },
 ];
 
@@ -116,12 +185,95 @@ struct Args {
     min_elements: usize,
 }
 
-/// What one codec produced for one tensor at one tier.
+/// What one codec produced for one tensor at one tier: the same reconstruction
+/// scored under every objective, so no single objective decides the report.
 struct CodecResult {
+    /// Relative RMS with no weighting — the objective TCF's quantizer
+    /// minimizes.
     relative_rms: f64,
+    /// Relative RMS weighted by `w = x*x` — the objective GGUF's Q6_K
+    /// quantizer minimizes.
+    relative_rms_w_squared: f64,
+    /// Relative RMS weighted by `w = sigma + abs(x)`, `sigma` the RMS of the
+    /// whole source tensor — the objective GGUF's Q4_K quantizer minimizes.
+    relative_rms_w_rms_abs: f64,
+    /// Worst single element, which no encoder here minimizes.
     max_abs: f64,
     bytes: usize,
     elements: usize,
+}
+
+impl CodecResult {
+    /// This reconstruction's score under one objective. Lower is better under
+    /// all four, so a ratio below 1.0 always means the numerator won.
+    fn score(&self, objective: Objective) -> f64 {
+        match objective {
+            Objective::Unweighted => self.relative_rms,
+            Objective::SquaredMagnitude => self.relative_rms_w_squared,
+            Objective::RmsPlusMagnitude => self.relative_rms_w_rms_abs,
+            Objective::MaxAbsolute => self.max_abs,
+        }
+    }
+}
+
+/// One error objective the report scores both codecs under.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Objective {
+    /// `w = 1`. TCF's quantizer minimizes this.
+    Unweighted,
+    /// `w = x*x`. GGUF's Q6_K quantizer minimizes this.
+    SquaredMagnitude,
+    /// `w = sigma + abs(x)`. GGUF's Q4_K quantizer minimizes this.
+    RmsPlusMagnitude,
+    /// Worst single element. Neither encoder minimizes this.
+    MaxAbsolute,
+}
+
+/// Every objective, in report order. Scoring under one of these alone is what
+/// made the earlier version of this tool circular, so the report never prints
+/// one without the others.
+static OBJECTIVES: [Objective; 4] = [
+    Objective::Unweighted,
+    Objective::SquaredMagnitude,
+    Objective::RmsPlusMagnitude,
+    Objective::MaxAbsolute,
+];
+
+impl Objective {
+    /// Short column label.
+    fn label(self) -> &'static str {
+        match self {
+            Objective::Unweighted => "relRMS unweighted",
+            Objective::SquaredMagnitude => "relRMS w=x^2",
+            Objective::RmsPlusMagnitude => "relRMS w=sigma+abs(x)",
+            Objective::MaxAbsolute => "max abs error",
+        }
+    }
+
+    /// Whose objective this is, printed beside the label so the reader never
+    /// has to remember which encoder minimizes which.
+    fn owner(self) -> &'static str {
+        match self {
+            Objective::Unweighted => "TCF's own objective",
+            Objective::SquaredMagnitude => "GGUF Q6_K's own objective",
+            Objective::RmsPlusMagnitude => "GGUF Q4_K's own objective",
+            Objective::MaxAbsolute => "neither encoder's objective",
+        }
+    }
+
+    /// A relative RMS reads as a percentage; an absolute error does not.
+    fn is_relative(self) -> bool {
+        self != Objective::MaxAbsolute
+    }
+
+    /// One codec's score, formatted for a table cell.
+    fn format(self, value: f64) -> String {
+        if self.is_relative() {
+            format!("{:>12.4}%", value * 100.0)
+        } else {
+            format!("{value:>13.3e}")
+        }
+    }
 }
 
 /// One tensor's outcome at one tier.
@@ -202,6 +354,9 @@ fn main() -> Result<()> {
             tier.tcf,
             tier.gguf.name()
         );
+        if let Some(note) = tier.same_format {
+            println!("    {note}");
+        }
     }
 
     // One row list per tier, in the same tensor order, so a reader can scan
@@ -441,7 +596,14 @@ fn tcf_result(values: &[f32], shape: &[usize], encoding: NativeEncoding) -> Resu
     let tiles = quantize(values, &dims, rank, layout).map_err(|e| anyhow!("{e}"))?;
     // The real packed payload, measured. Not a bpw formula.
     let packed = pack(&tiles, layout).map_err(|e| anyhow!("{e}"))?;
-    let reconstructed = dequantize(&tiles, layout).map_err(|e| anyhow!("{e}"))?;
+    // Dequantize what came back OUT of the bytes, not the tiles the quantizer
+    // returned. GGUF's side has always gone f32 -> packed blocks -> dequantize,
+    // and reconstructing TCF from in-memory tiles would let a packing bug pass
+    // unmeasured on one side only.
+    let tile_count =
+        u64::try_from(tiles.len()).map_err(|_| anyhow!("tile count does not fit u64"))?;
+    let unpacked = unpack(&packed, tile_count, layout).map_err(|e| anyhow!("{e}"))?;
+    let reconstructed = dequantize(&unpacked, layout).map_err(|e| anyhow!("{e}"))?;
 
     metrics(values, &reconstructed, packed.len())
 }
@@ -465,10 +627,14 @@ fn gguf_result(values: &[f32], shape: &[usize], format: QuantFormat) -> Result<C
     metrics(values, &reconstructed, bytes)
 }
 
-/// Relative RMS error and max absolute error of one reconstruction.
+/// Score one reconstruction under every objective at once.
 ///
-/// The RMS is `compressr::relative_rms_error`, unchanged: the same number the
-/// TCF bump screen ranks tensors by.
+/// BOTH codecs call this, on the same source buffer, in the same order, so no
+/// part of the difference between them can come from the measurement. The
+/// unweighted figure is `compressr::relative_rms_error`, unchanged: the same
+/// number the TCF bump screen ranks tensors by. The weighted figures go
+/// through `weighted_relative_rms` with the weight each GGUF quantizer
+/// actually minimizes under.
 fn metrics(source: &[f32], reconstructed: &[f32], bytes: usize) -> Result<CodecResult> {
     // Checked here so the message names the element spaces, not a metric.
     if source.len() != reconstructed.len() {
@@ -479,6 +645,13 @@ fn metrics(source: &[f32], reconstructed: &[f32], bytes: usize) -> Result<CodecR
         );
     }
     let relative_rms = relative_rms_error(source, reconstructed)?;
+    let relative_rms_w_squared =
+        weighted_relative_rms(source, reconstructed, |value| value * value);
+    // Q4_K's weight adds a floor term so a near-zero element is not scored at
+    // near-zero weight. `sigma` is the source tensor's own RMS.
+    let sigma = source_rms(source);
+    let relative_rms_w_rms_abs =
+        weighted_relative_rms(source, reconstructed, |value| sigma + value.abs());
     let mut max_abs = 0.0f64;
     for (value, reconstruction) in source.iter().zip(reconstructed) {
         let difference = (f64::from(*value) - f64::from(*reconstruction)).abs();
@@ -488,10 +661,63 @@ fn metrics(source: &[f32], reconstructed: &[f32], bytes: usize) -> Result<CodecR
     }
     Ok(CodecResult {
         relative_rms,
+        relative_rms_w_squared,
+        relative_rms_w_rms_abs,
         max_abs,
         bytes,
         elements: reconstructed.len(),
     })
+}
+
+/// `sqrt(sum(w_i * (src_i - rec_i)^2) / sum(w_i * src_i^2))`, accumulated in
+/// f64.
+///
+/// The weight is applied to the numerator and the denominator alike, so the
+/// result stays dimensionless and comparable across tensors of any scale —
+/// the same property `relative_rms_error` has, which is why the unweighted
+/// path is that function and is not re-derived here.
+///
+/// `weight` receives the SOURCE value, never the reconstruction: a weight that
+/// depended on what a codec produced would rank each codec on a different
+/// element space.
+///
+/// A denominator of zero means every weighted source element is zero, which
+/// only a codec that reconstructed them exactly can be scored against. It
+/// returns 0.0 rather than a NaN, matching `relative_rms_error`.
+///
+/// The caller has already checked the two slices are the same length.
+fn weighted_relative_rms<W: Fn(f64) -> f64>(
+    source: &[f32],
+    reconstructed: &[f32],
+    weight: W,
+) -> f64 {
+    let mut error_energy = 0.0f64;
+    let mut source_energy = 0.0f64;
+    for (value, reconstruction) in source.iter().zip(reconstructed) {
+        let value = f64::from(*value);
+        let w = weight(value);
+        let difference = value - f64::from(*reconstruction);
+        error_energy += w * difference * difference;
+        source_energy += w * value * value;
+    }
+    if source_energy == 0.0 {
+        return 0.0;
+    }
+    (error_energy / source_energy).sqrt()
+}
+
+/// `sqrt(sum(x^2) / n)` over the WHOLE tensor, in f64.
+///
+/// GGUF's Q4_K kernel takes this over one block. Taken per block here, the
+/// metric would inherit one codec's block geometry and stop being neutral
+/// between the two, so it is taken over the tensor and labelled that way in
+/// the report.
+fn source_rms(source: &[f32]) -> f64 {
+    if source.is_empty() {
+        return 0.0;
+    }
+    let energy: f64 = source.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
+    (energy / source.len() as f64).sqrt()
 }
 
 /// `a / b`, or `None` when `b` is zero and the ratio would be meaningless.
@@ -514,21 +740,18 @@ fn print_tier(tier: &Tier, rows: &[Row]) {
         tier.tcf,
         tier.gguf.name()
     );
-    println!(
-        "{:<48} {:>18} {:>11} {:>11} {:>8} {:>11} {:>11} {:>8} {:>11} {:>11}  {}",
-        "tensor",
-        "shape",
-        "relRMS TCF",
-        "relRMS GGUF",
-        "ratio",
-        "maxAbs TCF",
-        "maxAbs GGUF",
-        "ratio",
-        "bytes TCF",
-        "bytes GGUF",
-        "status"
-    );
+    if let Some(note) = tier.same_format {
+        println!("  {note}");
+    }
 
+    // Bytes and status first, once per tensor. The metric tables below repeat
+    // neither, so each of them stays narrow enough to read.
+    println!();
+    println!("-- encoded payload bytes and status --");
+    println!(
+        "{:<48} {:>18} {:>12} {:>12}  {}",
+        "tensor", "shape", "bytes TCF", "bytes GGUF", "status"
+    );
     for row in rows {
         let shape = format!("{:?}", row.shape);
         match &row.outcome {
@@ -547,18 +770,8 @@ fn print_tier(tier: &Tier, rows: &[Row]) {
                     )
                 };
                 println!(
-                    "{:<48} {:>18} {:>10.4}% {:>10.4}% {} {:>11.3e} {:>11.3e} {} {:>11} {:>11}  {}",
-                    row.name,
-                    shape,
-                    tcf.relative_rms * 100.0,
-                    gguf.relative_rms * 100.0,
-                    show_ratio(ratio(tcf.relative_rms, gguf.relative_rms)),
-                    tcf.max_abs,
-                    gguf.max_abs,
-                    show_ratio(ratio(tcf.max_abs, gguf.max_abs)),
-                    tcf.bytes,
-                    gguf.bytes,
-                    status
+                    "{:<48} {:>18} {:>12} {:>12}  {}",
+                    row.name, shape, tcf.bytes, gguf.bytes, status
                 );
             }
             Outcome::Unsupported(reason) => {
@@ -572,24 +785,119 @@ fn print_tier(tier: &Tier, rows: &[Row]) {
             }
         }
     }
+
+    // One table per objective, over the tensors both codecs actually encoded.
+    // A tensor absent here appears with its reason in the status table above.
+    for objective in &OBJECTIVES {
+        println!();
+        println!("-- {} ({}) --", objective.label(), objective.owner());
+        println!(
+            "{:<48} {:>18} {:>13} {:>13} {:>8}  {}",
+            "tensor", "shape", "TCF", "GGUF", "ratio", "status"
+        );
+        for row in rows {
+            let Outcome::Ran {
+                tcf,
+                gguf,
+                matched,
+                mismatch,
+            } = &row.outcome
+            else {
+                continue;
+            };
+            let status = if *matched {
+                "matched".to_string()
+            } else {
+                format!(
+                    "UNMATCHED — EXCLUDED: {}",
+                    mismatch.as_deref().unwrap_or("shape disagreement")
+                )
+            };
+            let shape = format!("{:?}", row.shape);
+            let tcf_score = tcf.score(*objective);
+            let gguf_score = gguf.score(*objective);
+            println!(
+                "{:<48} {:>18} {} {} {}  {}",
+                row.name,
+                shape,
+                objective.format(tcf_score),
+                objective.format(gguf_score),
+                show_ratio(ratio(tcf_score, gguf_score)),
+                status
+            );
+        }
+    }
+
     println!();
     println!("  ratio is TCF / GGUF. Below 1.0 means TCF reconstructs better.");
+    println!(
+        "  A codec winning the table that names its own objective is expected, not a finding."
+    );
 }
 
-/// The verdict: per tier, who wins how many tensors and by how much.
+/// One objective's win/loss count and ratio sample for one tier.
+struct Tally {
+    tcf: usize,
+    gguf: usize,
+    tied: usize,
+    ratios: Vec<f64>,
+}
+
+impl Tally {
+    fn new() -> Self {
+        Tally {
+            tcf: 0,
+            gguf: 0,
+            tied: 0,
+            ratios: Vec::new(),
+        }
+    }
+
+    /// Which codec won more tensors under this objective, or `None` when the
+    /// count is even and there is nothing to call.
+    fn winner(&self) -> Option<&'static str> {
+        match self.tcf.cmp(&self.gguf) {
+            std::cmp::Ordering::Greater => Some("TCF"),
+            std::cmp::Ordering::Less => Some("GGUF"),
+            std::cmp::Ordering::Equal => None,
+        }
+    }
+}
+
+/// The verdict: per tier, who wins how many tensors and by how much, reported
+/// SEPARATELY under every objective.
+///
+/// There is no single headline number here on purpose. One codec winning
+/// under its own objective and losing under the other's is the finding, and a
+/// pooled score would bury it.
 fn print_verdict(tier_rows: &[Vec<Row>]) {
     println!();
     println!("================================ VERDICT ================================");
-    println!("ratio is TCF / GGUF. Below 1.0 means TCF is more accurate at identical bytes.");
+    println!(
+        "ratio is TCF / GGUF. Below 1.0 means TCF is more accurate at identical payload bytes."
+    );
+    println!(
+        "Each objective is reported on its own. TCF's quantizer minimizes the unweighted one;"
+    );
+    println!("GGUF's minimize the two weighted ones. Read every row against who owns it.");
+    println!(
+        "The comparison is also search-stage-asymmetric: TCF refines its ROUNDED sub-scale against"
+    );
+    println!(
+        "the decoder's reconstruction grid, a stage GGUF has no counterpart for — GGUF's second"
+    );
+    println!("pass only re-rounds codes against the scale it already chose.");
+    println!(
+        "Payload bytes are matched; container overhead is not counted and is not symmetric —"
+    );
+    println!("a quantized TCF tensor carries roughly 160-190 further bytes this tool ignores.");
 
     for (tier, rows) in TIERS.iter().zip(tier_rows) {
-        let mut rms_ratios = Vec::new();
-        let mut abs_ratios = Vec::new();
-        let (mut rms_tcf, mut rms_gguf, mut rms_tied) = (0usize, 0usize, 0usize);
-        let (mut abs_tcf, mut abs_gguf, mut abs_tied) = (0usize, 0usize, 0usize);
+        let mut tallies: Vec<Tally> = OBJECTIVES.iter().map(|_| Tally::new()).collect();
         let mut unmatched = 0usize;
         let mut unsupported = 0usize;
         let mut failed = 0usize;
+        let mut compared = 0usize;
 
         for row in rows {
             match &row.outcome {
@@ -599,21 +907,18 @@ fn print_verdict(tier_rows: &[Vec<Row>]) {
                     matched: true,
                     ..
                 } => {
-                    match tcf.relative_rms.partial_cmp(&gguf.relative_rms) {
-                        Some(std::cmp::Ordering::Less) => rms_tcf += 1,
-                        Some(std::cmp::Ordering::Greater) => rms_gguf += 1,
-                        _ => rms_tied += 1,
-                    }
-                    match tcf.max_abs.partial_cmp(&gguf.max_abs) {
-                        Some(std::cmp::Ordering::Less) => abs_tcf += 1,
-                        Some(std::cmp::Ordering::Greater) => abs_gguf += 1,
-                        _ => abs_tied += 1,
-                    }
-                    if let Some(r) = ratio(tcf.relative_rms, gguf.relative_rms) {
-                        rms_ratios.push(r);
-                    }
-                    if let Some(r) = ratio(tcf.max_abs, gguf.max_abs) {
-                        abs_ratios.push(r);
+                    compared += 1;
+                    for (objective, tally) in OBJECTIVES.iter().zip(&mut tallies) {
+                        let tcf_score = tcf.score(*objective);
+                        let gguf_score = gguf.score(*objective);
+                        match tcf_score.partial_cmp(&gguf_score) {
+                            Some(std::cmp::Ordering::Less) => tally.tcf += 1,
+                            Some(std::cmp::Ordering::Greater) => tally.gguf += 1,
+                            _ => tally.tied += 1,
+                        }
+                        if let Some(r) = ratio(tcf_score, gguf_score) {
+                            tally.ratios.push(r);
+                        }
                     }
                 }
                 Outcome::Ran { matched: false, .. } => unmatched += 1,
@@ -622,7 +927,6 @@ fn print_verdict(tier_rows: &[Vec<Row>]) {
             }
         }
 
-        let compared = rms_tcf + rms_gguf + rms_tied;
         println!();
         println!(
             "{:.4} bpw  TCF {:?} vs GGUF {}  —  {} matched tensors compared",
@@ -631,29 +935,83 @@ fn print_verdict(tier_rows: &[Vec<Row>]) {
             tier.gguf.name(),
             compared
         );
+        if let Some(note) = tier.same_format {
+            println!("  {note}");
+        }
+        for (objective, tally) in OBJECTIVES.iter().zip(&mut tallies) {
+            println!(
+                "  {:<22} : TCF wins {:>4}, GGUF wins {:>4}, tied {:>4}  |  median {:>8}  ({})",
+                objective.label(),
+                tally.tcf,
+                tally.gguf,
+                tally.tied,
+                show_median(&mut tally.ratios),
+                objective.owner()
+            );
+        }
         println!(
-            "  relative RMS : TCF wins {rms_tcf:>4}, GGUF wins {rms_gguf:>4}, tied {rms_tied:>4}  |  median ratio {}",
-            show_median(&mut rms_ratios)
+            "  excluded               : {unmatched} byte/element mismatches, {unsupported} shapes \
+             this tier cannot encode, {failed} codec errors"
         );
-        println!(
-            "  max abs err  : TCF wins {abs_tcf:>4}, GGUF wins {abs_gguf:>4}, tied {abs_tied:>4}  |  median ratio {}",
-            show_median(&mut abs_ratios)
-        );
-        println!(
-            "  excluded     : {unmatched} byte/element mismatches, {unsupported} shapes this tier \
-             cannot encode, {failed} codec errors"
-        );
+
         if compared > 0 {
-            let verdict = if rms_tcf > rms_gguf {
-                "TCF more accurate on more tensors"
-            } else if rms_gguf > rms_tcf {
-                "GGUF more accurate on more tensors"
-            } else {
-                "split evenly"
-            };
-            println!("  verdict      : {verdict} (by relative RMS)");
+            print_objective_split(&tallies);
         }
     }
+}
+
+/// Say plainly where the objectives disagree.
+///
+/// A codec that wins the objective its own encoder minimizes and loses the
+/// other side's has not been shown to be better; it has been shown to be
+/// better at its own target. That sentence is the point of the whole report,
+/// so it is printed rather than left for the reader to derive.
+fn print_objective_split(tallies: &[Tally]) {
+    let Some(unweighted) = tally_for(tallies, Objective::Unweighted) else {
+        return;
+    };
+
+    for weighted_objective in [Objective::SquaredMagnitude, Objective::RmsPlusMagnitude] {
+        let Some(weighted) = tally_for(tallies, weighted_objective) else {
+            continue;
+        };
+        match (unweighted.winner(), weighted.winner()) {
+            (Some(a), Some(b)) if a != b => {
+                println!(
+                    "  SPLIT                  : {a} wins {}, {b} wins {} — the ranking flips with \
+                     the objective, so neither codec is more accurate outright.",
+                    Objective::Unweighted.label(),
+                    weighted_objective.label()
+                );
+            }
+            (Some(a), Some(_)) => {
+                println!(
+                    "  AGREES                 : {a} wins both {} and {}.",
+                    Objective::Unweighted.label(),
+                    weighted_objective.label()
+                );
+            }
+            _ => {
+                println!(
+                    "  NO CALL                : {} and {} did not both produce a winner.",
+                    Objective::Unweighted.label(),
+                    weighted_objective.label()
+                );
+            }
+        }
+    }
+}
+
+/// One objective's tally, found by its position in `OBJECTIVES`.
+///
+/// `tallies` is built by mapping over `OBJECTIVES`, so the two are index for
+/// index. A `None` here means the caller built a shorter list, which no caller
+/// does.
+fn tally_for(tallies: &[Tally], wanted: Objective) -> Option<&Tally> {
+    OBJECTIVES
+        .iter()
+        .position(|objective| *objective == wanted)
+        .and_then(|index| tallies.get(index))
 }
 
 /// Median of a ratio sample, formatted. The median, not the mean: one tensor
