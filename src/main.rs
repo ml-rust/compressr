@@ -8,6 +8,10 @@
 //! # Convert to GGUF with Q4_K quantization
 //! compressr convert model/ --format gguf --quantization q4_k
 //!
+//! # Or with llama.cpp's Q4_K_M mix: Q6_K on the output weight and on
+//! # selected attention-V and FFN-down tensors, Q4_K on the rest
+//! compressr convert model/ --format gguf --quantization q4_k_m
+//!
 //! # Name the architecture when the checkpoint's config.json does not
 //! compressr convert model/ --format gguf --quantization q4_k --arch voxcpm2
 //!
@@ -37,12 +41,15 @@
 //! GPTQ, AWQ, NF4, FP8 — is unimplemented, so it always errors. It exists for
 //! the CLI surface, not for use.
 
+mod quant_arg;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use compressr::{
     parse_tcf_encoding, parse_tcf_profile, ConversionConfig, OutputFormat, QuantizationConfig,
     QuantizationMethod, TcfOptions,
 };
+use quant_arg::parse_quantization;
 
 #[derive(Parser)]
 #[command(name = "compressr")]
@@ -70,6 +77,10 @@ enum Commands {
         output: Option<String>,
 
         /// Quantization level (q4_0, q4_1, q8_0, q4_k, q5_k, q6_k, nf4, fp8)
+        ///
+        /// Also accepts llama.cpp's mixed-precision names — q4_k_s, q4_k_m,
+        /// q5_k_s, q5_k_m — which assign a different GGUF block format to
+        /// different tensors by role and by layer. GGUF output only.
         ///
         /// Mutually exclusive with --dtype.
         #[arg(long, value_name = "LEVEL", conflicts_with = "dtype")]
@@ -219,7 +230,7 @@ fn main() -> Result<()> {
                 .as_deref()
                 .map(compressr::parse_target_dtype)
                 .transpose()?;
-            let quant_config = quantization
+            let quant_choice = quantization
                 .as_deref()
                 .map(parse_quantization)
                 .transpose()?;
@@ -240,8 +251,11 @@ fn main() -> Result<()> {
                 .with_max_shard_size(max_shard_size)
                 .with_verbose(verbose);
 
-            if let Some(quant_config) = quant_config {
-                config = config.with_quantization(quant_config);
+            if let Some(quant_choice) = quant_choice {
+                config = config.with_quantization(quant_choice.config);
+                if let Some(mix) = quant_choice.mix {
+                    config = config.with_gguf_mix(mix);
+                }
             }
             if let Some(target_dtype) = target_dtype {
                 config = config.with_target_dtype(target_dtype);
@@ -258,6 +272,28 @@ fn main() -> Result<()> {
 
             let stats = compressr::convert(config)?;
             println!("\n{}", stats);
+            // A comparison has to state what it compared, so the formats the
+            // conversion actually wrote are printed, not the ones the name
+            // implies. `--verbose` adds the per-tensor listing behind them.
+            // A TCF run records no rows: its payload is written in a later
+            // pass, so its byte counts are not the file's.
+            if !stats.mix.entries().is_empty() {
+                println!("{}", stats.mix);
+            }
+            if verbose && !stats.mix.entries().is_empty() {
+                for entry in stats.mix.entries() {
+                    println!(
+                        "  {:<60} {:<6} {:>12} bytes{}",
+                        entry.name,
+                        entry.format,
+                        entry.bytes,
+                        match entry.fallback {
+                            Some(reason) => format!("  (unquantized: {reason:?})"),
+                            None => String::new(),
+                        }
+                    );
+                }
+            }
             if output_format == OutputFormat::Tcf {
                 println!(
                     "TCF activation contract: exact F32 activations, F32 accumulate, F32 out. \
@@ -523,65 +559,6 @@ fn parse_method(s: &str) -> Result<QuantizationMethod> {
         "q6_k" | "q6k" => Ok(QuantizationMethod::Q6K),
         _ => anyhow::bail!("Unsupported method: {}. Supported: gptq, awq, nf4, fp8, q4_0, q4_1, q8_0, q4_k, q5_k, q6_k", s),
     }
-}
-
-fn parse_quantization(s: &str) -> Result<QuantizationConfig> {
-    // Parse quantization levels like "q4_0", "q4_k", "q4_k_m", etc.
-    let s_lower = s.to_lowercase();
-
-    // llama.cpp's `_S`/`_M`/`_L` names are MIXES: they assign a different format
-    // to different tensors, so `q4_k_m` puts Q6_K on the output weight and on
-    // part of the FFN-down and attention-V rather than Q4_K everywhere. This
-    // converter emits ONE format for every tensor, so accepting the name and
-    // quantizing flat would return something other than what was asked for.
-    // Refuse, the way every other unimplemented method here is refused.
-    //
-    // Matching the suffix exactly also rejects names a character-set trim used
-    // to accept, such as a repeated suffix.
-    for suffix in ["_s", "_m", "_l"] {
-        if let Some(base) = s_lower.strip_suffix(suffix) {
-            anyhow::bail!(
-                "Mixed-precision `{s}` is not implemented. The `{suffix}` variants assign \
-                 a different format per tensor, and this converter emits one format for \
-                 every tensor. Use `{base}` for a flat quantization."
-            );
-        }
-    }
-    let base = s_lower.as_str();
-
-    let method = match base {
-        "q4_0" | "q4.0" => QuantizationMethod::Q4_0,
-        "q4_1" | "q4.1" => QuantizationMethod::Q4_1,
-        "q8_0" | "q8.0" => QuantizationMethod::Q8_0,
-        "q4_k" | "q4k" => QuantizationMethod::Q4K,
-        "q5_k" | "q5k" => QuantizationMethod::Q5K,
-        "q6_k" | "q6k" => QuantizationMethod::Q6K,
-        "nf4" => QuantizationMethod::Nf4,
-        "fp8" => QuantizationMethod::Fp8,
-        _ => anyhow::bail!(
-            "Unsupported quantization: {}. Supported: q4_0, q4_1, q8_0, q4_k, q5_k, q6_k, nf4, fp8",
-            s
-        ),
-    };
-
-    // Determine bits and block size from method
-    let (bits, group_size) = match method {
-        QuantizationMethod::Q4_0 | QuantizationMethod::Q4_1 | QuantizationMethod::Nf4 => (4, 32),
-        QuantizationMethod::Q8_0 => (8, 32),
-        QuantizationMethod::Q4K => (4, 256),
-        QuantizationMethod::Q5K => (5, 256),
-        QuantizationMethod::Q6K => (6, 256),
-        QuantizationMethod::Fp8 => (8, 1),
-        _ => (4, 128),
-    };
-
-    Ok(QuantizationConfig {
-        method,
-        bits,
-        group_size,
-        calibration_dataset: None,
-        calibration_samples: 0,
-    })
 }
 
 #[cfg(test)]

@@ -2,6 +2,8 @@
 //!
 //! User-friendly configuration for quantization methods.
 
+use super::types::QuantType;
+
 /// Quantization method
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuantizationMethod {
@@ -58,6 +60,26 @@ impl QuantizationMethod {
             self,
             Self::Q4_0 | Self::Q4_1 | Self::Q8_0 | Self::Q4K | Self::Q5K | Self::Q6K
         )
+    }
+
+    /// The [`QuantType`] this method packs a tensor as.
+    ///
+    /// The two enums are separate because a method is a user-facing choice
+    /// while a type identifies a packed payload; a mixed-precision run picks a
+    /// type per tensor and never goes through a method at all.
+    pub fn quant_type(&self) -> QuantType {
+        match self {
+            Self::Q4_0 => QuantType::Q4_0,
+            Self::Q4_1 => QuantType::Q4_1,
+            Self::Q8_0 => QuantType::Q8_0,
+            Self::Q4K => QuantType::Q4K,
+            Self::Q5K => QuantType::Q5K,
+            Self::Q6K => QuantType::Q6K,
+            Self::Nf4 => QuantType::NF4,
+            Self::Fp8 => QuantType::FP8,
+            Self::Gptq => QuantType::GPTQ,
+            Self::Awq => QuantType::AWQ,
+        }
     }
 
     /// Get the block size for this method

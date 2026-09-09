@@ -16,7 +16,7 @@
 use anyhow::{anyhow, bail, Result};
 use half::f16;
 
-use super::config::{QuantizationConfig, QuantizationMethod};
+use super::config::QuantizationConfig;
 use super::tensor::QuantizedTensor;
 use super::types::QuantType;
 
@@ -57,48 +57,66 @@ impl Quantizer {
         shape: &[usize],
         dtype: crate::loader::UnifiedDType,
     ) -> Result<QuantizedTensor> {
+        self.quantize_tensor_as(data, shape, dtype, self.config.method.quant_type())
+    }
+
+    /// Quantize a tensor into a type the caller chose for THIS tensor.
+    ///
+    /// A mixed-precision GGUF run assigns a format per tensor, so the type
+    /// cannot come from the configuration. The planning layer and the write
+    /// loop read the same assignment, because a byte count reserved for one
+    /// type and filled with another shifts every later tensor offset in the
+    /// output file with no error raised.
+    ///
+    /// # Arguments
+    /// * `data` - Raw tensor bytes (F32, F16, or BF16)
+    /// * `shape` - Tensor shape [rows, cols] or [numel]
+    /// * `dtype` - Original data type
+    /// * `quant_type` - The format to pack into
+    pub fn quantize_tensor_as(
+        &self,
+        data: &[u8],
+        shape: &[usize],
+        dtype: crate::loader::UnifiedDType,
+        quant_type: QuantType,
+    ) -> Result<QuantizedTensor> {
         log::debug!(
-            "Quantizing tensor: shape={:?}, dtype={}, method={:?}",
+            "Quantizing tensor: shape={:?}, dtype={}, type={:?}",
             shape,
             dtype,
-            self.config.method
+            quant_type
         );
 
         // Convert to f32 first for uniform processing
         let f32_data = self.to_f32(data, dtype)?;
 
-        match self.config.method {
-            QuantizationMethod::Nf4 => self.quantize_nf4(&f32_data, shape),
-            QuantizationMethod::Fp8 => self.quantize_fp8(&f32_data, shape),
+        match quant_type {
+            QuantType::NF4 => self.quantize_nf4(&f32_data, shape),
+            QuantType::FP8 => self.quantize_fp8(&f32_data, shape),
             // Unreachable through `convert`: `ConversionConfig::validate`
             // refuses every method with no on-disk layout before a file is
             // opened. Kept so a direct `Quantizer` caller gets the same answer.
-            QuantizationMethod::Gptq | QuantizationMethod::Awq => {
+            QuantType::GPTQ | QuantType::AWQ => {
                 anyhow::bail!(
                     "{:?} is not implemented: it needs calibration statistics and a \
                      multi-tensor on-disk layout (qweight, scales, qzeros, g_idx), \
                      neither of which compressr has.",
-                    self.config.method
+                    quant_type
                 )
             }
-            QuantizationMethod::Q4_0 => {
-                quantize_gguf(&f32_data, shape, QuantFormat::Q4_0, QuantType::Q4_0)
-            }
-            QuantizationMethod::Q4_1 => {
-                quantize_gguf(&f32_data, shape, QuantFormat::Q4_1, QuantType::Q4_1)
-            }
-            QuantizationMethod::Q8_0 => {
-                quantize_gguf(&f32_data, shape, QuantFormat::Q8_0, QuantType::Q8_0)
-            }
-            QuantizationMethod::Q4K => {
-                quantize_gguf(&f32_data, shape, QuantFormat::Q4K, QuantType::Q4K)
-            }
-            QuantizationMethod::Q5K => {
-                quantize_gguf(&f32_data, shape, QuantFormat::Q5K, QuantType::Q5K)
-            }
-            QuantizationMethod::Q6K => {
-                quantize_gguf(&f32_data, shape, QuantFormat::Q6K, QuantType::Q6K)
-            }
+            QuantType::Q4_0 => quantize_gguf(&f32_data, shape, QuantFormat::Q4_0, QuantType::Q4_0),
+            QuantType::Q4_1 => quantize_gguf(&f32_data, shape, QuantFormat::Q4_1, QuantType::Q4_1),
+            QuantType::Q8_0 => quantize_gguf(&f32_data, shape, QuantFormat::Q8_0, QuantType::Q8_0),
+            QuantType::Q4K => quantize_gguf(&f32_data, shape, QuantFormat::Q4K, QuantType::Q4K),
+            QuantType::Q5K => quantize_gguf(&f32_data, shape, QuantFormat::Q5K, QuantType::Q5K),
+            QuantType::Q6K => quantize_gguf(&f32_data, shape, QuantFormat::Q6K, QuantType::Q6K),
+            // Q5_0, Q5_1, Q8_1, Q2_K, Q3_K and FP4 have a GGML block layout
+            // and no writer in boostr, so a mix never assigns one and a direct
+            // caller is told rather than handed a nearby format.
+            other => anyhow::bail!(
+                "{other:?} has no quantize kernel in boostr, so compressr cannot pack it. \
+                 Writable: Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K."
+            ),
         }
     }
 

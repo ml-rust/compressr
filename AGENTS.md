@@ -31,6 +31,8 @@ This section is the SINGLE source of truth on what works. Everything below assum
 | dtype cast         | F32, F16, BF16, round-to-nearest-even                      |
 | GGUF quantization  | Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K                         |
 | Sidecar copying    | Tokenizer and config files follow the weights              |
+| GGUF mixed precision | Q4_K_S, Q4_K_M, Q5_K_S, Q5_K_M — llama.cpp's per-tensor allocation, reproduced from `llama_tensor_get_type` |
+| Conversion report  | The format every tensor was written in, and the measured bits per weight |
 
 **Roadmap. Each has an enum variant and each is REFUSED before any output file is created:**
 
@@ -45,6 +47,7 @@ This section is the SINGLE source of truth on what works. Everything below assum
 | Python API          | The PyO3 module exports `__version__` only                              |
 | Triple-buffered I/O | A prefetch/compute/write pipeline; reads and writes are serial today    |
 | Parallel shard I/O  | Reads are sequential; rayon parallelizes TCF quantization, never I/O    |
+| Q2_K, Q3_K and IQ mixes | A Q2_K/Q3_K/I-quant WRITER in boostr; `q2_k_s`, `q3_k_s`, `q3_k_m` and `q3_k_l` are refused by name |
 
 The `optimize` subcommand parses its flags but every method it accepts is a roadmap item, so it always errors.
 
@@ -83,7 +86,8 @@ compressr info ./llama-3-8b --verbose
 
 ### Invariants
 
-- The per-tensor plan is computed ONCE and read by both the registration loop and the write loop. If they disagreed by one tensor, every later offset in the file would be wrong with no error raised.
+- The per-tensor plan is computed ONCE and read by both the registration loop and the write loop. If they disagreed by one tensor, every later offset in the file would be wrong with no error raised. A mixed-precision run puts a DIFFERENT block type in that plan per tensor, so the write loop takes its format from the plan and never from the configuration.
+- `general.file_type` is llama.cpp's `llama_ftype` enum, NOT a GGML type id. A reader takes each tensor's format from the tensor directory and reads this key only to name the file, so a wrong value mislabels the model everywhere it is displayed.
 - GGUF stores dimensions REVERSED, so the row length `ne[0]` is the LAST dimension of a standard-order shape. A rank-1 tensor or a row that is not a whole number of blocks is stored as F32, as llama.cpp does.
 - `ConversionConfig::validate` rejects every unwritable configuration BEFORE a file is opened. A mismatch caught by the writer instead aborts mid-loop and leaves a truncated file.
 - SafeTensors headers are padded with spaces to a multiple of 8 bytes, so the data block starts 8-byte aligned and a reader can map an F32 tensor in place.

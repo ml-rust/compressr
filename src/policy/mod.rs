@@ -16,8 +16,18 @@
 //! subsequent tensor offset in the file would be wrong, with no error raised.
 
 pub mod allocation;
+pub mod gguf_mix;
+pub mod mix_model;
+pub mod mix_report;
+pub mod mix_rules;
+pub mod tensor_role;
 
 pub use allocation::{relative_rms_error, select_bumped, ScreenedTensor};
+pub use gguf_mix::{assign_mix, parse_gguf_mix, GgufMix, GGUF_MIX_NAMES};
+pub use mix_model::{mix_model_facts, MixModel};
+pub use mix_report::{plan_format_label, quant_type_label, FormatUsage, MixEntry, MixReport};
+pub use mix_rules::{plan_mixed_tensor, step_down_unquantizable, use_more_bits, MixCounters};
+pub use tensor_role::{classify, is_quantizable_role, TensorRole, NEVER_QUANTIZED_SUBSTRINGS};
 
 use crate::loader::UnifiedDType;
 use crate::quantization::QuantType;
@@ -58,6 +68,13 @@ pub enum FallbackReason {
     /// Value-dependent like [`FallbackReason::SourceNonfinite`], and decided
     /// at the same point.
     NumericRange,
+    /// A mixed-precision allocation keeps this tensor unquantized
+    ///
+    /// llama.cpp's mixes never round a normalization weight, a
+    /// mixture-of-experts router, or the handful of small 2D weights listed in
+    /// [`NEVER_QUANTIZED_SUBSTRINGS`], whatever their shape. Only the GGUF mix
+    /// path produces this reason; a flat quantization has no role rules.
+    MixRole,
 }
 
 /// The TCF `fallback_reason` a compressr reason maps to.
@@ -73,6 +90,7 @@ pub fn tcf_fallback_reason(reason: FallbackReason) -> tcf_core::FallbackReason {
         FallbackReason::SourceDtype => tcf_core::FallbackReason::UnsupportedEncoding,
         FallbackReason::SourceNonfinite => tcf_core::FallbackReason::SourceNonfinite,
         FallbackReason::NumericRange => tcf_core::FallbackReason::NumericRange,
+        FallbackReason::MixRole => tcf_core::FallbackReason::UnsupportedEncoding,
     }
 }
 
@@ -168,7 +186,8 @@ impl PlanCounts {
             TensorPlan::StoreF32(FallbackReason::RowLength) => self.fallback_row_length += 1,
             TensorPlan::StoreF32(FallbackReason::SourceDtype)
             | TensorPlan::StoreF32(FallbackReason::SourceNonfinite)
-            | TensorPlan::StoreF32(FallbackReason::NumericRange) => self.fallback_source += 1,
+            | TensorPlan::StoreF32(FallbackReason::NumericRange)
+            | TensorPlan::StoreF32(FallbackReason::MixRole) => self.fallback_source += 1,
             TensorPlan::StoreAsIs => self.passthrough += 1,
         }
     }
@@ -181,7 +200,8 @@ impl PlanCounts {
             TcfPlan::Raw(FallbackReason::RowLength) => self.fallback_row_length += 1,
             TcfPlan::Raw(FallbackReason::SourceDtype)
             | TcfPlan::Raw(FallbackReason::SourceNonfinite)
-            | TcfPlan::Raw(FallbackReason::NumericRange) => self.fallback_source += 1,
+            | TcfPlan::Raw(FallbackReason::NumericRange)
+            | TcfPlan::Raw(FallbackReason::MixRole) => self.fallback_source += 1,
         }
     }
 }
@@ -281,7 +301,7 @@ fn read_config_architecture(input_path: &Path) -> Result<Option<String>> {
 /// The checkpoint directory an input path belongs to.
 ///
 /// An input names either the directory itself or one weights file inside it.
-fn checkpoint_dir(input_path: &Path) -> Option<PathBuf> {
+pub(crate) fn checkpoint_dir(input_path: &Path) -> Option<PathBuf> {
     if input_path.is_dir() {
         return Some(input_path.to_path_buf());
     }
@@ -420,6 +440,7 @@ mod tests {
             FallbackReason::SourceDtype,
             FallbackReason::SourceNonfinite,
             FallbackReason::NumericRange,
+            FallbackReason::MixRole,
         ] {
             assert_ne!(
                 tcf_fallback_reason(reason),

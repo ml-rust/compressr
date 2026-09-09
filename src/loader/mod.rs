@@ -588,7 +588,7 @@ fn describe_magic(magic: Option<[u8; 8]>) -> String {
 }
 
 /// Extract layer index from tensor name
-fn extract_layer_index(name: &str) -> Option<usize> {
+pub fn extract_layer_index(name: &str) -> Option<usize> {
     // Common patterns: "layers.N.", "h.N.", "transformer.h.N.", "model.layers.N."
     let parts: Vec<&str> = name.split('.').collect();
 

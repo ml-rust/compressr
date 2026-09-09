@@ -14,6 +14,10 @@
 //! - GGUF v3 out, one self-contained file
 //! - Element-type casts between F32, F16 and BF16, round-to-nearest-even
 //! - GGUF block quantization: Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K
+//! - GGUF mixed precision: Q4_K_S, Q4_K_M, Q5_K_S and Q5_K_M, which assign a
+//!   different block format per tensor by role and by layer, reproducing
+//!   llama.cpp's `llama_tensor_get_type`. Q2_K, Q3_K and the I-quant mixes are
+//!   refused by name: boostr reads those formats and writes none of them.
 //! - TCF v1 out, quantized once from the full-precision source
 //! - TCF profile allocation: a base encoding plus a bump encoding on the
 //!   worst-reconstructed share of the parameters
@@ -92,8 +96,10 @@ pub use loader::{
     TcfTensorFacts, UnifiedDType, UnifiedTensorInfo,
 };
 pub use policy::{
-    plan_tcf_tensor, plan_tensor, relative_rms_error, select_bumped, FallbackReason, PlanCounts,
-    ScreenedTensor, TcfPlan, TensorPlan,
+    assign_mix, mix_model_facts, parse_gguf_mix, plan_format_label, plan_mixed_tensor,
+    plan_tcf_tensor, plan_tensor, quant_type_label, relative_rms_error, select_bumped,
+    FallbackReason, FormatUsage, GgufMix, MixEntry, MixModel, MixReport, PlanCounts,
+    ScreenedTensor, TcfPlan, TensorPlan, TensorRole, GGUF_MIX_NAMES,
 };
 pub use quantization::{
     QuantType, QuantizationConfig, QuantizationMethod, QuantizedTensor, Quantizer,
@@ -198,6 +204,13 @@ pub struct ConversionConfig {
     /// quantizable parameters the bump covers, so it sets one encoding per
     /// tensor rather than one for the whole model.
     pub tcf_profile: Option<TcfProfile>,
+    /// llama.cpp mixed-precision allocation for a GGUF output
+    ///
+    /// Set alongside [`ConversionConfig::quantization`], whose method is the
+    /// mix's base format. When this is set the per-tensor format comes from
+    /// [`policy::assign_mix`] and the base method is used only for the tensors
+    /// no rule moves.
+    pub gguf_mix: Option<GgufMix>,
     /// Verbose logging
     pub verbose: bool,
 }
@@ -216,8 +229,15 @@ impl ConversionConfig {
             arch: None,
             tcf: None,
             tcf_profile: None,
+            gguf_mix: None,
             verbose: false,
         }
+    }
+
+    /// Set the llama.cpp mixed-precision allocation for a GGUF output
+    pub fn with_gguf_mix(mut self, mix: GgufMix) -> Self {
+        self.gguf_mix = Some(mix);
+        self
     }
 
     /// Set the TCF encoding and the encoding its module prefers
@@ -326,6 +346,27 @@ impl ConversionConfig {
                      header records an element type and a shape, which cannot describe a \
                      block-quantized tensor. Use --format gguf, or --dtype for a cast.",
                     self.output_format
+                );
+            }
+        }
+        if let Some(mix) = self.gguf_mix {
+            // A mix is a table of per-tensor GGML block types, and GGUF's
+            // tensor directory is the only container here that records a type
+            // per tensor.
+            if self.output_format != OutputFormat::Gguf {
+                bail!(
+                    "Mixed precision {} writes GGUF only, but --format is {:?}. A mix \
+                     assigns a different block type to different tensors, which only \
+                     GGUF's tensor directory can record.",
+                    mix.name(),
+                    self.output_format
+                );
+            }
+            if self.quantization.is_none() {
+                bail!(
+                    "Internal error: mixed precision {} reached convert with no base \
+                     quantization method.",
+                    mix.name()
                 );
             }
         }
@@ -455,6 +496,13 @@ pub struct ConversionStats {
     pub compression_ratio: f64,
     /// Elapsed time in seconds
     pub elapsed_secs: f64,
+    /// The format every tensor was written in, and the bpw that achieved
+    ///
+    /// Populated for a GGUF or SafeTensors output, not only for a
+    /// mixed-precision one: a comparison has to state what it compared, and a
+    /// flat run still stores some tensors unquantized. EMPTY for a TCF output,
+    /// whose writer produces its payload in a pass this loop does not see.
+    pub mix: MixReport,
 }
 
 impl std::fmt::Display for ConversionStats {
@@ -554,18 +602,7 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
     );
 
     // Step 2: Create the quantizer (if quantization is requested)
-    let quant_type = config.quantization.as_ref().map(|q| match q.method {
-        QuantizationMethod::Q4_0 => QuantType::Q4_0,
-        QuantizationMethod::Q4_1 => QuantType::Q4_1,
-        QuantizationMethod::Q8_0 => QuantType::Q8_0,
-        QuantizationMethod::Q4K => QuantType::Q4K,
-        QuantizationMethod::Q5K => QuantType::Q5K,
-        QuantizationMethod::Q6K => QuantType::Q6K,
-        QuantizationMethod::Nf4 => QuantType::NF4,
-        QuantizationMethod::Fp8 => QuantType::FP8,
-        QuantizationMethod::Gptq => QuantType::GPTQ,
-        QuantizationMethod::Awq => QuantType::AWQ,
-    });
+    let quant_type = config.quantization.as_ref().map(|q| q.method.quant_type());
 
     let quantizer = config
         .quantization
@@ -579,6 +616,10 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
     // Get model metadata
     let metadata = model.metadata();
 
+    // The mix rules read the architecture, so the value written to
+    // `general.architecture` is kept rather than resolved a second time.
+    let mut gguf_arch: Option<String> = None;
+
     // Configure writer based on format
     if config.output_format == OutputFormat::Gguf {
         // For GGUF, we need to set up metadata. Every consumer keys its
@@ -590,6 +631,7 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
             metadata.architecture.as_deref(),
             input_path,
         )?;
+        gguf_arch = Some(arch.clone());
         let arch = arch.as_str();
 
         // We need to configure the writer before initialization
@@ -623,19 +665,27 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
             );
         }
 
-        // Set file type based on quantization
-        if let Some(qt) = quant_type {
+        // `general.file_type` names the file, and only that: a reader takes
+        // each tensor's format from the tensor directory. The values are
+        // llama.cpp's `llama_ftype` enum, which is NOT the GGML type id — a
+        // file written with GGML ids reports Q3_K_M for a Q4_K model.
+        if let Some(mix) = config.gguf_mix {
+            gguf_writer.set_file_type(mix.llama_ftype());
+        } else if let Some(qt) = quant_type {
             let file_type = match qt {
                 QuantType::Q4_0 => 2,
                 QuantType::Q4_1 => 3,
-                QuantType::Q5_0 => 6,
-                QuantType::Q5_1 => 7,
-                QuantType::Q8_0 => 8,
+                QuantType::Q8_0 => 7,
+                QuantType::Q5_0 => 8,
+                QuantType::Q5_1 => 9,
                 QuantType::Q2K => 10,
+                // llama.cpp names no ftype for a flat K-quant, because its own
+                // K-quant paths are all mixes. The nearest published value is
+                // the `_S` variant of the same base format.
                 QuantType::Q3K => 11,
-                QuantType::Q4K => 12,
-                QuantType::Q5K => 13,
-                QuantType::Q6K => 14,
+                QuantType::Q4K => 14,
+                QuantType::Q5K => 16,
+                QuantType::Q6K => 18,
                 _ => 1, // F16 default
             };
             gguf_writer.set_file_type(file_type);
@@ -694,10 +744,42 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
     // the byte count and the write loop produces the bytes; a tensor the two
     // loops disagreed about would shift every later offset in the output file
     // without raising an error, so both read this one list.
-    let plans: Vec<TensorPlan> = tensor_info
-        .iter()
-        .map(|(_, info)| policy::plan_tensor(&info.shape, info.dtype, quant_type))
-        .collect();
+    let plans: Vec<TensorPlan> = match config.gguf_mix {
+        // A mix assigns a format per tensor from its role and its layer, so
+        // the plan list is built from that assignment rather than from one
+        // method applied to everything.
+        Some(mix) => {
+            let arch = gguf_arch.as_deref().unwrap_or_default();
+            let facts = policy::mix_model_facts(arch, &metadata, Path::new(&config.input_path))?;
+            log::info!(
+                "Mixed precision {}: base {:?}, {} layers, {} expert(s), 70B attention-V \
+                 rule {}",
+                mix.name(),
+                mix.base(),
+                facts.n_layer,
+                facts.n_expert,
+                if facts.is_70b { "on" } else { "off" }
+            );
+            let assigned = policy::assign_mix(
+                mix,
+                tensor_info
+                    .iter()
+                    .map(|(name, info)| (name.as_str(), info.shape.as_slice())),
+                &facts,
+            );
+            tensor_info
+                .iter()
+                .zip(&assigned)
+                .map(|((_, info), assigned)| {
+                    policy::plan_mixed_tensor(&info.shape, info.dtype, *assigned)
+                })
+                .collect()
+        }
+        None => tensor_info
+            .iter()
+            .map(|(_, info)| policy::plan_tensor(&info.shape, info.dtype, quant_type))
+            .collect(),
+    };
 
     // Step 4: Initialize writer and register all tensors
     if let Some(parent) = layout.weights_path.parent() {
@@ -739,6 +821,7 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
     let mut processed = 0;
     let mut output_size = 0u64;
     let mut counts = PlanCounts::default();
+    let mut mix = MixReport::default();
 
     for ((name, info), plan) in tensor_info.iter().zip(&plans) {
         if config.verbose {
@@ -751,11 +834,19 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
         // Quantize, cast, or pass through untouched, following the plan the
         // registration loop above already reserved space for.
         let output_data = match *plan {
-            TensorPlan::Quantize(_) => {
+            // The plan names the type, not the configuration: a mixed-precision
+            // run assigns a different one per tensor, and the registration loop
+            // above reserved bytes for exactly this type.
+            TensorPlan::Quantize(quant_type) => {
                 let quantizer = quantizer
                     .as_ref()
                     .context("Internal error: a tensor was planned for quantization but no quantizer is configured")?;
-                let quantized = quantizer.quantize_tensor(&tensor_data, &info.shape, info.dtype)?;
+                let quantized = quantizer.quantize_tensor_as(
+                    &tensor_data,
+                    &info.shape,
+                    info.dtype,
+                    quant_type,
+                )?;
                 quantized.packed_data
             }
             TensorPlan::StoreF32(_) => {
@@ -774,6 +865,22 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
             }
         };
         counts.record(*plan);
+        // The TCF writer produces its payload in a later pass of its own, so
+        // `output_data` there is the SOURCE the tensor was planned from and not
+        // the bytes the file holds. Recording it would report a bpw the file
+        // does not have, so the TCF path contributes no rows.
+        if config.output_format != OutputFormat::Tcf {
+            mix.record(MixEntry {
+                name: name.clone(),
+                format: policy::plan_format_label(*plan, config.stored_dtype(info.dtype)),
+                elements: info.numel as u64,
+                bytes: output_data.len() as u64,
+                fallback: match *plan {
+                    TensorPlan::StoreF32(reason) => Some(reason),
+                    _ => None,
+                },
+            });
+        }
 
         output_size += output_data.len() as u64;
 
@@ -833,6 +940,7 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
         output_size,
         compression_ratio,
         elapsed_secs: elapsed,
+        mix,
     };
 
     log::info!("Conversion complete: {}", stats);
@@ -1308,6 +1416,7 @@ mod tests {
             output_size: 5 * 1024 * 1024 * 1024, // 5 GB
             compression_ratio: 2.0,
             elapsed_secs: 30.5,
+            mix: MixReport::default(),
         };
 
         let display = format!("{}", stats);
