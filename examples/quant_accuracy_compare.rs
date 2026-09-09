@@ -2,8 +2,12 @@
 //!
 //! Quantizes the SAME source tensor with both codecs, dequantizes both, and
 //! diffs each reconstruction against the f32 source. Nothing is rescaled and no
-//! "closest bpw" fudge is applied: the three pairs below are bit-for-bit bpw
-//! matches, so the only variable left is which codec reconstructs better.
+//! "closest bpw" fudge is applied: every pair below is a bit-for-bit bpw
+//! match, so the only variable left is which codec reconstructs better.
+//!
+//! # Two modes
+//!
+//! `--mode super-block-256` (the DEFAULT, and the tool's original behaviour):
 //!
 //! | TCF          | GGUF | bytes / 256 elements | bpw    |
 //! |--------------|------|----------------------|--------|
@@ -15,6 +19,52 @@
 //! same layout: 32-element blocks, one binary16 scale, 8-bit codes clamped to
 //! [-127, 127], 34 bytes per 32 elements. That tier compares two ENCODERS of
 //! one format, and the report labels it so wherever it appears.
+//!
+//! Those first two TCF encodings carry a 256-element super-block, the same
+//! granularity the GGUF K-quants they face carry. So that mode structurally
+//! CANNOT observe a row where the two sides differ in what they can encode at
+//! all: whatever `Q4_K` refuses, `Q4AS32DT64`'s super-block is fitted over the
+//! same 256 elements.
+//!
+//! `--mode tile-64` exists for exactly that regime. TCF's flat-scale
+//! encodings tile at 64 and need only `row % 64 == 0`. GGUF's K-quants need
+//! `row % 256 == 0`; only its legacy 32-element formats reach a row of 64.
+//!
+//! | TCF          | GGUF | bpw  | granularity        |
+//! |--------------|------|------|--------------------|
+//! | `Q4S32T64`   | Q4_0 | 4.50 | scale group 32 both, symmetric both |
+//! | `Q4AS64T64`  | Q4_0 | 4.50 | TCF group 64 asymmetric vs GGUF block 32 symmetric |
+//! | `Q4AS32T64`  | Q4_1 | 5.00 | scale+min group 32 both, asymmetric both |
+//! | `Q6S32T64`   | NONE | 6.50 | GGUF has no format here — see below |
+//!
+//! The 6.50 row has no GGUF side. `Q6_K` is 6.5625 bpw but needs
+//! `row % 256 == 0`, and GGUF's 32-element formats step 4.50, 5.00, 5.50,
+//! 6.00, 8.50 with nothing at 6.50. Of those, boostr carries a CPU quantize
+//! kernel for `Q4_0`, `Q4_1` and `Q8_0` only, so the nearest ENCODABLE budget
+//! above 6.50 is `Q8_0` at 8.50 — 2.00 bpw more, which is not a matched
+//! comparison and is not printed as one. That row reports TCF's own
+//! reconstruction and states the gap.
+//!
+//! # What a "row" is
+//!
+//! The row is the LAST dimension of the standard-order shape, and every bpw,
+//! byte and shape-support figure here follows that. This was checked against
+//! both codecs rather than assumed:
+//!
+//! - `tcf-core`'s `row_major_tiles` (SPECIFICATION.md Section 12.3) sets
+//!   `K = dims[rank - 1]` and `R = product(dims[0..rank - 1])`, and refuses
+//!   the tensor when `K % tile != 0`. Tiles never cross a row boundary.
+//! - boostr's `QuantizeOps::quantize` for `CpuRuntime` refuses the tensor when
+//!   `shape.last() % format.block_size() != 0`.
+//! - `compressr`'s own GGUF writer and its `policy` module apply the same
+//!   last-dimension rule, because GGUF stores dimensions reversed and `ne[0]`
+//!   is the last standard-order dimension.
+//!
+//! So a rank-3 tensor is NOT flattened to `[shape[0], product(shape[1..])]` by
+//! either codec. A `[1024, 1024, 7]` conv weight has a row of 7, both codecs
+//! genuinely refuse it, and `compressr convert` genuinely stores it as F32.
+//! Reporting it as unencodable is the correct measurement, not an inflated
+//! count.
 //!
 //! Every number is PER TENSOR. A pooled model-wide number averages away the
 //! tensor where a gap actually shows, and attention output projections,
@@ -86,6 +136,10 @@
 //! # include smaller tensors than the default floor
 //! cargo run --release --example quant_accuracy_compare -- \
 //!     /path/to/safetensors-checkpoint --min-elements 1024
+//!
+//! # the 64-element-tile regime, where the two sides differ in reach
+//! cargo run --release --example quant_accuracy_compare -- \
+//!     /path/to/safetensors-checkpoint --mode tile-64
 //! ```
 //!
 //! # Which code actually runs
@@ -108,7 +162,7 @@
 //! way in f64 and is called with each codec's weight function.
 
 use anyhow::{anyhow, bail, Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use rayon::prelude::*;
 
 use boostr::quant::{DequantOps, QuantFormat, QuantizeOps};
@@ -118,48 +172,166 @@ use compressr::{cast_bytes, relative_rms_error};
 use tcf_core::encoding::{dequantize, pack, quantize, unpack};
 use tcf_core::NativeEncoding;
 
-/// One matched bits-per-weight tier: a TCF encoding and the GGUF format that
-/// occupies exactly the same bytes for the same element count.
+/// One bits-per-weight tier: a TCF encoding and, when GGUF has one at that
+/// budget and granularity, the GGUF format occupying exactly the same bytes
+/// for the same element count.
 struct Tier {
     /// Nominal bits per weight, for the report header only. The per-tensor
-    /// byte counts below are what actually proves the match.
+    /// byte counts below are what actually proves the match, and
+    /// `print_encoding_budgets` re-derives this figure from each side's own
+    /// block layout rather than trusting either name.
     bpw: f64,
     tcf: NativeEncoding,
-    gguf: QuantFormat,
+    /// `None` when GGUF has NO format at this tier's bits per weight and
+    /// granularity. Such a tier still runs TCF and prints its reconstruction;
+    /// what it cannot print is a ratio, and `gguf_gap` says why.
+    gguf: Option<QuantFormat>,
     /// Set when the two sides are not two formats but ONE format written by
     /// two encoders. The text is printed with the tier so no reader takes
     /// that tier's numbers for a format result.
     same_format: Option<&'static str>,
+    /// Set when `gguf` is `None`: the capability gap, stated in full so the
+    /// report names it instead of silently skipping the tier.
+    gguf_gap: Option<&'static str>,
+    /// Set when the two sides are matched in bytes but NOT in granularity or
+    /// symmetry. Printed with the tier so the reader is not told a
+    /// like-for-like pairing that is not one.
+    granularity_note: Option<&'static str>,
+}
+
+impl Tier {
+    /// The GGUF side's name, or a placeholder when the tier has no GGUF side.
+    fn gguf_name(&self) -> &'static str {
+        match self.gguf {
+            Some(format) => format.name(),
+            None => "(no GGUF format at this budget)",
+        }
+    }
+}
+
+/// Which set of encoding pairs the run compares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Mode {
+    /// The original three pairs. Both sides carry a 256-element super-block,
+    /// so both sides accept and refuse exactly the same shapes.
+    SuperBlock256,
+    /// TCF's 64-element-tile encodings against the best GGUF format at a
+    /// matched byte budget. This is the regime where the two sides differ in
+    /// what they can encode at all.
+    Tile64,
 }
 
 // `static`, not `const`: `process_batch` below takes `&'static Tier`
-// references into this array from inside a rayon closure, which a `const`
+// references into these arrays from inside a rayon closure, which a `const`
 // cannot provide — each use of a `const` re-materializes a fresh temporary.
-static TIERS: [Tier; 3] = [
+static SUPER_BLOCK_256_TIERS: [Tier; 3] = [
     Tier {
         bpw: 4.50,
         tcf: NativeEncoding::Q4AS32DT64,
-        gguf: QuantFormat::Q4K,
+        gguf: Some(QuantFormat::Q4K),
         same_format: None,
+        gguf_gap: None,
+        granularity_note: None,
     },
     Tier {
         bpw: 6.5625,
         tcf: NativeEncoding::Q6S16DT64,
-        gguf: QuantFormat::Q6K,
+        gguf: Some(QuantFormat::Q6K),
         same_format: None,
+        gguf_gap: None,
+        granularity_note: None,
     },
     Tier {
         bpw: 8.50,
         tcf: NativeEncoding::Q8S32T64,
-        gguf: QuantFormat::Q8_0,
+        gguf: Some(QuantFormat::Q8_0),
         same_format: Some(
             "SAME FORMAT, TWO ENCODERS: Q8S32T64 and Q8_0 are bit-for-bit the \
              same layout — 32-element blocks, one binary16 scale, 8-bit codes \
              clamped to [-127, 127], 34 bytes per 32 elements. Any gap here is \
              encoder work, NOT a format result.",
         ),
+        gguf_gap: None,
+        granularity_note: None,
     },
 ];
+
+/// The 64-element-tile regime. Every TCF encoding here is flat-scale, so its
+/// payload is exactly `tiles * bytes_per_tile` with no super-block to fit,
+/// and it needs only `row % 64 == 0`.
+static TILE_64_TIERS: [Tier; 4] = [
+    Tier {
+        bpw: 4.50,
+        tcf: NativeEncoding::Q4S32T64,
+        gguf: Some(QuantFormat::Q4_0),
+        same_format: None,
+        gguf_gap: None,
+        granularity_note: None,
+    },
+    Tier {
+        bpw: 4.50,
+        tcf: NativeEncoding::Q4AS64T64,
+        gguf: Some(QuantFormat::Q4_0),
+        same_format: None,
+        gguf_gap: None,
+        granularity_note: Some(
+            "MATCHED IN BYTES, NOT IN GRANULARITY: Q4AS64T64 spends its 4.50 \
+             bpw on an ASYMMETRIC scale-and-minimum pair per 64 weights; Q4_0 \
+             spends the same budget on a SYMMETRIC scale per 32 weights. The \
+             byte budget is the matched quantity here, nothing else.",
+        ),
+    },
+    Tier {
+        bpw: 5.00,
+        tcf: NativeEncoding::Q4AS32T64,
+        gguf: Some(QuantFormat::Q4_1),
+        same_format: None,
+        gguf_gap: None,
+        granularity_note: None,
+    },
+    Tier {
+        bpw: 6.50,
+        tcf: NativeEncoding::Q6S32T64,
+        gguf: None,
+        same_format: None,
+        gguf_gap: Some(
+            "CAPABILITY GAP: GGUF has NO format at 6.50 bpw that works at \
+             64-element granularity. Q6_K is 6.5625 bpw but needs \
+             row % 256 == 0. GGUF's 32-element formats step 4.50 (Q4_0), \
+             5.00 (Q4_1), 5.50 (Q5_0), 6.00 (Q5_1), 8.50 (Q8_0) — nothing at \
+             6.50 — and of those boostr carries a CPU quantize kernel for \
+             Q4_0, Q4_1 and Q8_0 only. The nearest encodable budget above \
+             6.50 is Q8_0 at 8.50, 2.00 bpw more, which is not a matched \
+             comparison and is not printed as one. TCF's own reconstruction \
+             is reported below; there is nothing to divide it by.",
+        ),
+        granularity_note: None,
+    },
+];
+
+/// The tier table one mode compares.
+fn tiers(mode: Mode) -> &'static [Tier] {
+    match mode {
+        Mode::SuperBlock256 => &SUPER_BLOCK_256_TIERS,
+        Mode::Tile64 => &TILE_64_TIERS,
+    }
+}
+
+/// TCF's bits per weight, from the layout's OWN byte arithmetic — never from
+/// the encoding's name.
+fn tcf_bits_per_weight(encoding: NativeEncoding) -> f64 {
+    encoding.layout().bits_per_weight()
+}
+
+/// GGUF's bits per weight, from the format's OWN block layout — never from
+/// the format's name.
+fn gguf_bits_per_weight(format: QuantFormat) -> f64 {
+    let block = format.block_size();
+    if block == 0 {
+        return 0.0;
+    }
+    (format.block_bytes() * 8) as f64 / block as f64
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -183,6 +355,11 @@ struct Args {
     /// dominated by a handful of groups and ranks nothing.
     #[arg(long, default_value_t = 4096)]
     min_elements: usize,
+
+    /// Which encoding pairs to compare. Defaults to the original three
+    /// 256-element-super-block pairs, so a prior run reproduces unchanged.
+    #[arg(long, value_enum, default_value_t = Mode::SuperBlock256)]
+    mode: Mode,
 }
 
 /// What one codec produced for one tensor at one tier: the same reconstruction
@@ -286,11 +463,37 @@ enum Outcome {
         matched: bool,
         mismatch: Option<String>,
     },
-    /// This tier cannot encode this tensor's shape at all, on one side or
-    /// both. Not an error, and not a comparison either.
-    Unsupported(String),
+    /// The tier has no GGUF side at all. TCF ran; there is nothing to divide
+    /// its score by. The tier's `gguf_gap` says what GGUF is missing.
+    NoGgufCounterpart(CodecResult),
+    /// This tier cannot encode this tensor's shape, on one side or both.
+    /// Each side's refusal is kept SEPARATELY: pooling them hides which codec
+    /// is the limited one, which is the whole claim under test.
+    Unsupported {
+        /// TCF's refusal, or `None` when TCF could encode this shape.
+        tcf: Option<String>,
+        /// GGUF's refusal, or `None` when GGUF could encode this shape. Also
+        /// `None` on a tier with no GGUF side, where GGUF has nothing to
+        /// refuse with.
+        gguf: Option<String>,
+    },
     /// A codec refused the tensor's values, or a call failed.
     Failed(String),
+}
+
+impl Outcome {
+    /// Both sides' refusals as one line, for the per-tensor status column.
+    /// The verdict counts them separately; a table cell reads better joined.
+    fn unsupported_reason(tcf: Option<&str>, gguf: Option<&str>) -> String {
+        let mut parts = Vec::new();
+        if let Some(reason) = tcf {
+            parts.push(format!("TCF: {reason}"));
+        }
+        if let Some(reason) = gguf {
+            parts.push(format!("GGUF: {reason}"));
+        }
+        parts.join("; ")
+    }
 }
 
 /// One tensor's row in the report.
@@ -329,10 +532,13 @@ fn main() -> Result<()> {
         }
     }
 
+    let tiers = tiers(args.mode);
+
     println!("model    : {}", args.model);
     println!("format   : {:?}", model.format());
     println!("tensors  : {}", model.tensor_count());
     println!("workers  : {} rayon threads", rayon::current_num_threads());
+    println!("mode     : {:?}", args.mode);
 
     let (selected, skipped) = select_tensors(&model, &args);
 
@@ -347,27 +553,17 @@ fn main() -> Result<()> {
 
     println!();
     println!("== comparing {} tensors ==", selected.len());
-    for tier in &TIERS {
-        println!(
-            "  {:.4} bpw: TCF {:?} vs GGUF {}",
-            tier.bpw,
-            tier.tcf,
-            tier.gguf.name()
-        );
-        if let Some(note) = tier.same_format {
-            println!("    {note}");
-        }
-    }
+    print_encoding_budgets(tiers);
 
     // One row list per tier, in the same tensor order, so a reader can scan
     // one tier top to bottom without a per-tensor block of six numbers.
-    let mut tier_rows: Vec<Vec<Row>> = TIERS.iter().map(|_| Vec::new()).collect();
+    let mut tier_rows: Vec<Vec<Row>> = tiers.iter().map(|_| Vec::new()).collect();
 
     // `ModelLoader::read_tensor_bytes` seeks a shared file handle and takes
     // `&mut self`, so it is not `Sync` and cannot be called from multiple
     // rayon workers at once. Reading and converting to f32 therefore stays
     // serial, one tensor at a time, exactly as before. The expensive part —
-    // quantizing, dequantizing and scoring both codecs at all three tiers —
+    // quantizing, dequantizing and scoring both codecs at every tier —
     // is what runs in parallel, in `process_batch` below, over batches
     // bounded by `BATCH_ELEMENT_BUDGET` so at most one batch's worth of f32
     // data is resident at once rather than the whole checkpoint's.
@@ -395,27 +591,94 @@ fn main() -> Result<()> {
         batch.push((name.clone(), shape.clone(), values));
 
         if batch_elements >= BATCH_ELEMENT_BUDGET {
-            process_batch(&batch, &mut tier_rows);
+            process_batch(&batch, tiers, &mut tier_rows);
             batch.clear();
             batch_elements = 0;
         }
     }
     if !batch.is_empty() {
-        process_batch(&batch, &mut tier_rows);
+        process_batch(&batch, tiers, &mut tier_rows);
     }
 
-    for (tier, rows) in TIERS.iter().zip(&tier_rows) {
+    for (tier, rows) in tiers.iter().zip(&tier_rows) {
         print_tier(tier, rows);
     }
 
-    print_verdict(&tier_rows);
+    print_verdict(tiers, &tier_rows);
     Ok(())
+}
+
+/// Print, per tier, the bits per weight each side ACTUALLY spends, derived
+/// from its own block layout, plus the granularity each side works at.
+///
+/// The names claim a budget; the layouts prove one. A tier whose two sides
+/// disagree here is not a matched comparison, and this says so up front
+/// rather than leaving it to the per-tensor byte counts to expose.
+fn print_encoding_budgets(tiers: &[Tier]) {
+    for tier in tiers {
+        let tcf_bpw = tcf_bits_per_weight(tier.tcf);
+        let geometry = tier.tcf.geometry();
+        match tier.gguf {
+            Some(format) => {
+                let gguf_bpw = gguf_bits_per_weight(format);
+                // A tolerance, not equality: both figures are computed in f64
+                // from integer byte counts, so an exact match is expected and
+                // a real difference is far larger than this.
+                let verdict = if (tcf_bpw - gguf_bpw).abs() < 1e-9 {
+                    "bpw MATCHED"
+                } else {
+                    "bpw MISMATCH — not a matched comparison"
+                };
+                println!(
+                    "  TCF {:?} {:.4} bpw (scale group {}, tile {}, {}) vs GGUF {} {:.4} bpw \
+                     (block {}) — {}",
+                    tier.tcf,
+                    tcf_bpw,
+                    geometry.group,
+                    geometry.tile,
+                    if geometry.symmetric {
+                        "symmetric"
+                    } else {
+                        "asymmetric"
+                    },
+                    format.name(),
+                    gguf_bpw,
+                    format.block_size(),
+                    verdict
+                );
+            }
+            None => {
+                println!(
+                    "  TCF {:?} {:.4} bpw (scale group {}, tile {}, {}) vs {}",
+                    tier.tcf,
+                    tcf_bpw,
+                    geometry.group,
+                    geometry.tile,
+                    if geometry.symmetric {
+                        "symmetric"
+                    } else {
+                        "asymmetric"
+                    },
+                    tier.gguf_name()
+                );
+            }
+        }
+        if let Some(note) = tier.same_format {
+            println!("    {note}");
+        }
+        if let Some(note) = tier.granularity_note {
+            println!("    {note}");
+        }
+        if let Some(note) = tier.gguf_gap {
+            println!("    {note}");
+        }
+    }
 }
 
 /// Run every (tensor, tier) pair in one batch across rayon's pool, then append
 /// each tensor's per-tier outcome to `tier_rows` in the batch's original
 /// order — the axis is (tensor, tier), not tensor alone, so a checkpoint
-/// dominated by one huge tensor still spreads its three tiers across workers
+/// dominated by one huge tensor still spreads its tiers across workers
 /// instead of leaving them idle behind it.
 ///
 /// `Vec::into_par_iter` is an indexed parallel iterator: `.collect::<Vec<_>>()`
@@ -423,8 +686,12 @@ fn main() -> Result<()> {
 /// regardless of which worker finished first or in what order. That is what
 /// keeps this report byte-identical in content and order to the serial
 /// version — no explicit re-sort is needed after the collect.
-fn process_batch(batch: &[(String, Vec<usize>, Vec<f32>)], tier_rows: &mut [Vec<Row>]) {
-    let tier_count = TIERS.len();
+fn process_batch(
+    batch: &[(String, Vec<usize>, Vec<f32>)],
+    tiers: &'static [Tier],
+    tier_rows: &mut [Vec<Row>],
+) {
+    let tier_count = tiers.len();
     let jobs: Vec<(usize, usize)> = (0..batch.len())
         .flat_map(|tensor_index| (0..tier_count).map(move |tier_index| (tensor_index, tier_index)))
         .collect();
@@ -433,17 +700,17 @@ fn process_batch(batch: &[(String, Vec<usize>, Vec<f32>)], tier_rows: &mut [Vec<
         .into_par_iter()
         .map(|(tensor_index, tier_index)| {
             let (_, shape, values) = &batch[tensor_index];
-            compare_tensor(values, shape, &TIERS[tier_index])
+            compare_tensor(values, shape, &tiers[tier_index])
         })
         .collect();
 
     let mut outcomes = outcomes.into_iter();
     for (name, shape, _values) in batch {
-        for tier_index in 0..tier_count {
+        for rows in tier_rows.iter_mut().take(tier_count) {
             let outcome = outcomes
                 .next()
                 .expect("exactly one outcome per (tensor, tier) pair in this batch");
-            tier_rows[tier_index].push(Row {
+            rows.push(Row {
                 name: name.clone(),
                 shape: shape.clone(),
                 outcome,
@@ -525,44 +792,67 @@ fn to_f32(bytes: &[u8], dtype: UnifiedDType) -> Result<Vec<f32>> {
         );
     }
     Ok(f32_bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect())
 }
 
-/// Run both codecs over one tensor at one tier.
+/// Run both codecs over one tensor at one tier, or TCF alone when the tier has
+/// no GGUF counterpart.
 fn compare_tensor(values: &[f32], shape: &[usize], tier: &Tier) -> Outcome {
+    // The row is the LAST dimension, and that is what both codecs use, not a
+    // convention adopted here: `tcf-core`'s `row_major_tiles` sets
+    // `K = dims[rank - 1]` (SPECIFICATION.md Section 12.3) and boostr's
+    // `QuantizeOps::quantize` gates on `shape.last() % block_size`. A rank-3
+    // tensor is NOT flattened to `[shape[0], product(shape[1..])]` by either
+    // side, so flattening it here would report a reach neither codec has.
     let row_len = match shape.last() {
         Some(len) => *len,
-        None => return Outcome::Unsupported("rank 0 has no row".to_string()),
+        None => {
+            return Outcome::Unsupported {
+                tcf: Some("rank 0 has no row".to_string()),
+                gguf: Some("rank 0 has no row".to_string()),
+            }
+        }
     };
 
-    // Both codecs pack whole blocks along the LAST axis. A row that is not a
-    // whole number of blocks cannot be encoded at all, and the two sides have
-    // different block widths, so the check is per side.
+    // A row that is not a whole number of blocks cannot be encoded at all,
+    // and the two sides have different block widths, so the check is per side
+    // and each side's refusal is kept apart from the other's.
     let tile = usize::from(tier.tcf.geometry().tile);
-    let block = tier.gguf.block_size();
-    let mut refusals = Vec::new();
-    if tile == 0 || !row_len.is_multiple_of(tile) {
-        refusals.push(format!("row {row_len} is not a whole number of {tile}-element TCF tiles"));
-    }
-    if block == 0 || !row_len.is_multiple_of(block) {
-        refusals.push(format!(
-            "row {row_len} is not a whole number of {block}-element {} blocks",
-            tier.gguf.name()
-        ));
-    }
-    if !refusals.is_empty() {
-        return Outcome::Unsupported(refusals.join("; "));
+    let tcf_refusal = (tile == 0 || !row_len.is_multiple_of(tile))
+        .then(|| format!("row {row_len} is not a whole number of {tile}-element TCF tiles"));
+    let gguf_refusal = tier.gguf.and_then(|format| {
+        let block = format.block_size();
+        (block == 0 || !row_len.is_multiple_of(block)).then(|| {
+            format!(
+                "row {row_len} is not a whole number of {block}-element {} blocks",
+                format.name()
+            )
+        })
+    });
+    if tcf_refusal.is_some() || gguf_refusal.is_some() {
+        return Outcome::Unsupported {
+            tcf: tcf_refusal,
+            gguf: gguf_refusal,
+        };
     }
 
     let tcf = match tcf_result(values, shape, tier.tcf) {
         Ok(result) => result,
         Err(e) => return Outcome::Failed(format!("TCF {:?}: {e:#}", tier.tcf)),
     };
-    let gguf = match gguf_result(values, shape, tier.gguf) {
+    let Some(gguf_format) = tier.gguf else {
+        // No GGUF format occupies this budget at this granularity. TCF's
+        // reconstruction is still worth reporting; a ratio is not, so none is
+        // invented.
+        return Outcome::NoGgufCounterpart(tcf);
+    };
+    let gguf = match gguf_result(values, shape, gguf_format) {
         Ok(result) => result,
-        Err(e) => return Outcome::Failed(format!("GGUF {}: {e:#}", tier.gguf.name())),
+        Err(e) => return Outcome::Failed(format!("GGUF {}: {e:#}", gguf_format.name())),
     };
 
     // A disagreement here is either a bug or a genuine shape-driven mismatch.
@@ -576,7 +866,10 @@ fn compare_tensor(values: &[f32], shape: &[usize], tier: &Tier) -> Outcome {
         ));
     }
     if tcf.bytes != gguf.bytes {
-        mismatch.push(format!("byte count TCF {} vs GGUF {}", tcf.bytes, gguf.bytes));
+        mismatch.push(format!(
+            "byte count TCF {} vs GGUF {}",
+            tcf.bytes, gguf.bytes
+        ));
     }
     let matched = mismatch.is_empty();
     Outcome::Ran {
@@ -738,9 +1031,15 @@ fn print_tier(tier: &Tier, rows: &[Row]) {
         "================ {:.4} bpw : TCF {:?} vs GGUF {} ================",
         tier.bpw,
         tier.tcf,
-        tier.gguf.name()
+        tier.gguf_name()
     );
     if let Some(note) = tier.same_format {
+        println!("  {note}");
+    }
+    if let Some(note) = tier.granularity_note {
+        println!("  {note}");
+    }
+    if let Some(note) = tier.gguf_gap {
         println!("  {note}");
     }
 
@@ -749,8 +1048,8 @@ fn print_tier(tier: &Tier, rows: &[Row]) {
     println!();
     println!("-- encoded payload bytes and status --");
     println!(
-        "{:<48} {:>18} {:>12} {:>12}  {}",
-        "tensor", "shape", "bytes TCF", "bytes GGUF", "status"
+        "{:<48} {:>18} {:>12} {:>12}  status",
+        "tensor", "shape", "bytes TCF", "bytes GGUF"
     );
     for row in rows {
         let shape = format!("{:?}", row.shape);
@@ -774,10 +1073,18 @@ fn print_tier(tier: &Tier, rows: &[Row]) {
                     row.name, shape, tcf.bytes, gguf.bytes, status
                 );
             }
-            Outcome::Unsupported(reason) => {
+            Outcome::NoGgufCounterpart(tcf) => {
+                println!(
+                    "{:<48} {:>18} {:>12} {:>12}  TCF ONLY: no GGUF format at this budget",
+                    row.name, shape, tcf.bytes, "n/a"
+                );
+            }
+            Outcome::Unsupported { tcf, gguf } => {
                 println!(
                     "{:<48} {:>18}  UNSUPPORTED at this tier: {}",
-                    row.name, shape, reason
+                    row.name,
+                    shape,
+                    Outcome::unsupported_reason(tcf.as_deref(), gguf.as_deref())
                 );
             }
             Outcome::Failed(reason) => {
@@ -792,39 +1099,52 @@ fn print_tier(tier: &Tier, rows: &[Row]) {
         println!();
         println!("-- {} ({}) --", objective.label(), objective.owner());
         println!(
-            "{:<48} {:>18} {:>13} {:>13} {:>8}  {}",
-            "tensor", "shape", "TCF", "GGUF", "ratio", "status"
+            "{:<48} {:>18} {:>13} {:>13} {:>8}  status",
+            "tensor", "shape", "TCF", "GGUF", "ratio"
         );
         for row in rows {
-            let Outcome::Ran {
-                tcf,
-                gguf,
-                matched,
-                mismatch,
-            } = &row.outcome
-            else {
-                continue;
-            };
-            let status = if *matched {
-                "matched".to_string()
-            } else {
-                format!(
-                    "UNMATCHED — EXCLUDED: {}",
-                    mismatch.as_deref().unwrap_or("shape disagreement")
-                )
-            };
             let shape = format!("{:?}", row.shape);
-            let tcf_score = tcf.score(*objective);
-            let gguf_score = gguf.score(*objective);
-            println!(
-                "{:<48} {:>18} {} {} {}  {}",
-                row.name,
-                shape,
-                objective.format(tcf_score),
-                objective.format(gguf_score),
-                show_ratio(ratio(tcf_score, gguf_score)),
-                status
-            );
+            match &row.outcome {
+                Outcome::Ran {
+                    tcf,
+                    gguf,
+                    matched,
+                    mismatch,
+                } => {
+                    let status = if *matched {
+                        "matched".to_string()
+                    } else {
+                        format!(
+                            "UNMATCHED — EXCLUDED: {}",
+                            mismatch.as_deref().unwrap_or("shape disagreement")
+                        )
+                    };
+                    let tcf_score = tcf.score(*objective);
+                    let gguf_score = gguf.score(*objective);
+                    println!(
+                        "{:<48} {:>18} {} {} {}  {}",
+                        row.name,
+                        shape,
+                        objective.format(tcf_score),
+                        objective.format(gguf_score),
+                        show_ratio(ratio(tcf_score, gguf_score)),
+                        status
+                    );
+                }
+                Outcome::NoGgufCounterpart(tcf) => {
+                    // TCF's figure, and nothing in the GGUF column, because
+                    // GGUF has no format at this budget to put there.
+                    println!(
+                        "{:<48} {:>18} {} {:>13} {:>8}  TCF ONLY: no GGUF format at this budget",
+                        row.name,
+                        shape,
+                        objective.format(tcf.score(*objective)),
+                        "n/a",
+                        "n/a"
+                    );
+                }
+                Outcome::Unsupported { .. } | Outcome::Failed(_) => continue,
+            }
         }
     }
 
@@ -870,7 +1190,7 @@ impl Tally {
 /// There is no single headline number here on purpose. One codec winning
 /// under its own objective and losing under the other's is the finding, and a
 /// pooled score would bury it.
-fn print_verdict(tier_rows: &[Vec<Row>]) {
+fn print_verdict(tiers: &[Tier], tier_rows: &[Vec<Row>]) {
     println!();
     println!("================================ VERDICT ================================");
     println!(
@@ -887,17 +1207,22 @@ fn print_verdict(tier_rows: &[Vec<Row>]) {
         "the decoder's reconstruction grid, a stage GGUF has no counterpart for — GGUF's second"
     );
     println!("pass only re-rounds codes against the scale it already chose.");
-    println!(
-        "Payload bytes are matched; container overhead is not counted and is not symmetric —"
-    );
+    println!("Payload bytes are matched; container overhead is not counted and is not symmetric —");
     println!("a quantized TCF tensor carries roughly 160-190 further bytes this tool ignores.");
+    println!("Shape exclusions are reported per side, never pooled: a tensor TCF encodes and GGUF");
+    println!("cannot is the capability claim under test, so it has its own line in every tier.");
 
-    for (tier, rows) in TIERS.iter().zip(tier_rows) {
+    for (tier, rows) in tiers.iter().zip(tier_rows) {
         let mut tallies: Vec<Tally> = OBJECTIVES.iter().map(|_| Tally::new()).collect();
         let mut unmatched = 0usize;
-        let mut unsupported = 0usize;
+        // Three separate exclusion counts, never pooled. The middle one is the
+        // capability claim under test: tensors TCF encodes and GGUF cannot.
+        let mut unsupported_tcf_only = 0usize;
+        let mut unsupported_gguf_only = 0usize;
+        let mut unsupported_neither = 0usize;
         let mut failed = 0usize;
         let mut compared = 0usize;
+        let mut tcf_only = 0usize;
 
         for row in rows {
             match &row.outcome {
@@ -922,7 +1247,17 @@ fn print_verdict(tier_rows: &[Vec<Row>]) {
                     }
                 }
                 Outcome::Ran { matched: false, .. } => unmatched += 1,
-                Outcome::Unsupported(_) => unsupported += 1,
+                Outcome::NoGgufCounterpart(_) => tcf_only += 1,
+                Outcome::Unsupported { tcf, gguf } => match (tcf.is_some(), gguf.is_some()) {
+                    (true, true) => unsupported_neither += 1,
+                    (true, false) => unsupported_tcf_only += 1,
+                    (false, true) => unsupported_gguf_only += 1,
+                    // `compare_tensor` only builds this variant when at least
+                    // one side refused, so this arm is unreachable. Counting
+                    // it as an exclusion of neither side keeps the three
+                    // numbers summing to the rows they came from.
+                    (false, false) => unsupported_neither += 1,
+                },
                 Outcome::Failed(_) => failed += 1,
             }
         }
@@ -932,11 +1267,20 @@ fn print_verdict(tier_rows: &[Vec<Row>]) {
             "{:.4} bpw  TCF {:?} vs GGUF {}  —  {} matched tensors compared",
             tier.bpw,
             tier.tcf,
-            tier.gguf.name(),
+            tier.gguf_name(),
             compared
         );
         if let Some(note) = tier.same_format {
             println!("  {note}");
+        }
+        if let Some(note) = tier.granularity_note {
+            println!("  {note}");
+        }
+        if let Some(note) = tier.gguf_gap {
+            println!("  {note}");
+        }
+        if tier.gguf.is_none() {
+            println!("  TCF-only tensors             : {tcf_only} encoded by TCF, no GGUF side");
         }
         for (objective, tally) in OBJECTIVES.iter().zip(&mut tallies) {
             println!(
@@ -949,9 +1293,16 @@ fn print_verdict(tier_rows: &[Vec<Row>]) {
                 objective.owner()
             );
         }
+        // Three separate shape-exclusion counts, never pooled into one. The
+        // GGUF-only line is the capability claim under test — tensors TCF
+        // encodes at this budget and GGUF cannot — so it is on its own line
+        // rather than summed with the others.
+        println!("  excluded, TCF cannot encode  : {unsupported_tcf_only}");
+        println!("  excluded, GGUF cannot encode : {unsupported_gguf_only}");
+        println!("  excluded, NEITHER can encode : {unsupported_neither}");
         println!(
-            "  excluded               : {unmatched} byte/element mismatches, {unsupported} shapes \
-             this tier cannot encode, {failed} codec errors"
+            "  excluded, other              : {unmatched} byte/element mismatches, \
+             {failed} codec errors"
         );
 
         if compared > 0 {
