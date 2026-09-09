@@ -17,6 +17,11 @@
 //! - **The imatrix.** Every upstream rule guarded by `qs.has_imatrix` takes
 //!   its no-imatrix branch, because compressr computes no importance matrix.
 //!   None of the four mixes here reads that flag.
+//! - **A model with more than one transformer stack.** `i_layer` and
+//!   `n_layer` below describe ONE stack, which is all upstream supports.
+//!   [`super::mix_assign`] applies these rules once per stack, and
+//!   [`super::mix_allocation`] states in the conversion report that the result
+//!   is compressr's approximation rather than upstream's allocation.
 
 use crate::loader::{extract_layer_index, UnifiedDType};
 use crate::quantization::QuantType;
@@ -39,7 +44,10 @@ pub struct MixCounters {
     pub n_attention_wv: i64,
     /// FFN-down tensors seen so far
     pub i_ffn_down: i64,
-    /// Transformer blocks, the denominator of the FFN-down rules
+    /// Blocks in the stack being walked, the denominator of the FFN-down rules
+    ///
+    /// Upstream has one stack and reads its block count here. compressr walks
+    /// one stack at a time, so this is that stack's own block count.
     pub n_ffn_down: i64,
     /// Whether the model has an output weight distinct from its embedding
     pub has_output: bool,
@@ -184,7 +192,7 @@ pub fn step_down_unquantizable(new_type: QuantType, shape: &[usize]) -> QuantTyp
 
 /// Decide what to do with one tensor of a mixed-precision GGUF conversion.
 ///
-/// `assigned` is the format [`super::gguf_mix::assign_mix`] gave this tensor,
+/// `assigned` is the format [`super::mix_assign::assign_mix`] gave this tensor,
 /// or `None` when the mix's role rules keep it unquantized. The shape and
 /// dtype checks that follow are the same ones [`super::plan_tensor`] applies,
 /// so a flat and a mixed run fall back for the same reasons.

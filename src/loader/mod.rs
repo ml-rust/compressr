@@ -471,6 +471,8 @@ impl LoadedModel {
                         .get_u32("llama.feed_forward_length")
                         .map(|v| v as usize),
                     rope_theta: meta.get_f32("llama.rope.freq_base").map(|v| v as f64),
+                    // A GGUF header states its block count outright.
+                    num_layers_inferred: false,
                 }
             }
             // Neither a TCF directory nor a PyTorch pickle carries an
@@ -515,6 +517,11 @@ impl LoadedModel {
         }
         if max_layer > 0 {
             metadata.num_layers = Some(max_layer);
+            // The highest index in the tensor names, plus one. For a model
+            // built from several stacks this is the largest of them, not the
+            // size of any one of them, so a consumer that needs a real layer
+            // count must prefer a stated one.
+            metadata.num_layers_inferred = true;
         }
 
         metadata
@@ -851,6 +858,14 @@ impl std::fmt::Display for UnifiedDType {
 pub struct ModelMetadata {
     pub architecture: Option<String>,
     pub num_layers: Option<usize>,
+    /// Whether `num_layers` was counted from tensor names rather than stated
+    ///
+    /// A SafeTensors, TCF or PyTorch header names no layer count, so one is
+    /// inferred from the highest index in the tensor names. That is the right
+    /// answer for a single transformer stack and the wrong one for a model
+    /// built from several, so a caller whose result depends on the count reads
+    /// this before trusting it.
+    pub num_layers_inferred: bool,
     pub hidden_size: Option<usize>,
     pub vocab_size: Option<usize>,
     pub num_heads: Option<usize>,

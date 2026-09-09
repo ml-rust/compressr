@@ -280,17 +280,44 @@ fn main() -> Result<()> {
             if !stats.mix.entries().is_empty() {
                 println!("{}", stats.mix);
             }
+            // A mix names an upstream allocation, so the file name carries a
+            // claim about which tensors were promoted. Printing the inputs the
+            // rules were given — the layer count per stack and where each was
+            // read — is what makes that claim checkable, and the fidelity line
+            // says outright when the model is not the shape upstream's rules
+            // assume.
+            if let Some(allocation) = &stats.allocation {
+                println!("{allocation}");
+            }
             if verbose && !stats.mix.entries().is_empty() {
+                // A mix moves a tensor OFF its base format, so marking those
+                // lines is what makes the listing an audit: the marked tensors
+                // ARE the allocation. The promoted formats come from the
+                // allocation itself rather than from "anything not the base",
+                // because a passed-through integer buffer is not the base
+                // format either and was promoted by nothing.
+                let promoted: std::collections::BTreeSet<&str> = stats
+                    .allocation
+                    .iter()
+                    .flat_map(|allocation| allocation.components.iter())
+                    .flat_map(|component| component.promoted_formats.keys())
+                    .map(String::as_str)
+                    .collect();
+                let base = stats
+                    .allocation
+                    .as_ref()
+                    .map(|allocation| allocation.base_format.as_str());
                 for entry in stats.mix.entries() {
+                    let note = match (entry.fallback, base) {
+                        (Some(reason), _) => format!("  (unquantized: {reason:?})"),
+                        (None, Some(base)) if promoted.contains(entry.format.as_str()) => {
+                            format!("  (promoted from {base})")
+                        }
+                        _ => String::new(),
+                    };
                     println!(
                         "  {:<60} {:<6} {:>12} bytes{}",
-                        entry.name,
-                        entry.format,
-                        entry.bytes,
-                        match entry.fallback {
-                            Some(reason) => format!("  (unquantized: {reason:?})"),
-                            None => String::new(),
-                        }
+                        entry.name, entry.format, entry.bytes, note
                     );
                 }
             }

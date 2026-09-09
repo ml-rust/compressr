@@ -92,14 +92,16 @@ pub use formats::{
     TcfOptions, TcfProfile, DEFAULT_MAX_SHARD_SIZE, TCF_ENCODING_NAMES, TCF_PROFILE_NAMES,
 };
 pub use loader::{
-    LayerGroup, LoadedModel, ModelLoader, ModelMetadata, TcfFileFacts, TcfModuleFacts,
-    TcfTensorFacts, UnifiedDType, UnifiedTensorInfo,
+    extract_layer_index, LayerGroup, LoadedModel, ModelLoader, ModelMetadata, TcfFileFacts,
+    TcfModuleFacts, TcfTensorFacts, UnifiedDType, UnifiedTensorInfo,
 };
 pub use policy::{
-    assign_mix, mix_model_facts, parse_gguf_mix, plan_format_label, plan_mixed_tensor,
-    plan_tcf_tensor, plan_tensor, quant_type_label, relative_rms_error, select_bumped,
-    FallbackReason, FormatUsage, GgufMix, MixEntry, MixModel, MixReport, PlanCounts,
-    ScreenedTensor, TcfPlan, TensorPlan, TensorRole, GGUF_MIX_NAMES,
+    assign_mix, assign_mix_reported, mix_model_facts, parse_gguf_mix, partition_components,
+    plan_format_label, plan_mixed_tensor, plan_tcf_tensor, plan_tensor, principal_component,
+    quant_type_label, relative_rms_error, select_bumped, split_component, use_more_bits,
+    ComponentAllocation, FallbackReason, FormatUsage, GgufMix, LayerCountSource, MixAllocation,
+    MixEntry, MixModel, MixReport, PlanCounts, ScreenedTensor, TcfPlan, TensorPlan, TensorRole,
+    GGUF_MIX_NAMES, UNLAYERED_COMPONENT,
 };
 pub use quantization::{
     QuantType, QuantizationConfig, QuantizationMethod, QuantizedTensor, Quantizer,
@@ -503,6 +505,13 @@ pub struct ConversionStats {
     /// flat run still stores some tensors unquantized. EMPTY for a TCF output,
     /// whose writer produces its payload in a pass this loop does not see.
     pub mix: MixReport,
+    /// Which tensors a mixed-precision rule promoted, and every number the
+    /// rules were given
+    ///
+    /// `None` for a run with no mix. A mixed run's allocation is a function of
+    /// a layer count and a walk order, so a report that states the formats
+    /// without stating those cannot be checked against llama.cpp.
+    pub allocation: Option<MixAllocation>,
 }
 
 impl std::fmt::Display for ConversionStats {
@@ -744,6 +753,7 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
     // the byte count and the write loop produces the bytes; a tensor the two
     // loops disagreed about would shift every later offset in the output file
     // without raising an error, so both read this one list.
+    let mut allocation: Option<policy::MixAllocation> = None;
     let plans: Vec<TensorPlan> = match config.gguf_mix {
         // A mix assigns a format per tensor from its role and its layer, so
         // the plan list is built from that assignment rather than from one
@@ -752,21 +762,31 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
             let arch = gguf_arch.as_deref().unwrap_or_default();
             let facts = policy::mix_model_facts(arch, &metadata, Path::new(&config.input_path))?;
             log::info!(
-                "Mixed precision {}: base {:?}, {} layers, {} expert(s), 70B attention-V \
-                 rule {}",
+                "Mixed precision {}: base {:?}, {} layers from {}, {} expert(s), 70B \
+                 attention-V rule {}",
                 mix.name(),
                 mix.base(),
                 facts.n_layer,
+                facts.layer_count_source,
                 facts.n_expert,
                 if facts.is_70b { "on" } else { "off" }
             );
-            let assigned = policy::assign_mix(
+            let (assigned, computed) = policy::assign_mix_reported(
                 mix,
                 tensor_info
                     .iter()
                     .map(|(name, info)| (name.as_str(), info.shape.as_slice())),
                 &facts,
             );
+            // A model built from several transformer stacks is not the shape
+            // upstream's rules were written for. The conversion still runs —
+            // the per-role assignments are unchanged — but the log says what
+            // the result is, so nobody reads the file name as a claim.
+            if computed.is_multi_component() {
+                log::warn!("{}", computed.fidelity());
+            }
+            log::info!("{computed}");
+            allocation = Some(computed);
             tensor_info
                 .iter()
                 .zip(&assigned)
@@ -941,6 +961,7 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
         compression_ratio,
         elapsed_secs: elapsed,
         mix,
+        allocation,
     };
 
     log::info!("Conversion complete: {}", stats);
@@ -1417,6 +1438,7 @@ mod tests {
             compression_ratio: 2.0,
             elapsed_secs: 30.5,
             mix: MixReport::default(),
+            allocation: None,
         };
 
         let display = format!("{}", stats);

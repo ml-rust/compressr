@@ -16,14 +16,24 @@
 //! subsequent tensor offset in the file would be wrong, with no error raised.
 
 pub mod allocation;
+pub mod config_facts;
 pub mod gguf_mix;
+pub mod mix_allocation;
+pub mod mix_assign;
+pub mod mix_components;
 pub mod mix_model;
 pub mod mix_report;
 pub mod mix_rules;
 pub mod tensor_role;
 
 pub use allocation::{relative_rms_error, select_bumped, ScreenedTensor};
-pub use gguf_mix::{assign_mix, parse_gguf_mix, GgufMix, GGUF_MIX_NAMES};
+pub use config_facts::{find_config_usize, LayerCountSource, LAYER_COUNT_KEYS};
+pub use gguf_mix::{parse_gguf_mix, GgufMix, GGUF_MIX_NAMES};
+pub use mix_allocation::{ComponentAllocation, MixAllocation};
+pub use mix_assign::{assign_mix, assign_mix_reported};
+pub use mix_components::{
+    partition_components, principal_component, split_component, Component, UNLAYERED_COMPONENT,
+};
 pub use mix_model::{mix_model_facts, MixModel};
 pub use mix_report::{plan_format_label, quant_type_label, FormatUsage, MixEntry, MixReport};
 pub use mix_rules::{plan_mixed_tensor, step_down_unquantizable, use_more_bits, MixCounters};
