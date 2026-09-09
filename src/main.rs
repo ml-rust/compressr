@@ -528,8 +528,25 @@ fn parse_quantization(s: &str) -> Result<QuantizationConfig> {
     // Parse quantization levels like "q4_0", "q4_k", "q4_k_m", etc.
     let s_lower = s.to_lowercase();
 
-    // Extract base quantization type (ignoring _s, _m, _l suffixes for now)
-    let base = s_lower.trim_end_matches(['s', 'm', 'l', '_']);
+    // llama.cpp's `_S`/`_M`/`_L` names are MIXES: they assign a different format
+    // to different tensors, so `q4_k_m` puts Q6_K on the output weight and on
+    // part of the FFN-down and attention-V rather than Q4_K everywhere. This
+    // converter emits ONE format for every tensor, so accepting the name and
+    // quantizing flat would return something other than what was asked for.
+    // Refuse, the way every other unimplemented method here is refused.
+    //
+    // Matching the suffix exactly also rejects names a character-set trim used
+    // to accept, such as a repeated suffix.
+    for suffix in ["_s", "_m", "_l"] {
+        if let Some(base) = s_lower.strip_suffix(suffix) {
+            anyhow::bail!(
+                "Mixed-precision `{s}` is not implemented. The `{suffix}` variants assign \
+                 a different format per tensor, and this converter emits one format for \
+                 every tensor. Use `{base}` for a flat quantization."
+            );
+        }
+    }
+    let base = s_lower.as_str();
 
     let method = match base {
         "q4_0" | "q4.0" => QuantizationMethod::Q4_0,
