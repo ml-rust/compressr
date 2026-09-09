@@ -1075,9 +1075,7 @@ checksum = "7a2d987857b319362043e95f5353c0535c1f58eec5336fdfcf626430af7def58"
 
 [[package]]
 name = "regexr"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86a1349fbb85141d3c4fbb05249ae2060c4f79de1fa279ac81ee1cba645d47df"
+version = "0.5.0"
 dependencies = [
  "aho-corasick",
  "dynasm",
@@ -1249,9 +1247,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "splintr"
-version = "0.19.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c74ed537e3244281cbe2ae22fcd55e1d9968258ca24cbf6f302f0598ed1d97be"
+version = "0.20.0"
 dependencies = [
  "aho-corasick",
  "base64",
@@ -1272,8 +1268,6 @@ dependencies = [
 [[package]]
 name = "splintr-vocab-pack"
 version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7401985534963ab3e0b5f4618133adc0f340a7c5eae42e52e9ba5da64f754a0"
 dependencies = [
  "base64",
  "serde_json",
@@ -1282,8 +1276,6 @@ dependencies = [
 [[package]]
 name = "splintr-vocab-whisper"
 version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a2ada363a88833d6cb54e094eaa1d6478ef8e22932157fad8865936e44d43c1"
 dependencies = [
  "splintr-vocab-pack",
 ]
@@ -1625,11 +1617,3 @@ dependencies = [
 [[patch.unused]]
 name = "nexar"
 version = "0.1.2"
-
-[[patch.unused]]
-name = "regexr"
-version = "0.5.0"
-
-[[patch.unused]]
-name = "splintr"
-version = "0.20.0"
