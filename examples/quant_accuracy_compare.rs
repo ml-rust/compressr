@@ -35,15 +35,48 @@
 //! | `Q4S32T64`   | Q4_0 | 4.50 | scale group 32 both, symmetric both |
 //! | `Q4AS64T64`  | Q4_0 | 4.50 | TCF group 64 asymmetric vs GGUF block 32 symmetric |
 //! | `Q4AS32T64`  | Q4_1 | 5.00 | scale+min group 32 both, asymmetric both |
-//! | `Q6S32T64`   | NONE | 6.50 | GGUF has no format here — see below |
+//! | `Q6S32T64`   | NONE | 6.50 | no equal-budget GGUF — BRACKETED, see below |
 //!
-//! The 6.50 row has no GGUF side. `Q6_K` is 6.5625 bpw but needs
+//! The 6.50 row has no equal-budget GGUF side. `Q6_K` is 6.5625 bpw but needs
 //! `row % 256 == 0`, and GGUF's 32-element formats step 4.50, 5.00, 5.50,
 //! 6.00, 8.50 with nothing at 6.50. Of those, boostr carries a CPU quantize
-//! kernel for `Q4_0`, `Q4_1` and `Q8_0` only, so the nearest ENCODABLE budget
-//! above 6.50 is `Q8_0` at 8.50 — 2.00 bpw more, which is not a matched
-//! comparison and is not printed as one. That row reports TCF's own
-//! reconstruction and states the gap.
+//! kernel for `Q4_0`, `Q4_1` and `Q8_0` only, so `Q5_0` and `Q5_1` cannot
+//! serve as a comparison side at all even though their budgets sit between.
+//!
+//! # Bracketing: what a tier with no equal-budget counterpart reports
+//!
+//! Printing TCF's error with `n/a` in every ratio column and stopping there
+//! discards the actual finding. For a row-64 tensor the real deployment choice
+//! is not "6.50 versus nothing"; it is 5.00 (`Q4_1`) or 8.50 (`Q8_0`) from
+//! GGUF against 6.50 from TCF. So such a tier is compared against the
+//! ENCODABLE GGUF budgets that BRACKET it — the nearest below and the nearest
+//! above, at the granularity the TCF tile allows.
+//!
+//! | side  | GGUF   | bpw  | relation to TCF's 6.50 |
+//! |-------|--------|------|------------------------|
+//! | below | `Q4_1` | 5.00 | 1.50 bpw cheaper       |
+//! | above | `Q8_0` | 8.50 | 2.00 bpw dearer        |
+//!
+//! Those two are not asserted. `verify_brackets` re-derives the candidate set
+//! from `QuantFormat`'s own block layouts, keeps only formats whose block
+//! divides the TCF tile, PROBES each one with a real `QuantizeOps::quantize`
+//! call to establish that boostr can actually write it, and then reports
+//! whether the declared pair really is the nearest encodable budget on each
+//! side. A format that sits between but has no quantize kernel is named as
+//! excluded rather than silently dropped.
+//!
+//! A bracketed comparison DELIBERATELY differs in bytes, so the byte-match
+//! verification that gates the equal-budget tiers does not apply to it and
+//! does not reject it. Every bracketed row and every bracketed verdict line
+//! therefore states both budgets, and the word `BRACKETED` appears on each, so
+//! no reader takes a bracketed ratio for an equal-bpw one.
+//!
+//! The finding is computed, never asserted. Per objective the report states
+//! whether TCF's error at its budget lands at or below the upper bracket's
+//! (TCF buys the dearer format's quality at a cheaper size), between the two
+//! (with the proportional position printed), or above the lower bracket's
+//! (TCF loses to both). "Better than 5.00, worse than 8.50" is a real answer
+//! and is printed as one.
 //!
 //! # What a "row" is
 //!
@@ -197,6 +230,41 @@ struct Tier {
     /// symmetry. Printed with the tier so the reader is not told a
     /// like-for-like pairing that is not one.
     granularity_note: Option<&'static str>,
+    /// The GGUF budgets that BRACKET this tier when `gguf` is `None`: the
+    /// nearest encodable budget below and the nearest above, at the
+    /// granularity this tier's TCF tile allows.
+    ///
+    /// Empty on every tier that has an equal-budget GGUF counterpart, so the
+    /// equal-budget tiers print and score exactly as they did before.
+    /// `verify_brackets` re-derives what belongs here from the formats' own
+    /// layouts and reports whether this declaration matches.
+    brackets: &'static [Bracket],
+}
+
+/// One GGUF format standing in for a budget TCF's tier cannot be matched at.
+struct Bracket {
+    side: BracketSide,
+    format: QuantFormat,
+}
+
+/// Which way a bracket misses the TCF tier's budget.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BracketSide {
+    /// Cheaper than TCF's budget: TCF must beat it on error to be worth the
+    /// extra bits.
+    Below,
+    /// Dearer than TCF's budget: TCF matching it on error means equal quality
+    /// at a smaller size.
+    Above,
+}
+
+impl BracketSide {
+    fn label(self) -> &'static str {
+        match self {
+            BracketSide::Below => "below",
+            BracketSide::Above => "above",
+        }
+    }
 }
 
 impl Tier {
@@ -232,6 +300,7 @@ static SUPER_BLOCK_256_TIERS: [Tier; 3] = [
         same_format: None,
         gguf_gap: None,
         granularity_note: None,
+        brackets: &[],
     },
     Tier {
         bpw: 6.5625,
@@ -240,6 +309,7 @@ static SUPER_BLOCK_256_TIERS: [Tier; 3] = [
         same_format: None,
         gguf_gap: None,
         granularity_note: None,
+        brackets: &[],
     },
     Tier {
         bpw: 8.50,
@@ -253,6 +323,7 @@ static SUPER_BLOCK_256_TIERS: [Tier; 3] = [
         ),
         gguf_gap: None,
         granularity_note: None,
+        brackets: &[],
     },
 ];
 
@@ -267,6 +338,7 @@ static TILE_64_TIERS: [Tier; 4] = [
         same_format: None,
         gguf_gap: None,
         granularity_note: None,
+        brackets: &[],
     },
     Tier {
         bpw: 4.50,
@@ -280,6 +352,7 @@ static TILE_64_TIERS: [Tier; 4] = [
              spends the same budget on a SYMMETRIC scale per 32 weights. The \
              byte budget is the matched quantity here, nothing else.",
         ),
+        brackets: &[],
     },
     Tier {
         bpw: 5.00,
@@ -288,6 +361,7 @@ static TILE_64_TIERS: [Tier; 4] = [
         same_format: None,
         gguf_gap: None,
         granularity_note: None,
+        brackets: &[],
     },
     Tier {
         bpw: 6.50,
@@ -300,13 +374,43 @@ static TILE_64_TIERS: [Tier; 4] = [
              row % 256 == 0. GGUF's 32-element formats step 4.50 (Q4_0), \
              5.00 (Q4_1), 5.50 (Q5_0), 6.00 (Q5_1), 8.50 (Q8_0) — nothing at \
              6.50 — and of those boostr carries a CPU quantize kernel for \
-             Q4_0, Q4_1 and Q8_0 only. The nearest encodable budget above \
-             6.50 is Q8_0 at 8.50, 2.00 bpw more, which is not a matched \
-             comparison and is not printed as one. TCF's own reconstruction \
-             is reported below; there is nothing to divide it by.",
+             Q4_0, Q4_1 and Q8_0 only, so Q5_0 and Q5_1 cannot serve as a \
+             comparison side even though their budgets sit between. There is \
+             no equal-budget ratio to print. What IS a real deployment \
+             choice is reported instead: TCF at 6.50 against the nearest \
+             ENCODABLE GGUF budgets that BRACKET it, Q4_1 at 5.00 below and \
+             Q8_0 at 8.50 above. Those rows differ in bytes ON PURPOSE and \
+             carry both budgets everywhere they appear.",
         ),
         granularity_note: None,
+        brackets: &[
+            Bracket {
+                side: BracketSide::Below,
+                format: QuantFormat::Q4_1,
+            },
+            Bracket {
+                side: BracketSide::Above,
+                format: QuantFormat::Q8_0,
+            },
+        ],
     },
+];
+
+/// Every GGUF format this tool will consider putting on the other side of a
+/// bracketed comparison.
+///
+/// This list is candidates only. `verify_brackets` filters it by each
+/// format's OWN `block_size` against the TCF tile, and probes each survivor
+/// with a real quantize call, so a format's membership here never decides
+/// whether it can bracket anything.
+static BRACKET_CANDIDATES: [QuantFormat; 7] = [
+    QuantFormat::Q4_0,
+    QuantFormat::Q4_1,
+    QuantFormat::Q5_0,
+    QuantFormat::Q5_1,
+    QuantFormat::Q8_0,
+    QuantFormat::Q8_1,
+    QuantFormat::IQ4NL,
 ];
 
 /// The tier table one mode compares.
@@ -331,6 +435,185 @@ fn gguf_bits_per_weight(format: QuantFormat) -> f64 {
         return 0.0;
     }
     (format.block_bytes() * 8) as f64 / block as f64
+}
+
+/// Whether boostr can actually WRITE this GGUF format on the CPU.
+///
+/// Established by calling the writer kernel on a one-block tensor, not by
+/// listing names: a kernel added or removed in boostr changes this answer
+/// without anyone editing a list here. boostr's CPU `QuantizeOps` covers a
+/// strict subset of the formats its `DequantOps` reads, and a format it can
+/// only READ cannot stand on the other side of a comparison at all.
+fn gguf_quantize_supported(format: QuantFormat) -> bool {
+    let block = format.block_size();
+    if block == 0 {
+        return false;
+    }
+    // A ramp with both signs and a non-zero mean, so no format's kernel takes
+    // an all-zero or all-positive shortcut and reports success on a degenerate
+    // input.
+    let values: Vec<f32> = (0..block)
+        .map(|index| (index as f32) * 0.125 - 2.0)
+        .collect();
+    let device = CpuDevice::new();
+    let client = CpuClient::new(device.clone());
+    let Ok(input) = Tensor::<CpuRuntime>::from_slice(&values, &[1, block], &device) else {
+        return false;
+    };
+    client.quantize(&input, format).is_ok()
+}
+
+/// One GGUF format's standing as a possible bracket for a TCF tier.
+struct BracketCandidate {
+    format: QuantFormat,
+    bpw: f64,
+    /// Whether boostr's CPU writer can produce it, PROBED, not assumed.
+    encodable: bool,
+}
+
+/// The candidate GGUF formats a tier's TCF tile can actually be compared
+/// against, each with its own layout-derived budget and a probed writer flag.
+///
+/// A format qualifies on granularity when its block divides the TCF tile: a
+/// 32-element block tiles a 64-element row, a 256-element block does not.
+/// That is derived from `block_size` here rather than stated in prose.
+fn bracket_candidates(tile: usize) -> Vec<BracketCandidate> {
+    let mut candidates: Vec<BracketCandidate> = BRACKET_CANDIDATES
+        .iter()
+        .filter_map(|format| {
+            let block = format.block_size();
+            if block == 0 || tile == 0 || !tile.is_multiple_of(block) {
+                return None;
+            }
+            Some(BracketCandidate {
+                format: *format,
+                bpw: gguf_bits_per_weight(*format),
+                encodable: gguf_quantize_supported(*format),
+            })
+        })
+        .collect();
+    // Deterministic order, by budget then by name, so two runs print the same
+    // table and two formats at one budget never swap places.
+    candidates.sort_by(|a, b| {
+        a.bpw
+            .partial_cmp(&b.bpw)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.format.name().cmp(b.format.name()))
+    });
+    candidates
+}
+
+/// Re-derive the nearest encodable budget on one side of a target, from the
+/// candidates' own layouts.
+fn nearest_encodable(
+    candidates: &[BracketCandidate],
+    target: f64,
+    side: BracketSide,
+) -> Option<&BracketCandidate> {
+    match side {
+        // Candidates are sorted ascending, so the nearest below is the last
+        // encodable one under the target and the nearest above is the first
+        // encodable one over it.
+        BracketSide::Below => candidates
+            .iter()
+            .filter(|c| c.encodable && c.bpw < target)
+            .next_back(),
+        BracketSide::Above => candidates.iter().find(|c| c.encodable && c.bpw > target),
+    }
+}
+
+/// Print the bracket check for one tier: every candidate at this granularity,
+/// which of them boostr can write, which pair genuinely brackets the TCF
+/// budget, and whether the tier's declared brackets are that pair.
+///
+/// The declaration in the tier table is what the run compares against, so it
+/// is checked against the layouts rather than trusted. A format whose budget
+/// sits between the brackets but which boostr cannot write is named, because
+/// its absence is a boostr limitation and not a GGUF one.
+fn verify_brackets(tier: &Tier) {
+    if tier.brackets.is_empty() {
+        return;
+    }
+    let tcf_bpw = tcf_bits_per_weight(tier.tcf);
+    let tile = usize::from(tier.tcf.geometry().tile);
+    let candidates = bracket_candidates(tile);
+
+    println!(
+        "    BRACKET CHECK: TCF {:?} at {:.4} bpw, tile {}. GGUF candidates whose block divides \
+         that tile:",
+        tier.tcf, tcf_bpw, tile
+    );
+    for candidate in &candidates {
+        println!(
+            "      {:<8} {:.4} bpw  block {:>3}  boostr CPU quantize kernel: {}",
+            candidate.format.name(),
+            candidate.bpw,
+            candidate.format.block_size(),
+            if candidate.encodable { "YES" } else { "NO" }
+        );
+    }
+
+    for bracket in tier.brackets {
+        let declared_bpw = gguf_bits_per_weight(bracket.format);
+        let nearest = nearest_encodable(&candidates, tcf_bpw, bracket.side);
+        let verdict = match nearest {
+            Some(candidate) if candidate.format == bracket.format => {
+                "IS the nearest encodable budget on that side".to_string()
+            }
+            Some(candidate) => format!(
+                "NOT the nearest — {} at {:.4} bpw is nearer, so this bracket is wider than it \
+                 needs to be",
+                candidate.format.name(),
+                candidate.bpw
+            ),
+            None => "no encodable GGUF budget exists on that side at this granularity".to_string(),
+        };
+        println!(
+            "      declared bracket {:<5} : {} at {:.4} bpw ({:+.4} bpw against TCF) — {}",
+            bracket.side.label(),
+            bracket.format.name(),
+            declared_bpw,
+            declared_bpw - tcf_bpw,
+            verdict
+        );
+    }
+
+    // The budgets GGUF defines between the brackets but boostr cannot write.
+    // Named, because "GGUF has nothing there" and "boostr cannot write what
+    // GGUF has there" are different claims and only the second one is true.
+    let below = tier
+        .brackets
+        .iter()
+        .find(|b| b.side == BracketSide::Below)
+        .map(|b| gguf_bits_per_weight(b.format));
+    let above = tier
+        .brackets
+        .iter()
+        .find(|b| b.side == BracketSide::Above)
+        .map(|b| gguf_bits_per_weight(b.format));
+    if let (Some(below), Some(above)) = (below, above) {
+        let excluded: Vec<String> = candidates
+            .iter()
+            .filter(|c| !c.encodable && c.bpw > below && c.bpw < above)
+            .map(|c| format!("{} at {:.4} bpw", c.format.name(), c.bpw))
+            .collect();
+        if excluded.is_empty() {
+            println!(
+                "      GGUF defines no further budget between {below:.4} and {above:.4} bpw at \
+                 this granularity."
+            );
+        } else {
+            println!(
+                "      between {:.4} and {:.4} bpw GGUF DOES define {}, but boostr has no CPU \
+                 quantize kernel for {}, so {} cannot serve as a bracket.",
+                below,
+                above,
+                excluded.join(" and "),
+                if excluded.len() == 1 { "it" } else { "them" },
+                if excluded.len() == 1 { "it" } else { "they" }
+            );
+        }
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -463,9 +746,16 @@ enum Outcome {
         matched: bool,
         mismatch: Option<String>,
     },
-    /// The tier has no GGUF side at all. TCF ran; there is nothing to divide
-    /// its score by. The tier's `gguf_gap` says what GGUF is missing.
-    NoGgufCounterpart(CodecResult),
+    /// The tier has no EQUAL-BUDGET GGUF side. TCF ran, and so did each GGUF
+    /// format that brackets TCF's budget — the nearest encodable one below and
+    /// the nearest above. There is still no equal-bpw ratio to print; the
+    /// bracketed ones are, and they carry both budgets. The tier's `gguf_gap`
+    /// says what GGUF is missing at the matched budget.
+    NoGgufCounterpart {
+        tcf: CodecResult,
+        /// One entry per declared bracket, in the tier's declaration order.
+        brackets: Vec<BracketOutcome>,
+    },
     /// This tier cannot encode this tensor's shape, on one side or both.
     /// Each side's refusal is kept SEPARATELY: pooling them hides which codec
     /// is the limited one, which is the whole claim under test.
@@ -493,6 +783,38 @@ impl Outcome {
             parts.push(format!("GGUF: {reason}"));
         }
         parts.join("; ")
+    }
+}
+
+/// One bracketing GGUF format's result for one tensor.
+///
+/// The byte count here DELIBERATELY differs from TCF's: a bracket is a
+/// different budget, which is the whole point of printing it. So no
+/// byte-match check applies, and `bpw` travels with every result so the
+/// difference is stated wherever the numbers are.
+struct BracketOutcome {
+    side: BracketSide,
+    format: QuantFormat,
+    /// This format's bits per weight, from its own block layout.
+    bpw: f64,
+    state: BracketState,
+}
+
+/// What the bracketing format did on one tensor.
+enum BracketState {
+    Ran(CodecResult),
+    /// The row is not a whole number of this format's blocks.
+    Unsupported(String),
+    /// The kernel refused the values, or a call failed.
+    Failed(String),
+}
+
+impl BracketState {
+    fn result(&self) -> Option<&CodecResult> {
+        match self {
+            BracketState::Ran(result) => Some(result),
+            BracketState::Unsupported(_) | BracketState::Failed(_) => None,
+        }
     }
 }
 
@@ -672,6 +994,7 @@ fn print_encoding_budgets(tiers: &[Tier]) {
         if let Some(note) = tier.gguf_gap {
             println!("    {note}");
         }
+        verify_brackets(tier);
     }
 }
 
@@ -845,10 +1168,38 @@ fn compare_tensor(values: &[f32], shape: &[usize], tier: &Tier) -> Outcome {
         Err(e) => return Outcome::Failed(format!("TCF {:?}: {e:#}", tier.tcf)),
     };
     let Some(gguf_format) = tier.gguf else {
-        // No GGUF format occupies this budget at this granularity. TCF's
-        // reconstruction is still worth reporting; a ratio is not, so none is
-        // invented.
-        return Outcome::NoGgufCounterpart(tcf);
+        // No GGUF format occupies this budget at this granularity, so no
+        // equal-bpw ratio exists and none is invented. The bracketing budgets
+        // DO exist and are what a deployment actually chooses between, so each
+        // one is run here and reported beside TCF with its own bits per
+        // weight attached.
+        let brackets = tier
+            .brackets
+            .iter()
+            .map(|bracket| {
+                let block = bracket.format.block_size();
+                let state = if block == 0 || !row_len.is_multiple_of(block) {
+                    BracketState::Unsupported(format!(
+                        "row {row_len} is not a whole number of {block}-element {} blocks",
+                        bracket.format.name()
+                    ))
+                } else {
+                    match gguf_result(values, shape, bracket.format) {
+                        Ok(result) => BracketState::Ran(result),
+                        Err(e) => {
+                            BracketState::Failed(format!("GGUF {}: {e:#}", bracket.format.name()))
+                        }
+                    }
+                };
+                BracketOutcome {
+                    side: bracket.side,
+                    format: bracket.format,
+                    bpw: gguf_bits_per_weight(bracket.format),
+                    state,
+                }
+            })
+            .collect();
+        return Outcome::NoGgufCounterpart { tcf, brackets };
     };
     let gguf = match gguf_result(values, shape, gguf_format) {
         Ok(result) => result,
@@ -1026,6 +1377,10 @@ fn show_ratio(value: Option<f64>) -> String {
 }
 
 fn print_tier(tier: &Tier, rows: &[Row]) {
+    // From the layout, not from `tier.bpw`, because every bracketed line below
+    // states TCF's budget against a different one and the two figures have to
+    // come from the same kind of source.
+    let tcf_bpw = tcf_bits_per_weight(tier.tcf);
     println!();
     println!(
         "================ {:.4} bpw : TCF {:?} vs GGUF {} ================",
@@ -1073,11 +1428,58 @@ fn print_tier(tier: &Tier, rows: &[Row]) {
                     row.name, shape, tcf.bytes, gguf.bytes, status
                 );
             }
-            Outcome::NoGgufCounterpart(tcf) => {
+            Outcome::NoGgufCounterpart { tcf, brackets } => {
                 println!(
                     "{:<48} {:>18} {:>12} {:>12}  TCF ONLY: no GGUF format at this budget",
                     row.name, shape, tcf.bytes, "n/a"
                 );
+                for bracket in brackets {
+                    // Indented under the tensor it belongs to, and never in the
+                    // "bytes GGUF" column of the row above: these bytes are a
+                    // DIFFERENT budget's bytes, not a matched count.
+                    match &bracket.state {
+                        BracketState::Ran(result) => {
+                            let size = ratio(tcf_bpw, bracket.bpw)
+                                .map(|r| format!("TCF spends {:.1}% of these bytes", r * 100.0))
+                                .unwrap_or_else(|| "size ratio n/a".to_string());
+                            println!(
+                                "  {:<46} {:>18} {:>12} {:>12}  BRACKETED {} — {} at {:.4} bpw vs \
+                                 TCF {:.4} bpw, {}",
+                                format!("^ bracket {}", bracket.side.label()),
+                                "",
+                                "",
+                                result.bytes,
+                                bracket.side.label(),
+                                bracket.format.name(),
+                                bracket.bpw,
+                                tcf_bpw,
+                                size
+                            );
+                        }
+                        BracketState::Unsupported(reason) => {
+                            println!(
+                                "  {:<46} {:>18} {:>12} {:>12}  BRACKETED {} UNSUPPORTED: {}",
+                                format!("^ bracket {}", bracket.side.label()),
+                                "",
+                                "",
+                                "n/a",
+                                bracket.side.label(),
+                                reason
+                            );
+                        }
+                        BracketState::Failed(reason) => {
+                            println!(
+                                "  {:<46} {:>18} {:>12} {:>12}  BRACKETED {} ERROR: {}",
+                                format!("^ bracket {}", bracket.side.label()),
+                                "",
+                                "",
+                                "n/a",
+                                bracket.side.label(),
+                                reason
+                            );
+                        }
+                    }
+                }
             }
             Outcome::Unsupported { tcf, gguf } => {
                 println!(
@@ -1131,7 +1533,7 @@ fn print_tier(tier: &Tier, rows: &[Row]) {
                         status
                     );
                 }
-                Outcome::NoGgufCounterpart(tcf) => {
+                Outcome::NoGgufCounterpart { tcf, brackets } => {
                     // TCF's figure, and nothing in the GGUF column, because
                     // GGUF has no format at this budget to put there.
                     println!(
@@ -1142,6 +1544,55 @@ fn print_tier(tier: &Tier, rows: &[Row]) {
                         "n/a",
                         "n/a"
                     );
+                    // The bracketing budgets DO have a figure. Their ratio is
+                    // real and is printed, with both budgets on the same line
+                    // so it is never read as an equal-bpw ratio.
+                    let tcf_score = tcf.score(*objective);
+                    for bracket in brackets {
+                        match &bracket.state {
+                            BracketState::Ran(result) => {
+                                let bracket_score = result.score(*objective);
+                                println!(
+                                    "  {:<46} {:>18} {} {} {}  BRACKETED {}: TCF {:.4} bpw vs {} \
+                                     {:.4} bpw — DIFFERENT BUDGETS, not an equal-bpw ratio",
+                                    format!("^ bracket {}", bracket.side.label()),
+                                    "",
+                                    objective.format(tcf_score),
+                                    objective.format(bracket_score),
+                                    show_ratio(ratio(tcf_score, bracket_score)),
+                                    bracket.side.label(),
+                                    tcf_bpw,
+                                    bracket.format.name(),
+                                    bracket.bpw
+                                );
+                            }
+                            BracketState::Unsupported(reason) => {
+                                println!(
+                                    "  {:<46} {:>18} {:>13} {:>13} {:>8}  BRACKETED {} \
+                                     UNSUPPORTED: {}",
+                                    format!("^ bracket {}", bracket.side.label()),
+                                    "",
+                                    "",
+                                    "n/a",
+                                    "n/a",
+                                    bracket.side.label(),
+                                    reason
+                                );
+                            }
+                            BracketState::Failed(reason) => {
+                                println!(
+                                    "  {:<46} {:>18} {:>13} {:>13} {:>8}  BRACKETED {} ERROR: {}",
+                                    format!("^ bracket {}", bracket.side.label()),
+                                    "",
+                                    "",
+                                    "n/a",
+                                    "n/a",
+                                    bracket.side.label(),
+                                    reason
+                                );
+                            }
+                        }
+                    }
                 }
                 Outcome::Unsupported { .. } | Outcome::Failed(_) => continue,
             }
@@ -1153,6 +1604,16 @@ fn print_tier(tier: &Tier, rows: &[Row]) {
     println!(
         "  A codec winning the table that names its own objective is expected, not a finding."
     );
+    if !tier.brackets.is_empty() {
+        println!(
+            "  A ^ bracket line is TCF at {tcf_bpw:.4} bpw against a DIFFERENT budget, so its \
+             ratio is"
+        );
+        println!(
+            "  quality per byte, never quality at equal bytes. Read it with both budgets on the \
+             line."
+        );
+    }
 }
 
 /// One objective's win/loss count and ratio sample for one tier.
@@ -1211,6 +1672,10 @@ fn print_verdict(tiers: &[Tier], tier_rows: &[Vec<Row>]) {
     println!("a quantized TCF tensor carries roughly 160-190 further bytes this tool ignores.");
     println!("Shape exclusions are reported per side, never pooled: a tensor TCF encodes and GGUF");
     println!("cannot is the capability claim under test, so it has its own line in every tier.");
+    println!("A tier with no equal-budget GGUF format gets a BRACKETED COMPARISON instead: TCF");
+    println!("against the nearest encodable GGUF budget below and above. Those bytes DIFFER from");
+    println!("TCF's by design, so a bracketed ratio is quality per byte, never quality at equal");
+    println!("bytes, and every bracketed line names both budgets.");
 
     for (tier, rows) in tiers.iter().zip(tier_rows) {
         let mut tallies: Vec<Tally> = OBJECTIVES.iter().map(|_| Tally::new()).collect();
@@ -1247,7 +1712,7 @@ fn print_verdict(tiers: &[Tier], tier_rows: &[Vec<Row>]) {
                     }
                 }
                 Outcome::Ran { matched: false, .. } => unmatched += 1,
-                Outcome::NoGgufCounterpart(_) => tcf_only += 1,
+                Outcome::NoGgufCounterpart { .. } => tcf_only += 1,
                 Outcome::Unsupported { tcf, gguf } => match (tcf.is_some(), gguf.is_some()) {
                     (true, true) => unsupported_neither += 1,
                     (true, false) => unsupported_tcf_only += 1,
@@ -1308,6 +1773,327 @@ fn print_verdict(tiers: &[Tier], tier_rows: &[Vec<Row>]) {
         if compared > 0 {
             print_objective_split(&tallies);
         }
+        print_bracket_verdict(tier, rows);
+    }
+}
+
+/// One bracketing budget's outcome under one objective, over the tensors
+/// where both it and TCF ran.
+struct BracketObjectiveStats {
+    /// Tensors where TCF's error is at or below this bracket's.
+    tcf_at_or_below: usize,
+    /// Tensors where TCF's error is above this bracket's.
+    tcf_worse: usize,
+    /// TCF / bracket, one per tensor. A DIFFERENT-budget ratio.
+    ratios: Vec<f64>,
+}
+
+impl BracketObjectiveStats {
+    fn new() -> Self {
+        BracketObjectiveStats {
+            tcf_at_or_below: 0,
+            tcf_worse: 0,
+            ratios: Vec::new(),
+        }
+    }
+
+    fn compared(&self) -> usize {
+        self.tcf_at_or_below + self.tcf_worse
+    }
+}
+
+/// The bracketed finding for one tier: TCF's error at its own budget against
+/// the nearest encodable GGUF budget below and the nearest above, plus the
+/// bits per weight each of them actually spends.
+///
+/// This is the answer the tier used to refuse to give. The budgets differ, so
+/// no ratio here is an equal-bpw ratio and every line says so. The conclusion
+/// is derived from the medians printed beside it, never asserted: TCF at or
+/// below the upper bracket, between the two, or above the lower one are three
+/// different findings and each is stated as what it is.
+fn print_bracket_verdict(tier: &Tier, rows: &[Row]) {
+    if tier.brackets.is_empty() {
+        return;
+    }
+    let tcf_bpw = tcf_bits_per_weight(tier.tcf);
+
+    // stats[bracket index][objective index], index-aligned with
+    // `tier.brackets` and `OBJECTIVES`, because `compare_tensor` builds each
+    // row's bracket list in the tier's declaration order.
+    let mut stats: Vec<Vec<BracketObjectiveStats>> = tier
+        .brackets
+        .iter()
+        .map(|_| {
+            OBJECTIVES
+                .iter()
+                .map(|_| BracketObjectiveStats::new())
+                .collect()
+        })
+        .collect();
+    let mut excluded: Vec<usize> = tier.brackets.iter().map(|_| 0).collect();
+    // Where TCF's error falls between the two brackets, per objective: 0.0 is
+    // the lower bracket's error, 1.0 is the upper bracket's.
+    let mut positions: Vec<Vec<f64>> = OBJECTIVES.iter().map(|_| Vec::new()).collect();
+    // Tensors where the DEARER bracket did not reconstruct better than the
+    // cheaper one, per objective. The position figure is meaningless there,
+    // so those tensors are counted out rather than folded in.
+    let mut inverted: Vec<usize> = OBJECTIVES.iter().map(|_| 0).collect();
+
+    let below_index = tier
+        .brackets
+        .iter()
+        .position(|bracket| bracket.side == BracketSide::Below);
+    let above_index = tier
+        .brackets
+        .iter()
+        .position(|bracket| bracket.side == BracketSide::Above);
+
+    for row in rows {
+        let Outcome::NoGgufCounterpart { tcf, brackets } = &row.outcome else {
+            continue;
+        };
+        for (bracket_index, bracket) in brackets.iter().enumerate() {
+            let Some(entry) = stats.get_mut(bracket_index) else {
+                continue;
+            };
+            let Some(result) = bracket.state.result() else {
+                if let Some(count) = excluded.get_mut(bracket_index) {
+                    *count += 1;
+                }
+                continue;
+            };
+            for (objective_index, objective) in OBJECTIVES.iter().enumerate() {
+                let Some(objective_stats) = entry.get_mut(objective_index) else {
+                    continue;
+                };
+                let tcf_score = tcf.score(*objective);
+                let bracket_score = result.score(*objective);
+                if tcf_score <= bracket_score {
+                    objective_stats.tcf_at_or_below += 1;
+                } else {
+                    objective_stats.tcf_worse += 1;
+                }
+                if let Some(r) = ratio(tcf_score, bracket_score) {
+                    objective_stats.ratios.push(r);
+                }
+            }
+        }
+
+        // The proportional position needs both brackets on the same tensor.
+        if let (Some(below), Some(above)) = (below_index, above_index) {
+            let below_result = brackets.get(below).and_then(|b| b.state.result());
+            let above_result = brackets.get(above).and_then(|b| b.state.result());
+            if let (Some(below_result), Some(above_result)) = (below_result, above_result) {
+                for (objective_index, objective) in OBJECTIVES.iter().enumerate() {
+                    let low_budget_error = below_result.score(*objective);
+                    let high_budget_error = above_result.score(*objective);
+                    let span = low_budget_error - high_budget_error;
+                    if span <= 0.0 {
+                        if let Some(count) = inverted.get_mut(objective_index) {
+                            *count += 1;
+                        }
+                        continue;
+                    }
+                    if let Some(sample) = positions.get_mut(objective_index) {
+                        sample.push((low_budget_error - tcf.score(*objective)) / span);
+                    }
+                }
+            }
+        }
+    }
+
+    println!(
+        "  BRACKETED COMPARISON — TCF {:?} at {:.4} bpw has NO equal-budget GGUF counterpart, so",
+        tier.tcf, tcf_bpw
+    );
+    println!(
+        "  it is scored against the nearest encodable GGUF budget on each side. Those budgets"
+    );
+    println!(
+        "  DIFFER from TCF's on purpose: every ratio below is quality per byte, NOT quality at"
+    );
+    println!("  equal bytes, and both budgets are named on every line that carries one.");
+    for (bracket, skipped) in tier.brackets.iter().zip(&excluded) {
+        let bracket_bpw = gguf_bits_per_weight(bracket.format);
+        let size = ratio(tcf_bpw, bracket_bpw)
+            .map(|r| format!("TCF spends {:.1}% of its bytes", r * 100.0))
+            .unwrap_or_else(|| "size ratio n/a".to_string());
+        println!(
+            "    bracket {:<5} : {} at {:.4} bpw ({:+.4} bpw against TCF) — {} | {} tensors it \
+             could not encode",
+            bracket.side.label(),
+            bracket.format.name(),
+            bracket_bpw,
+            bracket_bpw - tcf_bpw,
+            size,
+            skipped
+        );
+    }
+
+    for (objective_index, objective) in OBJECTIVES.iter().enumerate() {
+        println!("    {} ({})", objective.label(), objective.owner());
+        for (bracket_index, bracket) in tier.brackets.iter().enumerate() {
+            let Some(objective_stats) = stats
+                .get_mut(bracket_index)
+                .and_then(|entry| entry.get_mut(objective_index))
+            else {
+                continue;
+            };
+            println!(
+                "      vs bracket {:<5} {} {:.4} bpw : TCF at or below on {:>4} of {:>4}, median \
+                 ratio {:>8}",
+                bracket.side.label(),
+                bracket.format.name(),
+                gguf_bits_per_weight(bracket.format),
+                objective_stats.tcf_at_or_below,
+                objective_stats.compared(),
+                show_median(&mut objective_stats.ratios)
+            );
+        }
+        print_bracket_finding(
+            tier,
+            tcf_bpw,
+            &mut stats,
+            objective_index,
+            below_index,
+            above_index,
+            positions.get_mut(objective_index),
+            inverted.get(objective_index).copied().unwrap_or(0),
+        );
+    }
+}
+
+/// State the bracketed finding for one objective in plain terms, computed from
+/// the medians printed above it.
+///
+/// Three outcomes, and each is printed as itself. "Better than the cheap
+/// bracket, worse than the dear one" is a real answer, so it is stated with
+/// the proportional position rather than rounded up into a win.
+#[allow(clippy::too_many_arguments)]
+fn print_bracket_finding(
+    tier: &Tier,
+    tcf_bpw: f64,
+    stats: &mut [Vec<BracketObjectiveStats>],
+    objective_index: usize,
+    below_index: Option<usize>,
+    above_index: Option<usize>,
+    positions: Option<&mut Vec<f64>>,
+    inverted: usize,
+) {
+    let (Some(below_index), Some(above_index)) = (below_index, above_index) else {
+        println!(
+            "      FINDING          : only one bracket declared, so there is no span to place TCF \
+             in."
+        );
+        return;
+    };
+    let below_format = tier.brackets[below_index].format;
+    let above_format = tier.brackets[above_index].format;
+    let below_bpw = gguf_bits_per_weight(below_format);
+    let above_bpw = gguf_bits_per_weight(above_format);
+
+    let below_median = stats
+        .get_mut(below_index)
+        .and_then(|entry| entry.get_mut(objective_index))
+        .and_then(|entry| median(&mut entry.ratios));
+    let above_median = stats
+        .get_mut(above_index)
+        .and_then(|entry| entry.get_mut(objective_index))
+        .and_then(|entry| median(&mut entry.ratios));
+    let (Some(below_median), Some(above_median)) = (below_median, above_median) else {
+        println!(
+            "      FINDING          : not enough tensors ran on both brackets to place TCF \
+             between them."
+        );
+        return;
+    };
+
+    let below_size = ratio(tcf_bpw, below_bpw).map(|r| r * 100.0);
+    let above_size = ratio(tcf_bpw, above_bpw).map(|r| r * 100.0);
+    let show_size = |value: Option<f64>| match value {
+        Some(percent) => format!("{percent:.1}%"),
+        None => "n/a".to_string(),
+    };
+
+    if above_median <= 1.0 {
+        println!(
+            "      FINDING          : TCF at {:.4} bpw MATCHES OR BEATS the upper bracket {} at \
+             {:.4} bpw",
+            tcf_bpw,
+            above_format.name(),
+            above_bpw
+        );
+        println!(
+            "                         (median ratio {:.4}) while spending {} of its bytes — the \
+             upper bracket's",
+            above_median,
+            show_size(above_size)
+        );
+        println!("                         quality at the smaller size.");
+    } else if below_median < 1.0 {
+        let position = positions.and_then(|sample| median(sample));
+        println!(
+            "      FINDING          : TCF at {:.4} bpw is BETTER than the lower bracket {} at \
+             {:.4} bpw",
+            tcf_bpw,
+            below_format.name(),
+            below_bpw
+        );
+        println!(
+            "                         (median ratio {:.4}) and WORSE than the upper bracket {} \
+             at {:.4} bpw",
+            below_median,
+            above_format.name(),
+            above_bpw
+        );
+        println!(
+            "                         (median ratio {above_median:.4}). It does NOT buy the upper \
+             bracket's quality."
+        );
+        match position {
+            Some(position) => println!(
+                "                         Its error sits {:.1}% of the way from the {:.4} bpw \
+                 bracket to the {:.4} bpw one,",
+                position * 100.0,
+                below_bpw,
+                above_bpw
+            ),
+            None => println!(
+                "                         The two brackets never separated on error, so there is \
+                 no position to report,"
+            ),
+        }
+        println!(
+            "                         for {} of the lower bracket's bytes and {} of the upper's.",
+            show_size(below_size),
+            show_size(above_size)
+        );
+    } else {
+        println!(
+            "      FINDING          : TCF at {:.4} bpw is WORSE than BOTH brackets — median ratio \
+             {:.4} against",
+            tcf_bpw, below_median
+        );
+        println!(
+            "                         {} at {:.4} bpw and {:.4} against {} at {:.4} bpw. The \
+             {:.4} bpw it spends",
+            below_format.name(),
+            below_bpw,
+            above_median,
+            above_format.name(),
+            above_bpw,
+            tcf_bpw - below_bpw
+        );
+        println!(
+            "                         over the lower bracket buys nothing under this objective."
+        );
+    }
+    if inverted > 0 {
+        println!(
+            "                         {inverted} tensors excluded from the position figure: the \
+             dearer bracket did not"
+        );
+        println!("                         reconstruct better than the cheaper one there.");
     }
 }
 
@@ -1368,15 +2154,24 @@ fn tally_for(tallies: &[Tally], wanted: Objective) -> Option<&Tally> {
 /// Median of a ratio sample, formatted. The median, not the mean: one tensor
 /// with a near-zero denominator would otherwise carry the whole tier.
 fn show_median(values: &mut [f64]) -> String {
+    match median(values) {
+        Some(median) => format!("{median:.4}"),
+        None => "n/a".to_string(),
+    }
+}
+
+/// The median itself, for the callers that compare against it rather than
+/// print it. `show_median` formats what this returns, so the two can never
+/// disagree about what the middle value is.
+fn median(values: &mut [f64]) -> Option<f64> {
     if values.is_empty() {
-        return "n/a".to_string();
+        return None;
     }
     values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let mid = values.len() / 2;
-    let median = if values.len().is_multiple_of(2) {
+    Some(if values.len().is_multiple_of(2) {
         (values[mid - 1] + values[mid]) / 2.0
     } else {
         values[mid]
-    };
-    format!("{median:.4}")
+    })
 }
