@@ -514,10 +514,7 @@ fn nearest_encodable(
         // Candidates are sorted ascending, so the nearest below is the last
         // encodable one under the target and the nearest above is the first
         // encodable one over it.
-        BracketSide::Below => candidates
-            .iter()
-            .filter(|c| c.encodable && c.bpw < target)
-            .next_back(),
+        BracketSide::Below => candidates.iter().rfind(|c| c.encodable && c.bpw < target),
         BracketSide::Above => candidates.iter().find(|c| c.encodable && c.bpw > target),
     }
 }
