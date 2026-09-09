@@ -16,7 +16,7 @@ use compressr::{
     TcfFormatWriter, TcfOptions, UnifiedDType,
 };
 use std::path::Path;
-use tcf_core::TcfFile;
+use tcf_core::{DotAccumulator, InputRepresentation, MathMode, OutputDtype, TcfFile};
 
 /// A tensor the fixture holds, and the plan it is meant to exercise.
 struct Fixture {
@@ -168,6 +168,13 @@ fn verify(path: &Path, expected_tensors: usize) {
     assert_eq!(file.tensors().len(), expected_tensors);
     for tensor in file.tensors() {
         file.verify_tensor(tensor).expect("digests and proofs hold");
+        // Section 3: the declared contract is the exact f32-activation one an
+        // uncalibrated conversion produces, and every tensor resolves to it.
+        let contract = file.contract(tensor).expect("the contract resolves");
+        assert_eq!(contract.input_representation, InputRepresentation::F32);
+        assert_eq!(contract.dot_accumulator, DotAccumulator::F32);
+        assert_eq!(contract.output_dtype, OutputDtype::F32);
+        assert_eq!(contract.math_mode, MathMode::ReassociationAllowed);
     }
 }
 

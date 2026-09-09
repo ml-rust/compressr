@@ -6,17 +6,77 @@
 //! `transfer_bytes`, both digests and the proof fields, and rejects a
 //! caller-supplied value by name rather than overwriting it.
 //!
-//! `calibration_id`, `activation_contract_id` and `workload_profile_id` stay
-//! zero as well. compressr runs no calibration and measures no workload, and a
-//! fabricated id names a record no consumer can resolve.
+//! `calibration_id` and `workload_profile_id` stay zero. compressr runs no
+//! calibration and measures no workload, and a fabricated id names a record no
+//! consumer can resolve.
+//!
+//! `activation_contract_id` is different: Section 3 requires every tensor to
+//! name a `ContractRecord` in the same file, and Section 9 defines no "no
+//! contract" value. So this module declares the contract an uncalibrated
+//! conversion actually produces — exact F32 activations, F32 accumulation,
+//! F32 output — and points every record at it. That is a truthful statement,
+//! not a placeholder: these weights were prepared for an f32-activation
+//! kernel, and a consumer that dispatches them through an 8-bit-activation
+//! kernel is the mismatch the contract rule exists to refuse, because
+//! compressr never calibrated them for it.
 
 use tcf_core::{
-    consts::ROOT_PARENT_ID, Encoding, ExecutionRole, LayoutId, ModuleRecord, ModuleRole,
-    PolicyFlags, ProofFormat, RawEncoding, ResidencyClass, Role, StateDtype, StateFlags, StringRef,
-    TensorFlags, TensorRecord,
+    consts::ROOT_PARENT_ID, ContractFlags, ContractRecord, DotAccumulator, Encoding, ExecutionRole,
+    InputRepresentation, LayoutId, MathMode, ModuleRecord, ModuleRole, OutputDtype, PolicyFlags,
+    ProofFormat, QuantAxis, RawEncoding, ResidencyClass, Role, RoundingMode, ScaleComputeDtype,
+    StateDtype, StateFlags, StringRef, TensorFlags, TensorRecord,
 };
 
 use super::encoding::TcfOptions;
+
+/// The id every `ModuleRecord` and `TensorRecord` compressr writes points at.
+///
+/// Section 9 gives `contract_id` no reserved "unset" value, so `0` would be an
+/// ordinary id that happens to read like an omission. `1` says the reference
+/// is deliberate.
+pub const EXACT_F32_CONTRACT_ID: u32 = 1;
+
+/// The single activation contract every compressr-written TCF file declares.
+///
+/// compressr quantizes weights with no calibration and no activation-side
+/// measurement, and tunes nothing for a quantized-activation kernel. The
+/// contract that describes that output exactly is the full-precision one:
+/// F32 activations in, F32 dot accumulation, F32 out. `quant_group`, `qmin`
+/// and `qmax` describe an activation quantization grid that `F32` does not
+/// have, so they stay zero; Section 9.2 defines them for `A8S32_DYNAMIC`
+/// alone. `quant_axis`, `rounding_mode` and `scale_compute_dtype` carry the
+/// one value v1 defines for each. `kernel_semantics_id` and `calibration_id`
+/// stay zero: compressr names no kernel and runs no calibration.
+///
+/// `math_mode` is `REASSOCIATION_ALLOWED`. compressr places no constraint on
+/// the order a consumer's kernel accumulates in — it never measured an error
+/// budget that a fixed reduction order would protect. `REASSOCIATION_FORBIDDEN`
+/// would read as safer while asserting a requirement compressr never
+/// established, and would refuse backends for a reason this producer cannot
+/// justify.
+///
+/// `contract_digest` stays zero for `tcf-core` to compute, as every other
+/// writer-owned field does. Every value here is a constant, so two runs
+/// produce byte-identical contract records.
+pub fn contract_record() -> ContractRecord {
+    ContractRecord {
+        contract_id: EXACT_F32_CONTRACT_ID,
+        input_representation: InputRepresentation::F32,
+        quant_group: 0,
+        quant_axis: QuantAxis::Last,
+        rounding_mode: RoundingMode::RnEven,
+        qmin: 0,
+        qmax: 0,
+        scale_compute_dtype: ScaleComputeDtype::F32,
+        dot_accumulator: DotAccumulator::F32,
+        output_dtype: OutputDtype::F32,
+        math_mode: MathMode::ReassociationAllowed,
+        kernel_semantics_id: 0,
+        calibration_id: 0,
+        flags: ContractFlags::NONE,
+        contract_digest: [0u8; 16],
+    }
+}
 
 /// The single root module every tensor belongs to.
 ///
@@ -36,7 +96,7 @@ pub fn module_record(name: StringRef, options: TcfOptions) -> ModuleRecord {
             None,
             None,
         ],
-        activation_contract_id: 0,
+        activation_contract_id: EXACT_F32_CONTRACT_ID,
         policy_flags: PolicyFlags::NONE,
         min_quant_k: u32::from(options.encoding.geometry().tile),
         default_residency: ResidencyClass::Warm,
@@ -72,7 +132,7 @@ pub fn tensor_record(
         rank,
         calibration_id: 0,
         dims,
-        activation_contract_id: 0,
+        activation_contract_id: EXACT_F32_CONTRACT_ID,
         layout_id: LayoutId::RowMajorDense,
         data_offset: 0,
         logical_payload_bytes: 0,
@@ -120,8 +180,41 @@ mod tests {
         assert_eq!(module.min_quant_k, 64);
     }
 
-    /// Every id compressr cannot honestly fill stays zero, and every field
-    /// tcf-core owns stays zero for it to compute.
+    /// The declared contract is the exact f32-activation one, with no
+    /// activation quantization grid and no kernel or calibration named.
+    #[test]
+    fn the_declared_contract_is_exact_f32() {
+        let contract = contract_record();
+        assert_eq!(contract.contract_id, EXACT_F32_CONTRACT_ID);
+        assert_eq!(contract.input_representation, InputRepresentation::F32);
+        assert_eq!(contract.dot_accumulator, DotAccumulator::F32);
+        assert_eq!(contract.output_dtype, OutputDtype::F32);
+        assert_eq!(contract.math_mode, MathMode::ReassociationAllowed);
+        assert_eq!(contract.quant_group, 0);
+        assert_eq!(contract.qmin, 0);
+        assert_eq!(contract.qmax, 0);
+        assert_eq!(contract.kernel_semantics_id, 0);
+        assert_eq!(contract.calibration_id, 0);
+        assert_eq!(contract.contract_digest, [0u8; 16]);
+    }
+
+    /// Two calls produce the same bytes: nothing in the record is read from
+    /// the clock, a hash map, or the source checkpoint.
+    #[test]
+    fn the_contract_is_the_same_on_every_call() {
+        assert_eq!(contract_record(), contract_record());
+    }
+
+    /// The module and every tensor name the contract this file carries.
+    #[test]
+    fn every_record_points_at_the_declared_contract() {
+        let module = module_record(StringRef::new(0, 5), options());
+        assert_eq!(module.activation_contract_id, contract_record().contract_id);
+    }
+
+    /// Every id compressr cannot honestly fill stays zero, every field
+    /// tcf-core owns stays zero for it to compute, and the contract id
+    /// resolves to the record this module writes.
     #[test]
     fn ids_and_writer_owned_fields_stay_unset() {
         let record = tensor_record(
@@ -133,7 +226,7 @@ mod tests {
             2,
         );
         assert_eq!(record.calibration_id, 0);
-        assert_eq!(record.activation_contract_id, 0);
+        assert_eq!(record.activation_contract_id, EXACT_F32_CONTRACT_ID);
         assert_eq!(record.workload_profile_id, 0);
         assert_eq!(record.data_offset, 0);
         assert_eq!(record.logical_payload_bytes, 0);

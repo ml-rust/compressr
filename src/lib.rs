@@ -679,8 +679,10 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
             ),
         }
         log::info!(
-            "TCF calibration_id, activation_contract_id and workload_profile_id are left \
-             unset: compressr runs no calibration and measures no workload."
+            "TCF activation contract: exact F32 activations, F32 accumulate, F32 out; an \
+             uncalibrated conversion tunes nothing for a quantized-activation kernel. \
+             calibration_id and workload_profile_id are left unset: compressr runs no \
+             calibration and measures no workload."
         );
         writer = Box::new(tcf_writer);
     }

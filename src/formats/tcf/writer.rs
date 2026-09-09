@@ -53,7 +53,7 @@ use tcf_core::{Encoding, LogicalTile, NativeEncoding, Payload, TcfError, TcfWrit
 use super::encoding::{values_f32, TcfOptions, TensorShape, TCF_ENCODING_NAMES};
 use super::parallel::quantize_named;
 use super::plan::{allocate, plan_one, reason_for, settle, PlannedTensor, Registration};
-use super::record::{module_record, tensor_record};
+use super::record::{contract_record, module_record, tensor_record};
 use super::spill::PayloadSpill;
 use crate::formats::FormatWriter;
 use crate::loader::{LoadedModel, ModelLoader, UnifiedDType};
@@ -356,7 +356,7 @@ impl Default for TcfFormatWriter {
 
 impl FormatWriter for TcfFormatWriter {
     /// Record the destination and open a `tcf-core` writer holding one root
-    /// module.
+    /// module and the one activation contract every record names.
     ///
     /// Nothing is created on disk here: the file is written once in
     /// [`FormatWriter::finalize`].
@@ -371,6 +371,12 @@ impl FormatWriter for TcfFormatWriter {
 
         let mut writer = TcfWriter::new();
         let name = writer.intern(&self.module_name).map_err(|e| anyhow!(e))?;
+        // Section 3: every `activation_contract_id` must resolve to a
+        // `ContractRecord` in this file, so the contract is added before any
+        // record that names it.
+        writer
+            .add_contract(contract_record())
+            .map_err(|e| anyhow!(e))?;
         writer
             .add_module(module_record(name, options))
             .map_err(|e| anyhow!(e))?;

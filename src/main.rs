@@ -260,8 +260,9 @@ fn main() -> Result<()> {
             println!("\n{}", stats);
             if output_format == OutputFormat::Tcf {
                 println!(
-                    "TCF calibration_id, activation_contract_id and workload_profile_id are \
-                     unset: compressr runs no calibration and measures no workload."
+                    "TCF activation contract: exact F32 activations, F32 accumulate, F32 out. \
+                     calibration_id and workload_profile_id are unset: compressr runs no \
+                     calibration and measures no workload."
                 );
             }
             if let Some(profile) = tcf_profile {

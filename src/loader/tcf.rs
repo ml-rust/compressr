@@ -52,7 +52,8 @@ pub struct TcfTensorFacts {
     pub residency_class: String,
     /// Name of the owning module, or its numeric id when the file names none.
     pub module: String,
-    /// `ContractRecord` this tensor is read against, 0 when unset.
+    /// `ContractRecord` this tensor is read against. Section 9 defines no
+    /// "unset" value, so every id here names a record the file carries.
     pub activation_contract_id: u32,
     /// `CalibrationRecord` behind its sensitivity figures, 0 when unset.
     pub calibration_id: u32,
