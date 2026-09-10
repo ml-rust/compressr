@@ -42,6 +42,14 @@
 //! compressr convert model/ --format tcf --tcf-profile balanced \
 //!     --imatrix model.imatrix --tcf-importance combined
 //!
+//! # Widen the TCF quantizer's candidate-scale search. A wider search tries
+//! # every candidate the standard search tries, plus more, so it can only
+//! # match or improve the fit under the encoder's error objective, at the
+//! # cost of conversion time only. That is not a promise of a better model:
+//! # measure before pairing it with --imatrix
+//! compressr convert model/ --format tcf --tcf-profile balanced \
+//!     --tcf-search wide
+//!
 //! # Rank that profile's bump set by a measured task-metric delta instead of
 //! # by the weight-error screen
 //! compressr convert model/ --format tcf --tcf-profile balanced \
@@ -69,8 +77,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use compressr::{
     parse_sensitivity, parse_tcf_encoding, parse_tcf_importance, parse_tcf_objective,
-    parse_tcf_profile, ConversionConfig, ImportanceMatrix, OutputFormat, QuantizationConfig,
-    QuantizationMethod, SensitivityMeasurement, TcfObjective, TcfOptions, TcfProfile,
+    parse_tcf_profile, parse_tcf_search, ConversionConfig, ImportanceMatrix, OutputFormat,
+    QuantizationConfig, QuantizationMethod, SearchEffort, SensitivityMeasurement, TcfObjective,
+    TcfOptions, TcfProfile,
 };
 use quant_arg::parse_quantization;
 
@@ -178,6 +187,23 @@ enum Commands {
         /// --imatrix is untouched by this flag and is refused for naming it.
         #[arg(long, value_name = "FORM")]
         tcf_importance: Option<String>,
+
+        /// How wide the TCF quantizer's candidate-scale search runs (standard, wide, exhaustive)
+        ///
+        /// --format tcf only. standard is the DEFAULT and today's search:
+        /// unset, a conversion writes exactly the bytes it always wrote.
+        /// wide and exhaustive try every candidate standard tries, plus
+        /// more, so each is a STRICT SUPERSET of a narrower search — it can
+        /// only match or improve the fit UNDER THE ENCODER'S ERROR
+        /// OBJECTIVE. That objective is a proxy for model quality, not model
+        /// quality: a wider search has been measured to improve the task
+        /// metric with no importance matrix and to DEGRADE it with one, so
+        /// pair a wider search with --imatrix only after measuring. The cost
+        /// is conversion time only: no bit layout, tile order, plane order,
+        /// offset or digest moves, so the file stays a normal conforming TCF
+        /// v1 file under any effort.
+        #[arg(long, value_name = "EFFORT")]
+        tcf_search: Option<String>,
 
         /// Measured task-metric sensitivity, as JSON lines
         ///
@@ -317,6 +343,7 @@ fn main() -> Result<()> {
             tcf_profile,
             tcf_objective,
             tcf_importance,
+            tcf_search,
             sensitivity,
             imatrix,
             arch,
@@ -346,6 +373,7 @@ fn main() -> Result<()> {
                 .as_deref()
                 .map(parse_tcf_importance)
                 .transpose()?;
+            let tcf_search = tcf_search.as_deref().map(parse_tcf_search).transpose()?;
             let sensitivity = sensitivity.as_deref().map(read_sensitivity).transpose()?;
             // Read before the output path is defaulted, so a file that is not
             // an importance matrix fails before any directory is created.
@@ -387,6 +415,9 @@ fn main() -> Result<()> {
             }
             if let Some(tcf_importance) = tcf_importance {
                 config = config.with_tcf_importance(tcf_importance);
+            }
+            if let Some(tcf_search) = tcf_search {
+                config = config.with_tcf_search(tcf_search);
             }
             if let Some(imatrix) = imatrix {
                 config = config.with_importance(imatrix);
@@ -467,6 +498,13 @@ fn main() -> Result<()> {
                 match tcf_objective_policy(tcf_options, tcf_profile, tcf_objective) {
                     Ok(policy) => println!("{policy}"),
                     Err(error) => println!("TCF objective: {error}"),
+                }
+                // Stated only when the search widened: a default run's log is
+                // unchanged from before this flag existed.
+                if let Some(effort) = tcf_search {
+                    if effort != SearchEffort::Standard {
+                        println!("{}", compressr::tcf_search_report(effort));
+                    }
                 }
                 println!(
                     "TCF activation contract: exact F32 activations, F32 accumulate, F32 out. \
@@ -1025,6 +1063,47 @@ mod tests {
                     None
                 );
             }
+            _ => panic!("expected the convert subcommand"),
+        }
+    }
+
+    /// The search-effort flag parses, and a flagless run names no effort at
+    /// all: the standard search is then the default the conversion applies.
+    #[test]
+    fn test_convert_parses_the_tcf_search_flag() {
+        let cli = Cli::try_parse_from([
+            "compressr",
+            "convert",
+            "model/",
+            "--format",
+            "tcf",
+            "--tcf-profile",
+            "balanced",
+            "--tcf-search",
+            "exhaustive",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Convert { tcf_search, .. } => {
+                let effort = parse_tcf_search(tcf_search.as_deref().expect("the flag")).unwrap();
+                assert_eq!(effort, SearchEffort::Exhaustive);
+            }
+            _ => panic!("expected the convert subcommand"),
+        }
+
+        let flagless = Cli::try_parse_from([
+            "compressr",
+            "convert",
+            "model/",
+            "--format",
+            "tcf",
+            "--tcf-profile",
+            "balanced",
+        ])
+        .unwrap();
+        match flagless.command {
+            Commands::Convert { tcf_search, .. } => assert!(tcf_search.is_none()),
             _ => panic!("expected the convert subcommand"),
         }
     }

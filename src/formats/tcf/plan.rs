@@ -44,7 +44,7 @@
 
 use anyhow::{anyhow, Context, Result};
 
-use tcf_core::{encoding::dequantize, Encoding, LogicalTile, TcfError};
+use tcf_core::{encoding::dequantize, Encoding, LogicalTile, QuantizeParams, TcfError};
 
 use tcf_core::NativeEncoding;
 
@@ -221,7 +221,10 @@ pub(super) fn settle(
         shape.extent(),
         shape.rank(),
         layout,
-        weights.source(),
+        QuantizeParams {
+            weights: weights.source(),
+            effort: options.search_effort,
+        },
     ) {
         Ok(tiles) => {
             // A row that holds a whole number of tiles covers the element

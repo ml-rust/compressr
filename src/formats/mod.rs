@@ -34,10 +34,11 @@ pub use safetensors::{
 
 pub use tcf::{
     default_objective_for, normalized_encoding_name, objective_policy, parse_tcf_encoding,
-    parse_tcf_importance, parse_tcf_objective, parse_tcf_profile, tcf_encoding_name,
-    ImportanceForm, ObjectiveSource, PlannedTensor, ResolvedWeights, TcfFormatWriter, TcfObjective,
-    TcfOptions, TcfProfile, TCF_ENCODING_NAMES, TCF_IMPORTANCE_NAMES, TCF_OBJECTIVE_NAMES,
-    TCF_PROFILE_NAMES,
+    parse_tcf_importance, parse_tcf_objective, parse_tcf_profile, parse_tcf_search,
+    tcf_encoding_name, tcf_search_name, tcf_search_report, ImportanceForm, ObjectiveSource,
+    PlannedTensor, ResolvedWeights, TcfFormatWriter, TcfObjective, TcfOptions, TcfProfile,
+    TCF_ENCODING_NAMES, TCF_IMPORTANCE_NAMES, TCF_OBJECTIVE_NAMES, TCF_PROFILE_NAMES,
+    TCF_SEARCH_NAMES,
 };
 
 use anyhow::{bail, Context, Result};

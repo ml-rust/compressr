@@ -13,7 +13,7 @@
 //! passes the encoding its record already fixed. Resolving once per file
 //! would apply one half of a mixed file's answer to the other half.
 
-use tcf_core::NativeEncoding;
+use tcf_core::{NativeEncoding, SearchEffort};
 
 use super::encoding_table::default_objective_for;
 use super::importance_form::ImportanceForm;
@@ -56,6 +56,17 @@ pub struct TcfOptions {
     /// [`ImportanceForm::Replace`], the importance alone, which a measurement
     /// minimizes; `--tcf-importance replace` selects the importance alone.
     pub importance_form: ImportanceForm,
+    /// How wide the quantizer's candidate-scale search runs
+    ///
+    /// The default is [`SearchEffort::Standard`], today's search, so a run
+    /// that names no `--tcf-search` writes exactly the bytes it always
+    /// wrote. `--tcf-search wide` and `--tcf-search exhaustive` widen it: a
+    /// strict superset of the narrower search, so the fit can only match or
+    /// improve ON THE ERROR OBJECTIVE, and the cost is conversion time only.
+    /// The objective is a proxy for model quality, not model quality itself
+    /// — see [`super::search_effort`], where the measurement that separates
+    /// the two is recorded.
+    pub search_effort: SearchEffort,
 }
 
 impl TcfOptions {
@@ -67,6 +78,7 @@ impl TcfOptions {
             profile: None,
             objective_override: None,
             importance_form: ImportanceForm::Replace,
+            search_effort: SearchEffort::Standard,
         }
     }
 
@@ -82,6 +94,7 @@ impl TcfOptions {
             profile: Some(profile),
             objective_override: None,
             importance_form: ImportanceForm::Replace,
+            search_effort: SearchEffort::Standard,
         }
     }
 
@@ -118,6 +131,26 @@ impl TcfOptions {
     pub fn with_importance_form_override(mut self, form: Option<ImportanceForm>) -> Self {
         if let Some(form) = form {
             self.importance_form = form;
+        }
+        self
+    }
+
+    /// Set how wide the quantizer's candidate-scale search runs.
+    ///
+    /// A wider effort is a strict superset of a narrower one, so it never
+    /// produces a worse fit under the error objective — only more conversion
+    /// time. It CAN produce a worse model: see [`super::search_effort`].
+    pub fn with_search_effort(mut self, effort: SearchEffort) -> Self {
+        self.search_effort = effort;
+        self
+    }
+
+    /// Set the search effort only when a run named one.
+    ///
+    /// `None` leaves [`SearchEffort::Standard`], today's search.
+    pub fn with_search_effort_override(mut self, effort: Option<SearchEffort>) -> Self {
+        if let Some(effort) = effort {
+            self.search_effort = effort;
         }
         self
     }
@@ -193,6 +226,31 @@ mod tests {
             flat.with_importance_form_override(Some(ImportanceForm::Replace))
                 .importance_form,
             ImportanceForm::Replace
+        );
+    }
+
+    /// A flagless run defaults to the standard search, and only an explicit
+    /// `--tcf-search` moves it.
+    #[test]
+    fn options_start_on_the_standard_search_effort() {
+        let flat = TcfOptions::uniform(NativeEncoding::Q4S32T64, NativeEncoding::Q4S32T64);
+        assert_eq!(flat.search_effort, SearchEffort::Standard);
+        assert_eq!(
+            TcfOptions::from_profile(super::super::profile::TCF_COMPACT).search_effort,
+            SearchEffort::Standard
+        );
+        assert_eq!(
+            flat.with_search_effort_override(None).search_effort,
+            SearchEffort::Standard
+        );
+        assert_eq!(
+            flat.with_search_effort(SearchEffort::Wide).search_effort,
+            SearchEffort::Wide
+        );
+        assert_eq!(
+            flat.with_search_effort_override(Some(SearchEffort::Exhaustive))
+                .search_effort,
+            SearchEffort::Exhaustive
         );
     }
 

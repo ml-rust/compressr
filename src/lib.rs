@@ -123,11 +123,12 @@ pub mod python;
 pub use cast::{cast_bytes, parse_target_dtype, torch_dtype_name, ACCEPTED_DTYPE_NAMES};
 pub use formats::{
     default_objective_for, objective_policy, parse_shard_size, parse_tcf_encoding,
-    parse_tcf_importance, parse_tcf_objective, parse_tcf_profile, FormatWriter, GgufBatchWriter,
-    GgufFormatWriter, ImportanceForm, ObjectiveSource, PlannedTensor, SafeTensorsFormatWriter,
-    StreamingGgufWriter, TcfFormatWriter, TcfObjective, TcfOptions, TcfProfile,
-    DEFAULT_MAX_SHARD_SIZE, TCF_ENCODING_NAMES, TCF_IMPORTANCE_NAMES, TCF_OBJECTIVE_NAMES,
-    TCF_PROFILE_NAMES,
+    parse_tcf_importance, parse_tcf_objective, parse_tcf_profile, parse_tcf_search,
+    tcf_search_name, tcf_search_report, FormatWriter, GgufBatchWriter, GgufFormatWriter,
+    ImportanceForm, ObjectiveSource, PlannedTensor, SafeTensorsFormatWriter, StreamingGgufWriter,
+    TcfFormatWriter, TcfObjective, TcfOptions, TcfProfile, DEFAULT_MAX_SHARD_SIZE,
+    TCF_ENCODING_NAMES, TCF_IMPORTANCE_NAMES, TCF_OBJECTIVE_NAMES, TCF_PROFILE_NAMES,
+    TCF_SEARCH_NAMES,
 };
 pub use importance::{
     check_importance_matrix, importance_columns, importance_layout_line, importance_source_line,
@@ -152,6 +153,7 @@ pub use policy::{
 pub use quantization::{
     QuantType, QuantizationConfig, QuantizationMethod, QuantizedTensor, Quantizer,
 };
+pub use tcf_core::SearchEffort;
 
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -273,6 +275,18 @@ pub struct ConversionConfig {
     /// with an importance vector, and is rejected by every format but
     /// [`OutputFormat::Tcf`].
     pub tcf_importance: Option<ImportanceForm>,
+    /// How wide the TCF quantizer's candidate-scale search runs
+    ///
+    /// `None` is [`SearchEffort::Standard`], today's search: a run that names
+    /// no `--tcf-search` writes exactly the bytes it always wrote. `Some`
+    /// widens it for every tensor, whatever encoding it is written in. A
+    /// wider effort is a strict superset of a narrower one, so it can only
+    /// match or improve the reconstruction UNDER THE ERROR OBJECTIVE, and
+    /// costs conversion time only. That is not the same as a better model —
+    /// the measurement separating the two is recorded in
+    /// [`formats::tcf::search_effort`]. Rejected by every format but
+    /// [`OutputFormat::Tcf`].
+    pub tcf_search: Option<SearchEffort>,
     /// Measured task-metric sensitivity for the TCF profile's bump set
     ///
     /// Valid only alongside [`ConversionConfig::tcf_profile`], and only for a
@@ -326,6 +340,7 @@ impl ConversionConfig {
             tcf_profile: None,
             tcf_objective: None,
             tcf_importance: None,
+            tcf_search: None,
             tcf_sensitivity: None,
             gguf_sensitivity: None,
             gguf_mix: None,
@@ -385,6 +400,18 @@ impl ConversionConfig {
         self
     }
 
+    /// Set how wide the TCF quantizer's candidate-scale search runs
+    ///
+    /// Unset leaves [`SearchEffort::Standard`], today's search. A wider
+    /// effort is a strict superset of it, so it can only match or improve
+    /// the reconstruction under the error objective, and costs conversion
+    /// time only. A better objective score is not always a better model —
+    /// see [`formats::tcf::search_effort`].
+    pub fn with_tcf_search(mut self, effort: SearchEffort) -> Self {
+        self.tcf_search = Some(effort);
+        self
+    }
+
     /// Set the measured task-metric sensitivity the bump set is ranked by
     pub fn with_tcf_sensitivity(mut self, measurement: SensitivityMeasurement) -> Self {
         self.tcf_sensitivity = Some(measurement);
@@ -407,13 +434,19 @@ impl ConversionConfig {
         // decides nothing without `--imatrix`: a tensor with no entry never
         // reaches the importance path.
         let form = self.tcf_importance;
+        // The search effort rides on the same flag too, and both passes take
+        // it from the same `TcfOptions`, so pass 1's screen and pass 2's
+        // requantization search the same width.
+        let search_effort = self.tcf_search;
         match (self.tcf, self.tcf_profile) {
             (Some(options), _) => Ok(options
                 .with_objective_override(objective)
-                .with_importance_form_override(form)),
+                .with_importance_form_override(form)
+                .with_search_effort_override(search_effort)),
             (None, Some(profile)) => Ok(TcfOptions::from_profile(profile)
                 .with_objective_override(objective)
-                .with_importance_form_override(form)),
+                .with_importance_form_override(form)
+                .with_search_effort_override(search_effort)),
             (None, None) => bail!("Internal error: --format tcf reached convert with no encoding"),
         }
     }
@@ -638,6 +671,14 @@ impl ConversionConfig {
                  format's quantizer is not TCF's. Accepted forms: {}",
                 self.output_format,
                 TCF_IMPORTANCE_NAMES.join(", ")
+            );
+        } else if self.tcf_search.is_some() {
+            bail!(
+                "--tcf-search applies to --format tcf only, but --format is {:?}. It names how \
+                 wide the TCF quantizer's candidate-scale search runs, and every other format's \
+                 quantizer is not TCF's. Accepted efforts: {}",
+                self.output_format,
+                TCF_SEARCH_NAMES.join(", ")
             );
         }
         // Both forms describe what to do with an importance vector, so a run
@@ -1661,6 +1702,49 @@ mod tests {
         assert!(err.contains("--tcf-objective"), "{err}");
         assert!(err.contains("--format tcf only"), "{err}");
         assert!(err.contains("rms-plus-abs"), "{err}");
+    }
+
+    /// The search effort names how wide TCF's own quantizer searches, so it
+    /// is refused for every other format rather than silently ignored.
+    #[test]
+    fn test_tcf_search_is_refused_for_another_format() {
+        let config = ConversionConfig::new("input/".into(), "out.gguf".into(), OutputFormat::Gguf)
+            .with_tcf_search(SearchEffort::Wide);
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("--tcf-search"), "{err}");
+        assert!(err.contains("--format tcf only"), "{err}");
+        assert!(err.contains("exhaustive"), "{err}");
+    }
+
+    /// A run that names no search effort keeps the standard search, and both
+    /// a flat run and a profile run take an explicit one the same way.
+    #[test]
+    fn test_the_search_effort_defaults_to_standard_and_reaches_both_tcf_flags() {
+        let flagless = ConversionConfig::new("input/".into(), "out.tcf".into(), OutputFormat::Tcf)
+            .with_tcf(tcf_options());
+        assert!(flagless.validate().is_ok());
+        assert_eq!(
+            flagless.tcf_options().unwrap().search_effort,
+            SearchEffort::Standard
+        );
+
+        let flat = ConversionConfig::new("input/".into(), "out.tcf".into(), OutputFormat::Tcf)
+            .with_tcf(tcf_options())
+            .with_tcf_search(SearchEffort::Wide);
+        assert!(flat.validate().is_ok());
+        assert_eq!(
+            flat.tcf_options().unwrap().search_effort,
+            SearchEffort::Wide
+        );
+
+        let profiled = ConversionConfig::new("input/".into(), "out.tcf".into(), OutputFormat::Tcf)
+            .with_tcf_profile(parse_tcf_profile("compact").unwrap())
+            .with_tcf_search(SearchEffort::Exhaustive);
+        assert!(profiled.validate().is_ok());
+        assert_eq!(
+            profiled.tcf_options().unwrap().search_effort,
+            SearchEffort::Exhaustive
+        );
     }
 
     /// A run that names no objective leaves every tensor on its own

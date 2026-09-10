@@ -53,9 +53,9 @@ use anyhow::{anyhow, Context, Result};
 use rayon::prelude::*;
 
 use tcf_core::encoding::{
-    accepts, accepts_tile_chunk, quantize_tile_chunk_weighted, quantize_weighted, tile_count,
+    accepts, accepts_tile_chunk, quantize_tile_chunk_with, quantize_with, tile_count,
 };
-use tcf_core::{LogicalTile, QuantLayout, TcfError, WeightSource};
+use tcf_core::{LogicalTile, QuantLayout, QuantizeParams, TcfError};
 
 use super::chunk::{chunk_bounds, chunk_slice, chunk_start, chunk_tiles};
 
@@ -71,16 +71,17 @@ const MIN_PARALLEL_TILES: u64 = 512;
 
 /// Quantize a whole tensor, splitting its tiles across rayon's pool.
 ///
-/// Byte-for-byte what `tcf_core::encoding::quantize_weighted` returns for the
+/// Byte-for-byte what `tcf_core::encoding::quantize_with` returns for the
 /// same arguments — this is a scheduling change and nothing else. `values`
-/// holds the tensor row-major, `dims[0..rank]` is its shape, and `weights`
-/// names the error objective every group is scored by.
+/// holds the tensor row-major, `dims[0..rank]` is its shape, and `params`
+/// names the error objective every group is scored by and how wide its
+/// candidate-scale search runs.
 ///
-/// `WeightSource::Uniform` is the objective every earlier run used, and
-/// `tcf-core` reproduces the unweighted bytes exactly under it.
+/// `QuantizeParams::default()` is what every earlier run used, and
+/// `tcf-core` reproduces those bytes exactly under it.
 ///
 /// # Errors
-/// Whatever `tcf_core::encoding::quantize_weighted` raises, and for the same
+/// Whatever `tcf_core::encoding::quantize_with` raises, and for the same
 /// values. When several chunks fail, the failure of the LOWEST tile index is
 /// returned, which is the one a serial run would have hit first.
 pub(super) fn quantize_tensor(
@@ -88,15 +89,15 @@ pub(super) fn quantize_tensor(
     dims: &[u64],
     rank: u32,
     layout: QuantLayout,
-    weights: WeightSource<'_>,
+    params: QuantizeParams<'_>,
 ) -> Result<Vec<LogicalTile>, TcfError> {
     let tile = usize::from(layout.geometry.tile);
     let total = tile_count(dims, rank, layout.geometry.tile)?;
     if total < MIN_PARALLEL_TILES {
-        // The serial path is `quantize_weighted` itself, not a one-chunk
-        // call: a small tensor then touches no scheduling code at all, and
-        // the two paths cannot drift.
-        return quantize_weighted(values, dims, rank, layout, weights);
+        // The serial path is `quantize_with` itself, not a one-chunk call: a
+        // small tensor then touches no scheduling code at all, and the two
+        // paths cannot drift.
+        return quantize_with(values, dims, rank, layout, params);
     }
 
     let chunk = chunk_tiles(total, rayon::current_num_threads());
@@ -114,10 +115,18 @@ pub(super) fn quantize_tensor(
             let final_chunk = first.saturating_add(count) == total;
             // The weights are narrowed the same way the values are, so a
             // source that carries data stays parallel to the chunk it scores.
-            // Every value-derived source narrows to itself.
+            // Every value-derived source narrows to itself. The effort
+            // travels unchanged: it names a candidate set per group, not a
+            // span over the tensor, so no chunk boundary narrows it.
             let start = chunk_start(tile, first)?;
-            let weights = weights.slice(start, start.saturating_add(slice.len()));
-            quantize_tile_chunk_weighted(slice, count, first, final_chunk, layout, weights)
+            let weights = params
+                .weights
+                .slice(start, start.saturating_add(slice.len()));
+            let chunk_params = QuantizeParams {
+                weights,
+                effort: params.effort,
+            };
+            quantize_tile_chunk_with(slice, count, first, final_chunk, layout, chunk_params)
         })
         .collect();
 
@@ -160,7 +169,7 @@ pub(super) fn accepts_tensor(
     let total = tile_count(dims, rank, layout.geometry.tile)?;
     if total < MIN_PARALLEL_TILES {
         // The serial path is `accepts` itself, for the same reason the
-        // quantize path calls `quantize_weighted`: the two cannot drift.
+        // quantize path calls `quantize_with`: the two cannot drift.
         return accepts(values, dims, rank, layout);
     }
 
@@ -197,10 +206,10 @@ pub(super) fn quantize_named(
     dims: &[u64],
     rank: u32,
     layout: QuantLayout,
-    weights: WeightSource<'_>,
+    params: QuantizeParams<'_>,
     name: &str,
 ) -> Result<Vec<LogicalTile>> {
-    quantize_tensor(values, dims, rank, layout, weights)
+    quantize_tensor(values, dims, rank, layout, params)
         .map_err(|e| anyhow!(e))
         .with_context(|| format!("Failed to quantize tensor '{name}'"))
 }
@@ -209,7 +218,7 @@ pub(super) fn quantize_named(
 mod tests {
     use super::*;
     use tcf_core::encoding::{pack, quantize, quantize_weighted};
-    use tcf_core::NativeEncoding;
+    use tcf_core::{NativeEncoding, WeightSource};
 
     /// The objectives a `--tcf-objective` run can select.
     const OBJECTIVES: [WeightSource<'static>; 3] = [
@@ -254,7 +263,7 @@ mod tests {
         for encoding in ENCODINGS {
             let layout = encoding.layout();
             let serial = quantize(&source, &shape, 2, layout).expect("serial quantize");
-            let parallel = quantize_tensor(&source, &shape, 2, layout, WeightSource::Uniform)
+            let parallel = quantize_tensor(&source, &shape, 2, layout, QuantizeParams::default())
                 .expect("parallel quantize");
             assert_eq!(parallel.len(), serial.len(), "{encoding:?}");
             let left = pack(&parallel, layout).expect("parallel packs");
@@ -271,7 +280,7 @@ mod tests {
         for encoding in ENCODINGS {
             let layout = encoding.layout();
             let serial = quantize(&source, &shape, 2, layout).expect("serial quantize");
-            let parallel = quantize_tensor(&source, &shape, 2, layout, WeightSource::Uniform)
+            let parallel = quantize_tensor(&source, &shape, 2, layout, QuantizeParams::default())
                 .expect("parallel quantize");
             let left = pack(&parallel, layout).expect("parallel packs");
             let right = pack(&serial, layout).expect("serial packs");
@@ -305,7 +314,8 @@ mod tests {
                 let layout = encoding.layout();
                 for (name, source) in &cases {
                     let quantized =
-                        quantize_tensor(source, &shape, 2, layout, WeightSource::Uniform).is_ok();
+                        quantize_tensor(source, &shape, 2, layout, QuantizeParams::default())
+                            .is_ok();
                     let accepted = accepts_tensor(source, &shape, 2, layout).expect("decides");
                     assert_eq!(accepted, quantized, "{encoding:?} {name} {shape:?}");
                 }
@@ -325,8 +335,14 @@ mod tests {
             for weights in OBJECTIVES {
                 let serial = quantize_weighted(&source, &shape, 2, layout, weights)
                     .expect("serial quantize");
-                let parallel = quantize_tensor(&source, &shape, 2, layout, weights)
-                    .expect("parallel quantize");
+                let parallel = quantize_tensor(
+                    &source,
+                    &shape,
+                    2,
+                    layout,
+                    QuantizeParams::with_weights(weights),
+                )
+                .expect("parallel quantize");
                 let left = pack(&parallel, layout).expect("parallel packs");
                 let right = pack(&serial, layout).expect("serial packs");
                 assert_eq!(left, right, "{encoding:?} {weights:?}");
@@ -343,11 +359,37 @@ mod tests {
         for encoding in ENCODINGS {
             let layout = encoding.layout();
             let unweighted = quantize(&source, &shape, 2, layout).expect("unweighted quantize");
-            let uniform = quantize_tensor(&source, &shape, 2, layout, WeightSource::Uniform)
+            let uniform = quantize_tensor(&source, &shape, 2, layout, QuantizeParams::default())
                 .expect("uniform quantize");
             let left = pack(&uniform, layout).expect("uniform packs");
             let right = pack(&unweighted, layout).expect("unweighted packs");
             assert_eq!(left, right, "{encoding:?}");
+        }
+    }
+
+    /// The search effort travels to every chunk unchanged, so a wider search
+    /// must match the whole-tensor path exactly, the same way a weighted
+    /// objective does.
+    #[test]
+    fn the_parallel_path_matches_the_serial_one_under_every_effort() {
+        let shape = [65u64, 640];
+        let source = values(65 * 640);
+        for encoding in ENCODINGS {
+            let layout = encoding.layout();
+            for effort in [
+                tcf_core::SearchEffort::Standard,
+                tcf_core::SearchEffort::Wide,
+                tcf_core::SearchEffort::Exhaustive,
+            ] {
+                let params = QuantizeParams::default().with_effort(effort);
+                let serial =
+                    quantize_with(&source, &shape, 2, layout, params).expect("serial quantize");
+                let parallel =
+                    quantize_tensor(&source, &shape, 2, layout, params).expect("parallel quantize");
+                let left = pack(&parallel, layout).expect("parallel packs");
+                let right = pack(&serial, layout).expect("serial packs");
+                assert_eq!(left, right, "{encoding:?} {effort:?}");
+            }
         }
     }
 
@@ -361,7 +403,7 @@ mod tests {
         let layout = NativeEncoding::Q4S32T64.layout();
         let serial = quantize(&source, &shape, 2, layout).unwrap_err();
         let parallel =
-            quantize_tensor(&source, &shape, 2, layout, WeightSource::Uniform).unwrap_err();
+            quantize_tensor(&source, &shape, 2, layout, QuantizeParams::default()).unwrap_err();
         assert_eq!(parallel, serial);
         assert!(matches!(parallel, TcfError::SourceNonfinite { .. }));
     }

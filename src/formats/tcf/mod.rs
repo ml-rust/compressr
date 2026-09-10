@@ -35,6 +35,7 @@ mod plan;
 mod profile;
 mod record;
 mod screen;
+mod search_effort;
 mod spill;
 mod writer;
 
@@ -47,4 +48,5 @@ pub use objective_weights::ResolvedWeights;
 pub use options::TcfOptions;
 pub use plan::PlannedTensor;
 pub use profile::{parse_tcf_profile, TcfProfile, TCF_PROFILE_NAMES};
+pub use search_effort::{parse_tcf_search, tcf_search_name, tcf_search_report, TCF_SEARCH_NAMES};
 pub use writer::TcfFormatWriter;

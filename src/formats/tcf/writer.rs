@@ -48,7 +48,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use tcf_core::{Encoding, LogicalTile, NativeEncoding, Payload, TcfError, TcfWriter};
+use tcf_core::{
+    Encoding, LogicalTile, NativeEncoding, Payload, QuantizeParams, TcfError, TcfWriter,
+};
 
 use super::allocate::allocate;
 use super::encoding::{values_f32, TensorShape};
@@ -398,7 +400,10 @@ impl TcfFormatWriter {
             shape.extent(),
             shape.rank(),
             encoding.layout(),
-            weights.source(),
+            QuantizeParams {
+                weights: weights.source(),
+                effort: options.search_effort,
+            },
             name,
         )?;
         Ok(Payload::Quantized(tiles))
