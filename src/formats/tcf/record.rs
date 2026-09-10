@@ -6,9 +6,15 @@
 //! `transfer_bytes`, both digests and the proof fields, and rejects a
 //! caller-supplied value by name rather than overwriting it.
 //!
-//! `calibration_id` and `workload_profile_id` stay zero. compressr runs no
-//! calibration and measures no workload, and a fabricated id names a record no
-//! consumer can resolve.
+//! `workload_profile_id` stays zero. compressr measures no workload, and a
+//! fabricated id names a record no consumer can resolve.
+//!
+//! `calibration_id` stays zero for the same reason on every run that measures
+//! nothing, which is every run without `--sensitivity`. With that flag a
+//! measurement exists, so [`calibration_record`] declares it and every
+//! measured tensor points at it. Section 10.5.1 is why that pairing is not
+//! optional: `sensitivity_delta` without `calibration_id` is a number with no
+//! authority, and a scheduler MUST NOT rank on it.
 //!
 //! `activation_contract_id` is different: Section 3 requires every tensor to
 //! name a `ContractRecord` in the same file, and Section 9 defines no "no
@@ -21,13 +27,15 @@
 //! compressr never calibrated them for it.
 
 use tcf_core::{
-    consts::ROOT_PARENT_ID, ContractFlags, ContractRecord, DotAccumulator, Encoding, ExecutionRole,
-    InputRepresentation, LayoutId, MathMode, ModuleRecord, ModuleRole, OutputDtype, PolicyFlags,
-    ProofFormat, QuantAxis, RawEncoding, ResidencyClass, Role, RoundingMode, ScaleComputeDtype,
-    StateDtype, StateFlags, StringRef, TensorFlags, TensorRecord,
+    consts::ROOT_PARENT_ID, CalibrationFlags, CalibrationRecord, ContractFlags, ContractRecord,
+    DotAccumulator, Encoding, ExecutionRole, InputRepresentation, LayoutId, MathMode, ModuleRecord,
+    ModuleRole, OutputDtype, PolicyFlags, PrimaryMetric, ProofFormat, QuantAxis, RawEncoding,
+    ResidencyClass, Role, RoundingMode, ScaleComputeDtype, StateDtype, StateFlags, StringRef,
+    TensorFlags, TensorRecord,
 };
 
 use super::encoding::TcfOptions;
+use crate::policy::SensitivityMeasurement;
 
 /// The id every `ModuleRecord` and `TensorRecord` compressr writes points at.
 ///
@@ -106,12 +114,39 @@ pub fn module_record(name: StringRef, options: TcfOptions) -> ModuleRecord {
     }
 }
 
+/// One tensor's measured sensitivity, and the calibration that measured it.
+///
+/// Every field is read from a `--sensitivity` file. A run without that flag
+/// passes `None` and the record's sensitivity fields stay zero with
+/// `SENSITIVITY_VALID` clear, which Section 8.2 requires: zero MUST NOT be
+/// overloaded to mean "not measured".
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TensorSensitivity {
+    /// The `CalibrationRecord` this delta was measured under
+    pub calibration_id: u32,
+    /// The task-metric delta quantizing this tensor cost
+    pub delta: f64,
+    /// Evaluation rows the delta was measured over
+    pub samples: u32,
+    /// Seeds those rows were drawn under
+    pub seed_count: u32,
+}
+
 /// One tensor's record.
 ///
 /// `role` stays `Other` and `execution_role` follows the rank alone: a rank-2
 /// tensor is a matmul operand and a rank-1 one is elementwise. Naming a tensor
 /// an embedding or a router from its name would be a guess, and
 /// `execution_role` is the dispatch key.
+///
+/// `sensitivity_ci95` stays zero with or without a measurement. The
+/// sensitivity file carries one delta per tensor and no confidence interval,
+/// and Section 8.2 reads the field only against `SENSITIVITY_VALID`, so a
+/// fabricated interval would be read as measured.
+///
+/// `TASK_CRITICAL` is never set. Section 8.2 names the bit and defines no
+/// threshold for it, so a producer setting it from its own bump decision would
+/// be asserting a claim the format does not define.
 pub fn tensor_record(
     tensor_id: u32,
     name: StringRef,
@@ -119,6 +154,7 @@ pub fn tensor_record(
     fallback_reason: tcf_core::FallbackReason,
     dims: [u64; 8],
     rank: u32,
+    sensitivity: Option<TensorSensitivity>,
 ) -> TensorRecord {
     TensorRecord {
         tensor_id,
@@ -128,9 +164,12 @@ pub fn tensor_record(
         encoding,
         fallback_reason,
         residency_class: ResidencyClass::Warm,
-        flags: TensorFlags::NONE,
+        flags: match sensitivity {
+            Some(_) => TensorFlags::SENSITIVITY_VALID,
+            None => TensorFlags::NONE,
+        },
         rank,
-        calibration_id: 0,
+        calibration_id: sensitivity.map_or(0, |measured| measured.calibration_id),
         dims,
         activation_contract_id: EXACT_F32_CONTRACT_ID,
         layout_id: LayoutId::RowMajorDense,
@@ -139,12 +178,12 @@ pub fn tensor_record(
         physical_span_bytes: 0,
         resident_bytes: 0,
         transfer_bytes: 0,
-        sensitivity_delta: 0.0,
+        sensitivity_delta: sensitivity.map_or(0.0, |measured| measured.delta as f32),
         sensitivity_ci95: 0.0,
         accesses_per_generation: 0.0,
         bytes_read_per_generation: 0.0,
-        sensitivity_samples: 0,
-        sensitivity_seed_count: 0,
+        sensitivity_samples: sensitivity.map_or(0, |measured| measured.samples),
+        sensitivity_seed_count: sensitivity.map_or(0, |measured| measured.seed_count),
         access_profile_samples: 0,
         execution_role: if rank >= 2 {
             ExecutionRole::Matmul
@@ -160,6 +199,58 @@ pub fn tensor_record(
     }
 }
 
+/// Seeds a sensitivity file's row sample was drawn under.
+///
+/// The measurement names one `eval_seed`, so one seed. A larger count would
+/// claim a seed-to-seed variance estimate the file does not hold.
+pub const SENSITIVITY_SEED_COUNT: u32 = 1;
+
+/// The calibration a `--sensitivity` run's tensors point at. Section 10.
+///
+/// Section 4 step 5 requires `calibration_id` in every measured
+/// `TensorRecord`, and Section 10.5.1 makes the pairing load-bearing: a
+/// `sensitivity_delta` with no calibration behind it is a number with no
+/// authority. So a measured run declares the calibration it actually read.
+///
+/// `primary_metric` is `TASK_SPECIFIC`. The measurement is a task loss, not a
+/// word or character error rate and not a perplexity, and Section 10 forbids
+/// naming a tensor RMS here — which is exactly why the weight-error screen
+/// writes no calibration record at all.
+///
+/// Three fields stay zero because compressr cannot fill them honestly, and
+/// each is a real gap rather than a formality:
+///
+/// - `dataset_digest`, a BLAKE3-256 over the evaluation set's content.
+///   compressr never sees that data; it reads a file of numbers computed from
+///   it. The dataset is named, not fingerprinted.
+/// - `acceptance_margin`. Nothing in the measurement declares a margin a delta
+///   must stay inside, and inventing one would fix an acceptance criterion the
+///   producer never set.
+/// - `producer_timestamp`. The measurement carries no time, and the conversion's
+///   own clock would date the file rather than the calibration. Leaving it zero
+///   also keeps two identical runs byte-identical.
+pub fn calibration_record(
+    measurement: &SensitivityMeasurement,
+    dataset_name: StringRef,
+    evaluator_name: StringRef,
+) -> CalibrationRecord {
+    let baseline = measurement.baseline();
+    CalibrationRecord {
+        calibration_id: measurement.calibration_id(),
+        primary_metric: PrimaryMetric::TaskSpecific,
+        flags: CalibrationFlags::NONE,
+        sample_count: baseline.eval_rows,
+        seed_count: SENSITIVITY_SEED_COUNT,
+        baseline_metric: baseline.baseline_total as f32,
+        acceptance_margin: 0.0,
+        dataset_name,
+        evaluator_name,
+        dataset_digest: [0u8; 32],
+        evaluator_config_digest: measurement.calibration_digest(),
+        producer_timestamp: 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,6 +258,15 @@ mod tests {
 
     fn options() -> TcfOptions {
         TcfOptions::uniform(NativeEncoding::Q4S32T64, NativeEncoding::Q6S32T64)
+    }
+
+    fn measurement() -> SensitivityMeasurement {
+        crate::policy::parse_sensitivity(&[
+            r#"{"record":"baseline","ckpt":"cache/models/example/abcdef","manifest":"manifests/eval.tsv","encoding":"Q4S32_T64","eval_rows":12,"eval_seed":7,"baseline_total":1.17}"#,
+            r#"{"record":"sensitivity","name":"a.weight","delta":0.5}"#,
+        ]
+        .join("\n"))
+        .expect("parses")
     }
 
     #[test]
@@ -224,6 +324,7 @@ mod tests {
             tcf_core::FallbackReason::None,
             [1, 64, 0, 0, 0, 0, 0, 0],
             2,
+            None,
         );
         assert_eq!(record.calibration_id, 0);
         assert_eq!(record.activation_contract_id, EXACT_F32_CONTRACT_ID);
@@ -236,6 +337,54 @@ mod tests {
         assert_eq!(record.execution_role, ExecutionRole::Matmul);
     }
 
+    /// A measured tensor carries the delta, the sample count and the
+    /// calibration behind them, and says so with `SENSITIVITY_VALID`. The
+    /// confidence interval stays zero: the measurement has none.
+    #[test]
+    fn a_measured_tensor_records_its_delta_and_its_calibration() {
+        let measurement = measurement();
+        let record = tensor_record(
+            0,
+            StringRef::new(0, 1),
+            Encoding::Native(NativeEncoding::Q4S32T64),
+            tcf_core::FallbackReason::TaskSensitivity,
+            [1, 64, 0, 0, 0, 0, 0, 0],
+            2,
+            Some(TensorSensitivity {
+                calibration_id: measurement.calibration_id(),
+                delta: 0.5,
+                samples: 12,
+                seed_count: SENSITIVITY_SEED_COUNT,
+            }),
+        );
+        assert!(record.flags.contains(TensorFlags::SENSITIVITY_VALID));
+        assert_eq!(record.sensitivity_delta, 0.5);
+        assert_eq!(record.sensitivity_samples, 12);
+        assert_eq!(record.sensitivity_seed_count, 1);
+        assert_eq!(record.sensitivity_ci95, 0.0);
+        assert_eq!(record.calibration_id, measurement.calibration_id());
+        assert_ne!(record.calibration_id, 0);
+    }
+
+    /// The calibration names a task metric, never an RMS, and leaves the
+    /// three fields compressr cannot fill honestly at zero.
+    #[test]
+    fn the_calibration_declares_the_measurement_it_read() {
+        let measurement = measurement();
+        let record = calibration_record(&measurement, StringRef::new(0, 4), StringRef::new(4, 6));
+        assert_eq!(record.primary_metric, PrimaryMetric::TaskSpecific);
+        assert_eq!(record.calibration_id, measurement.calibration_id());
+        assert_eq!(record.sample_count, 12);
+        assert_eq!(record.seed_count, SENSITIVITY_SEED_COUNT);
+        assert_eq!(
+            record.evaluator_config_digest,
+            measurement.calibration_digest()
+        );
+        assert_eq!(record.dataset_digest, [0u8; 32]);
+        assert_eq!(record.acceptance_margin, 0.0);
+        assert_eq!(record.producer_timestamp, 0);
+    }
+
     #[test]
     fn a_rank_1_tensor_dispatches_elementwise() {
         let record = tensor_record(
@@ -245,6 +394,7 @@ mod tests {
             tcf_core::FallbackReason::RankLt2,
             [64, 0, 0, 0, 0, 0, 0, 0],
             1,
+            None,
         );
         assert_eq!(record.execution_role, ExecutionRole::Elementwise);
     }

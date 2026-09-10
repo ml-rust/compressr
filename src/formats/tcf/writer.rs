@@ -50,15 +50,28 @@ use std::path::{Path, PathBuf};
 
 use tcf_core::{Encoding, LogicalTile, NativeEncoding, Payload, TcfError, TcfWriter};
 
+use super::allocate::allocate;
 use super::encoding::{values_f32, TcfOptions, TensorShape, TCF_ENCODING_NAMES};
 use super::parallel::quantize_named;
-use super::plan::{allocate, plan_one, reason_for, settle, PlannedTensor, Registration};
-use super::record::{contract_record, module_record, tensor_record};
+use super::plan::{plan_one, reason_for, settle, PlannedTensor, Registration};
+use super::record::{
+    calibration_record, contract_record, module_record, tensor_record, TensorSensitivity,
+    SENSITIVITY_SEED_COUNT,
+};
 use super::spill::PayloadSpill;
 use crate::formats::FormatWriter;
 use crate::loader::{LoadedModel, ModelLoader, UnifiedDType};
-use crate::policy::TcfPlan;
+use crate::policy::{SensitivityMeasurement, TcfPlan};
 use crate::quantization::QuantType;
+
+/// What every measured `TensorRecord` copies from the declared calibration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CalibrationFacts {
+    /// The `CalibrationRecord` this file declares
+    id: u32,
+    /// Evaluation rows every delta was measured over
+    samples: u32,
+}
 
 /// TCF format writer.
 ///
@@ -79,6 +92,13 @@ pub struct TcfFormatWriter {
     /// Pass 1's payloads, `None` once a spill error has sent every remaining
     /// tensor back to the quantizer
     spill: Option<PayloadSpill>,
+    /// The measured task-metric sensitivity `--sensitivity` supplied
+    ///
+    /// `None` runs the weight-error screen and writes no sensitivity field.
+    sensitivity: Option<SensitivityMeasurement>,
+    /// The calibration this file declares, filled by
+    /// [`TcfFormatWriter::declare_calibration`] for a measured run only
+    calibration: Option<CalibrationFacts>,
     writer: Option<TcfWriter>,
 }
 
@@ -98,6 +118,8 @@ impl TcfFormatWriter {
             planned: Vec::new(),
             shapes: Vec::new(),
             spill: None,
+            sensitivity: None,
+            calibration: None,
             writer: None,
         }
     }
@@ -105,6 +127,15 @@ impl TcfFormatWriter {
     /// Set the encoding to quantize into and the module's preferred encoding.
     pub fn with_options(mut self, options: TcfOptions) -> Self {
         self.options = Some(options);
+        self
+    }
+
+    /// Set the measured task-metric sensitivity the bump set is ranked by.
+    ///
+    /// Without this the ranking is the weight-error screen and every
+    /// sensitivity field stays unset. See [`crate::policy::sensitivity`].
+    pub fn with_sensitivity(mut self, measurement: SensitivityMeasurement) -> Self {
+        self.sensitivity = Some(measurement);
         self
     }
 
@@ -136,6 +167,45 @@ impl TcfFormatWriter {
         })
     }
 
+    /// Declare the calibration a measured run read, and remember what every
+    /// measured tensor copies from it.
+    ///
+    /// Does nothing without `--sensitivity`: a run that measured nothing
+    /// declares no calibration, and its tensors keep `calibration_id` zero.
+    ///
+    /// # Errors
+    /// The writer was not initialized, or the string table refused a name.
+    fn declare_calibration(&mut self) -> Result<()> {
+        let Some(measurement) = self.sensitivity.clone() else {
+            return Ok(());
+        };
+        let dataset = measurement.baseline().dataset.clone();
+        let evaluator = measurement.evaluator_name().to_string();
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| anyhow!("TCF writer used before initialize()"))?;
+        let dataset_name = writer
+            .intern(&dataset)
+            .map_err(|e| anyhow!(e))
+            .context("Failed to intern the sensitivity file's dataset name")?;
+        let evaluator_name = writer
+            .intern(&evaluator)
+            .map_err(|e| anyhow!(e))
+            .context("Failed to intern the sensitivity file's evaluator name")?;
+        let record = calibration_record(&measurement, dataset_name, evaluator_name);
+        let facts = CalibrationFacts {
+            id: record.calibration_id,
+            samples: record.sample_count,
+        };
+        writer
+            .add_calibration(record)
+            .map_err(|e| anyhow!(e))
+            .context("Failed to declare the sensitivity file's calibration")?;
+        self.calibration = Some(facts);
+        Ok(())
+    }
+
     /// Register every settled record with `tcf-core`, in directory order.
     ///
     /// Each tensor's [`TensorShape`] is derived here and kept, so the payload
@@ -162,6 +232,18 @@ impl TcfFormatWriter {
             let tensor_id =
                 u32::try_from(index).context("More tensors than a TCF file can hold")?;
             let reason = reason_for(&plan, options);
+            // A delta with no calibration behind it is a number with no
+            // authority (Section 10.5.1), so the two are written together or
+            // not at all.
+            let measured =
+                plan.sensitivity_delta
+                    .zip(self.calibration)
+                    .map(|(delta, calibration)| TensorSensitivity {
+                        calibration_id: calibration.id,
+                        delta,
+                        samples: calibration.samples,
+                        seed_count: SENSITIVITY_SEED_COUNT,
+                    });
 
             let writer = self
                 .writer
@@ -171,7 +253,15 @@ impl TcfFormatWriter {
                 .intern(name)
                 .map_err(|e| anyhow!(e))
                 .with_context(|| format!("Failed to intern tensor name '{name}'"))?;
-            let record = tensor_record(tensor_id, interned, plan.encoding, reason, dims, rank);
+            let record = tensor_record(
+                tensor_id,
+                interned,
+                plan.encoding,
+                reason,
+                dims,
+                rank,
+                measured,
+            );
             let registered = match plan.encoding {
                 Encoding::Native(_) => writer.register_quantized_tensor(record),
                 _ => writer.register_raw_tensor(record),
@@ -477,7 +567,8 @@ impl FormatWriter for TcfFormatWriter {
         log::info!("TCF: {counts}");
 
         let options = self.options()?;
-        allocate(&mut self.planned, options)?;
+        allocate(&mut self.planned, options, self.sensitivity.as_ref())?;
+        self.declare_calibration()?;
         self.register_all()?;
         let writer = self
             .writer

@@ -18,6 +18,7 @@
 //! boostr for the same reason: a writer checked against a reader beside it
 //! proves nothing.
 
+mod allocate;
 mod encoding;
 mod parallel;
 mod plan;

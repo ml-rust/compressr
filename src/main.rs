@@ -25,6 +25,11 @@
 //! # Or let a profile allocate the encodings, mixed precision
 //! compressr convert model/ --format tcf --tcf-profile balanced
 //!
+//! # Rank that profile's bump set by a measured task-metric delta instead of
+//! # by the weight-error screen
+//! compressr convert model/ --format tcf --tcf-profile balanced \
+//!     --sensitivity sensitivity.jsonl
+//!
 //! # Shard the output at 2 GB instead of the 5 GB default
 //! compressr convert model/ --format safetensors --dtype bf16 --max-shard-size 2GB
 //!
@@ -43,11 +48,11 @@
 
 mod quant_arg;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use compressr::{
-    parse_tcf_encoding, parse_tcf_profile, ConversionConfig, OutputFormat, QuantizationConfig,
-    QuantizationMethod, TcfOptions,
+    parse_sensitivity, parse_tcf_encoding, parse_tcf_profile, ConversionConfig, OutputFormat,
+    QuantizationConfig, QuantizationMethod, SensitivityMeasurement, TcfOptions,
 };
 use quant_arg::parse_quantization;
 
@@ -123,10 +128,22 @@ enum Commands {
         /// The alternative to --tcf-encoding, and mutually exclusive with it.
         /// A profile is mixed precision: a base encoding for every quantizable
         /// tensor, and a bump encoding on the worst-reconstructed share of the
-        /// parameters. compressr ranks that share by a weight-error screen and
-        /// runs no task-metric calibration.
+        /// parameters. That share is ranked by a weight-error screen unless
+        /// --sensitivity supplies a measured task-metric delta.
         #[arg(long, value_name = "PROFILE")]
         tcf_profile: Option<String>,
+
+        /// Measured task-metric sensitivity, as JSON lines
+        ///
+        /// Requires --tcf-profile with a bump encoding. One "baseline" record
+        /// naming the model, the evaluation set and the encoding measured,
+        /// then one "sensitivity" record per tensor carrying its task delta.
+        /// The profile's bump set is then ranked by measured damage per
+        /// element, and sensitivity_delta, sensitivity_samples and
+        /// calibration_id are written from the measurement. Without it the
+        /// ranking is a weight-error screen and those fields stay unset.
+        #[arg(long, value_name = "FILE")]
+        sensitivity: Option<String>,
 
         /// Architecture written to GGUF's general.architecture (e.g. llama, qwen2)
         ///
@@ -218,6 +235,7 @@ fn main() -> Result<()> {
             tcf_encoding,
             tcf_preferred_encoding,
             tcf_profile,
+            sensitivity,
             arch,
             verbose,
         } => {
@@ -237,6 +255,7 @@ fn main() -> Result<()> {
             let tcf_options =
                 parse_tcf_options(tcf_encoding.as_deref(), tcf_preferred_encoding.as_deref())?;
             let tcf_profile = tcf_profile.as_deref().map(parse_tcf_profile).transpose()?;
+            let sensitivity = sensitivity.as_deref().map(read_sensitivity).transpose()?;
 
             let output_path = output.unwrap_or_else(|| {
                 default_output_path(
@@ -268,6 +287,10 @@ fn main() -> Result<()> {
             }
             if let Some(tcf_profile) = tcf_profile {
                 config = config.with_tcf_profile(tcf_profile);
+            }
+            let measured = sensitivity.clone();
+            if let Some(measurement) = sensitivity {
+                config = config.with_tcf_sensitivity(measurement);
             }
 
             let stats = compressr::convert(config)?;
@@ -324,8 +347,8 @@ fn main() -> Result<()> {
             if output_format == OutputFormat::Tcf {
                 println!(
                     "TCF activation contract: exact F32 activations, F32 accumulate, F32 out. \
-                     calibration_id and workload_profile_id are unset: compressr runs no \
-                     calibration and measures no workload."
+                     workload_profile_id is unset: compressr measures no workload. No \
+                     activation calibration was run either, which is what that contract says."
                 );
             }
             if let Some(profile) = tcf_profile {
@@ -337,13 +360,29 @@ fn main() -> Result<()> {
                     profile.bump,
                     profile.bump_fraction * 100.0
                 );
-                println!(
-                    "That share was ranked by a WEIGHT-ERROR screen: each tensor was quantized \
-                     at the base encoding, dequantized again, and scored by the relative RMS of \
-                     the error. No task-metric calibration was run, so sensitivity_delta, \
-                     sensitivity_ci95, sensitivity_samples and calibration_id are unset and \
-                     this file is NOT profile-solved per PROFILES.md Section 4."
-                );
+                match measured {
+                    Some(ref measurement) => println!(
+                        "That share was ranked by a MEASURED task-metric delta per element: {} \
+                         tensors measured over {} evaluation rows at {}. sensitivity_delta, \
+                         sensitivity_samples and calibration_id are written from that \
+                         measurement, which this file declares as calibration {:#010x}. \
+                         sensitivity_ci95 is unset: the measurement carries no confidence \
+                         interval, and the calibration's dataset digest and acceptance margin \
+                         are unset because the measurement carries neither.",
+                        measurement.measured(),
+                        measurement.baseline().eval_rows,
+                        measurement.baseline().encoding,
+                        measurement.calibration_id()
+                    ),
+                    None => println!(
+                        "That share was ranked by a WEIGHT-ERROR screen: each tensor was \
+                         quantized at the base encoding, dequantized again, and scored by the \
+                         relative RMS of the error. No task-metric calibration was run, so \
+                         sensitivity_delta, sensitivity_ci95, sensitivity_samples and \
+                         calibration_id are unset and this file is NOT profile-solved per \
+                         PROFILES.md Section 4."
+                    ),
+                }
                 println!(
                     "The ladder's {:.2} bpw for {} assumes that allocation. The bpw this file \
                      achieved is measured from the bytes written and is logged as \
@@ -570,6 +609,16 @@ fn parse_tcf_options(
              the encoding the weights are written in."
         ),
     }
+}
+
+/// Read and parse a `--sensitivity` file.
+///
+/// Parsed here rather than in the writer so a malformed or empty file fails
+/// before any output is created, as every other conversion check does.
+fn read_sensitivity(path: &str) -> Result<SensitivityMeasurement> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read the sensitivity file '{path}'"))?;
+    parse_sensitivity(&text).with_context(|| format!("Failed to parse '{path}'"))
 }
 
 fn parse_method(s: &str) -> Result<QuantizationMethod> {

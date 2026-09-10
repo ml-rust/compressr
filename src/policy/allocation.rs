@@ -4,8 +4,8 @@
 //!
 //! `PROFILES.md` Section 4 screens tensors (step 1), measures a task-metric
 //! delta per candidate (step 2), then allocates against the profile's byte
-//! budget (step 3). Step 2 needs a model and a 128-prompt calibration set.
-//! compressr has neither, so it never runs, and no value here is ever written
+//! budget (step 3). Step 2 needs a model and a calibration set. compressr has
+//! neither, so it never runs here, and NO value in this module is ever written
 //! to `sensitivity_delta`, `sensitivity_ci95`, `sensitivity_samples` or
 //! `calibration_id`.
 //!
@@ -13,7 +13,14 @@
 //! encoding, dequantize it again, and take the RMS of the error over the RMS
 //! of the source. That number ranks tensors by how badly the base encoding
 //! reconstructs their weights. It is not a task delta and never stands in for
-//! one.
+//! one. A conversion ranked this way is NOT profile-solved per Section 4, and
+//! its sensitivity fields stay unset.
+//!
+//! This is the default and the only path without `--sensitivity`. That flag
+//! reads step 2's measurement from a harness that did run the model, and
+//! [`super::sensitivity_rank`] ranks the same budget by it instead. Neither
+//! module changes the other: [`select_bumped`] here is the screen's selection
+//! and stays exactly as strong a claim as it was.
 //!
 //! # The budget is counted in elements
 //!

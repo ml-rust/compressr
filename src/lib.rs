@@ -21,12 +21,22 @@
 //! - TCF v1 out, quantized once from the full-precision source
 //! - TCF profile allocation: a base encoding plus a bump encoding on the
 //!   worst-reconstructed share of the parameters
+//! - TCF task-metric allocation: the same profile, with the bump set ranked by
+//!   a measured sensitivity file instead
 //!
-//! A TCF profile is allocated from a WEIGHT-ERROR screen. `PROFILES.md`
-//! Section 4 step 2 measures a task-metric delta on a calibration set, which
-//! compressr cannot run, so `sensitivity_delta`, `sensitivity_ci95`,
-//! `sensitivity_samples` and `calibration_id` stay unset and no file compressr
-//! writes is profile-solved in that sense.
+//! A TCF profile is allocated from a WEIGHT-ERROR screen by default.
+//! `PROFILES.md` Section 4 step 2 measures a task-metric delta on a
+//! calibration set, which compressr cannot run, so on such a run
+//! `sensitivity_delta`, `sensitivity_ci95`, `sensitivity_samples` and
+//! `calibration_id` stay unset and the file is not profile-solved in that
+//! sense.
+//!
+//! `--sensitivity` supplies that measurement from a harness that did run the
+//! model. The bump set is then ranked by measured task damage per element, and
+//! `sensitivity_delta`, `sensitivity_samples` and `calibration_id` are written
+//! from it alongside a `CalibrationRecord`. `sensitivity_ci95` stays unset:
+//! the measurement carries no confidence interval. See
+//! [`policy::sensitivity`].
 //!
 //! TCF is produced from a full-precision checkpoint only. Converting a GGUF
 //! or a TCF into one would quantize already-quantized weights a second time,
@@ -96,12 +106,13 @@ pub use loader::{
     TcfModuleFacts, TcfTensorFacts, UnifiedDType, UnifiedTensorInfo,
 };
 pub use policy::{
-    assign_mix, assign_mix_reported, mix_model_facts, parse_gguf_mix, partition_components,
-    plan_format_label, plan_mixed_tensor, plan_tcf_tensor, plan_tensor, principal_component,
-    quant_type_label, relative_rms_error, select_bumped, split_component, use_more_bits,
-    ComponentAllocation, FallbackReason, FormatUsage, GgufMix, LayerCountSource, MixAllocation,
-    MixEntry, MixModel, MixReport, PlanCounts, ScreenedTensor, TcfPlan, TensorPlan, TensorRole,
-    GGUF_MIX_NAMES, UNLAYERED_COMPONENT,
+    assign_mix, assign_mix_reported, mix_model_facts, parse_gguf_mix, parse_sensitivity,
+    partition_components, plan_format_label, plan_mixed_tensor, plan_tcf_tensor, plan_tensor,
+    principal_component, quant_type_label, relative_rms_error, select_bumped,
+    select_bumped_measured, split_component, use_more_bits, BumpCandidate, ComponentAllocation,
+    FallbackReason, FormatUsage, GgufMix, LayerCountSource, MeasuredBump, MixAllocation, MixEntry,
+    MixModel, MixReport, PlanCounts, ScreenedTensor, SensitivityBaseline, SensitivityMeasurement,
+    TcfPlan, TensorPlan, TensorRole, GGUF_MIX_NAMES, UNLAYERED_COMPONENT,
 };
 pub use quantization::{
     QuantType, QuantizationConfig, QuantizationMethod, QuantizedTensor, Quantizer,
@@ -206,6 +217,12 @@ pub struct ConversionConfig {
     /// quantizable parameters the bump covers, so it sets one encoding per
     /// tensor rather than one for the whole model.
     pub tcf_profile: Option<TcfProfile>,
+    /// Measured task-metric sensitivity for the TCF profile's bump set
+    ///
+    /// Valid only alongside [`ConversionConfig::tcf_profile`], and only for a
+    /// profile that names a bump encoding. Without it the bump set is ranked
+    /// by the weight-error screen and no sensitivity field is written.
+    pub tcf_sensitivity: Option<SensitivityMeasurement>,
     /// llama.cpp mixed-precision allocation for a GGUF output
     ///
     /// Set alongside [`ConversionConfig::quantization`], whose method is the
@@ -231,6 +248,7 @@ impl ConversionConfig {
             arch: None,
             tcf: None,
             tcf_profile: None,
+            tcf_sensitivity: None,
             gguf_mix: None,
             verbose: false,
         }
@@ -251,6 +269,12 @@ impl ConversionConfig {
     /// Set the TCF allocation profile
     pub fn with_tcf_profile(mut self, profile: TcfProfile) -> Self {
         self.tcf_profile = Some(profile);
+        self
+    }
+
+    /// Set the measured task-metric sensitivity the bump set is ranked by
+    pub fn with_tcf_sensitivity(mut self, measurement: SensitivityMeasurement) -> Self {
+        self.tcf_sensitivity = Some(measurement);
         self
     }
 
@@ -313,6 +337,9 @@ impl ConversionConfig {
     /// - `--format tcf` was given with both `--tcf-profile` and
     ///   `--tcf-encoding`, or with neither. A profile already fixes the base
     ///   encoding, so the two flags cannot both describe the same file.
+    /// - `--sensitivity` was given without a TCF profile that names a bump
+    ///   encoding, or with a measurement taken at another encoding. A ranking
+    ///   measured at one encoding does not transfer to another.
     ///
     /// Every check runs BEFORE any output file is created, because a mismatch
     /// caught by the writer instead surfaces halfway through the tensor loop
@@ -402,10 +429,40 @@ impl ConversionConfig {
                      meaning beside it."
                 );
             }
+            // A measurement ranks one set against one budget. Without a
+            // profile there is no bump set to rank, and a profile that names
+            // no bump encoding has nothing to raise a tensor to.
+            if let Some(ref measurement) = self.tcf_sensitivity {
+                let Some(profile) = self.tcf_profile else {
+                    bail!(
+                        "--sensitivity applies to --tcf-profile only. A measurement ranks the \
+                         tensors a profile raises to its bump encoding, and --tcf-encoding \
+                         writes one encoding for every tensor, so there is no set to rank. \
+                         Accepted profiles: {}",
+                        TCF_PROFILE_NAMES.join(", ")
+                    );
+                };
+                if profile.bump.is_none() {
+                    bail!(
+                        "--sensitivity was given with profile {}, which names no bump \
+                         encoding. Every tensor is written at {:?}, so there is no bump set \
+                         for a measurement to rank.",
+                        profile.name,
+                        profile.base
+                    );
+                }
+                measurement.check_encoding(profile.base)?;
+            }
         } else if self.tcf.is_some() || self.tcf_profile.is_some() {
             bail!(
                 "--tcf-encoding and --tcf-profile apply to --format tcf only, but --format \
                  is {:?}.",
+                self.output_format
+            );
+        } else if self.tcf_sensitivity.is_some() {
+            bail!(
+                "--sensitivity applies to --format tcf only, but --format is {:?}. It ranks a \
+                 TCF profile's bump set, and no other format has one.",
                 self.output_format
             );
         }
@@ -722,6 +779,17 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
         if let Some(name) = policy::model_name(Path::new(&config.input_path)) {
             tcf_writer = tcf_writer.with_module_name(&name);
         }
+        if let Some(measurement) = config.tcf_sensitivity.clone() {
+            log::info!(
+                "TCF sensitivity: {} measured tensors over {} evaluation rows at {}, \
+                 calibration {:#010x}",
+                measurement.measured(),
+                measurement.baseline().eval_rows,
+                measurement.baseline().encoding,
+                measurement.calibration_id()
+            );
+            tcf_writer = tcf_writer.with_sensitivity(measurement);
+        }
         match options.profile {
             Some(profile) => log::info!(
                 "TCF profile {}: base {:?}, bump {:?} on the top {:.0}% of quantizable \
@@ -738,10 +806,11 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
             ),
         }
         log::info!(
-            "TCF activation contract: exact F32 activations, F32 accumulate, F32 out; an \
-             uncalibrated conversion tunes nothing for a quantized-activation kernel. \
-             calibration_id and workload_profile_id are left unset: compressr runs no \
-             calibration and measures no workload."
+            "TCF activation contract: exact F32 activations, F32 accumulate, F32 out; a \
+             conversion that calibrated no activations tunes nothing for a \
+             quantized-activation kernel. workload_profile_id is left unset: compressr \
+             measures no workload. calibration_id is set only on a --sensitivity run, from \
+             the measurement that run read."
         );
         writer = Box::new(tcf_writer);
     }

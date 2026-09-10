@@ -10,10 +10,18 @@
 //! [`settle`] quantizes a tensor once to see whether the values themselves
 //! refuse the encoding, and the same call answers how well the encoding
 //! reconstructs them. That relative RMS error ranks bump candidates in
-//! [`allocate`]. It is a weight error. `PROFILES.md` Section 4 step 2 measures
-//! a task-metric delta on a calibration set, which compressr cannot run, so
-//! `sensitivity_delta`, `sensitivity_ci95`, `sensitivity_samples` and
-//! `calibration_id` are never written from anything here.
+//! [`super::allocate`] by default. It is a weight error, never a task delta,
+//! and no sensitivity field is ever written from it: a run without
+//! `--sensitivity` leaves `sensitivity_delta`, `sensitivity_ci95`,
+//! `sensitivity_samples` and `calibration_id` unset, and its file is NOT
+//! profile-solved per `PROFILES.md` Section 4.
+//!
+//! `--sensitivity` supplies the measurement compressr cannot take itself: a
+//! task-metric delta per tensor, measured elsewhere at the profile's base
+//! encoding. [`super::allocate`] then ranks by that instead, and the writer
+//! records `sensitivity_delta`, `sensitivity_samples` and `calibration_id`
+//! from it. `sensitivity_ci95` stays unset either way — the measurement
+//! carries no confidence interval. See [`crate::policy::sensitivity`].
 //!
 //! # The screen is hot
 //!
@@ -42,8 +50,7 @@ use super::encoding::{raw_encoding_for, values_f32, TcfOptions, TensorShape};
 use super::parallel::{accepts_tensor, quantize_tensor};
 use crate::loader::UnifiedDType;
 use crate::policy::{
-    plan_tcf_tensor, relative_rms_error, select_bumped, tcf_fallback_reason, FallbackReason,
-    ScreenedTensor, TcfPlan,
+    plan_tcf_tensor, relative_rms_error, tcf_fallback_reason, FallbackReason, TcfPlan,
 };
 
 /// One tensor as registered, before its values decide anything.
@@ -88,6 +95,13 @@ pub struct PlannedTensor {
     pub bumpable: bool,
     /// True when a profile allocation raised this tensor to its bump encoding
     pub bumped: bool,
+    /// The tensor's measured task-metric delta, when `--sensitivity` gave one
+    ///
+    /// `None` for every run without the flag, and for a tensor the measurement
+    /// does not name. This is `PROFILES.md` Section 4 step 2's number and the
+    /// only thing `sensitivity_delta` is ever written from; the weight-error
+    /// screen never reaches that field.
+    pub sensitivity_delta: Option<f64>,
 }
 
 /// What the screen learned about one quantizable tensor.
@@ -249,7 +263,7 @@ fn bump_accepts(
 ///
 /// Nothing is registered here. A profile's bump set ranks tensors against
 /// each other, so the encoding a record carries is only final once every
-/// tensor has been screened. [`allocate`] settles that, and the writer
+/// tensor has been screened. [`super::allocate`] settles that, and the writer
 /// registers the records afterwards.
 pub(super) fn plan_one(
     options: TcfOptions,
@@ -285,83 +299,8 @@ pub(super) fn plan_one(
         elements,
         bumpable: screen.is_some_and(|screen| screen.bumpable),
         bumped: false,
+        sensitivity_delta: None,
     })
-}
-
-/// Raise the profile's bump set from the base encoding.
-///
-/// Candidates are the quantized tensors the bump encoding also accepts. A
-/// tensor stored raw has no base encoding to be bumped from, and one the bump
-/// encoding refuses cannot carry it, so neither is ranked and neither counts
-/// toward the element total the profile's fraction is taken of. The budget
-/// is spent in elements, not in tensors: the ladder's rungs are bpw
-/// numbers, and only elements track bytes.
-///
-/// The ranking is the weight-error screen. `PROFILES.md` Section 4 step 2
-/// — the task-metric measurement that separates a solved profile from a
-/// heuristic — needs a model and a calibration set, which compressr does
-/// not have, so it never runs and every sensitivity field stays unset.
-pub(super) fn allocate(planned: &mut [PlannedTensor], options: TcfOptions) -> Result<()> {
-    let Some(profile) = options.profile else {
-        return Ok(());
-    };
-    let Some(bump) = profile.bump else {
-        log::info!(
-            "TCF profile {}: {:?} for every quantizable tensor, no bump set",
-            profile.name,
-            profile.base
-        );
-        return Ok(());
-    };
-
-    let candidates: Vec<ScreenedTensor> = planned
-        .iter()
-        .enumerate()
-        .filter_map(|(index, plan)| {
-            plan.screen_error
-                .filter(|_| plan.bumpable)
-                .map(|relative_rms| ScreenedTensor {
-                    index,
-                    relative_rms,
-                    elements: plan.elements,
-                })
-        })
-        .collect();
-    let candidate_count = candidates.len();
-    let candidate_elements: u64 = candidates.iter().map(|c| c.elements).sum();
-    let bumped = select_bumped(&candidates, profile.bump_fraction);
-
-    let mut bumped_elements: u64 = 0;
-    for index in &bumped {
-        let plan = planned
-            .get_mut(*index)
-            .ok_or_else(|| anyhow!("Allocation named tensor {index}, which was never planned"))?;
-        plan.encoding = Encoding::Native(bump);
-        plan.bumped = true;
-        bumped_elements = bumped_elements.saturating_add(plan.elements);
-    }
-
-    let share = if candidate_elements == 0 {
-        0.0
-    } else {
-        bumped_elements as f64 * 100.0 / candidate_elements as f64
-    };
-    log::info!(
-        "TCF profile {}: base {:?}, {} of {candidate_count} quantizable tensors bumped to \
-         {bump:?}, {share:.1}% of quantizable parameters against a {:.0}% budget",
-        profile.name,
-        profile.base,
-        bumped.len(),
-        profile.bump_fraction * 100.0
-    );
-    log::info!(
-        "TCF profile {}: the bump set was ranked by a weight-error screen — relative RMS of \
-         the dequantized weights against the source. No task-metric calibration ran, so \
-         sensitivity_delta, sensitivity_ci95, sensitivity_samples and calibration_id stay \
-         unset and this file is NOT profile-solved per PROFILES.md Section 4.",
-        profile.name
-    );
-    Ok(())
 }
 
 /// The `fallback_reason` one settled tensor carries.
@@ -391,7 +330,7 @@ pub(super) fn reason_for(plan: &PlannedTensor, options: TcfOptions) -> tcf_core:
 
 #[cfg(test)]
 mod tests {
-    use super::super::profile::{TCF_COMPACT, TCF_REF};
+    use super::super::profile::TCF_COMPACT;
     use super::*;
     use tcf_core::{NativeEncoding, RawEncoding};
 
@@ -409,6 +348,7 @@ mod tests {
             elements: 64,
             bumpable: fallback.is_none(),
             bumped,
+            sensitivity_delta: None,
         }
     }
 
@@ -454,76 +394,5 @@ mod tests {
             Some(FallbackReason::Rank),
         );
         assert_eq!(reason_for(&raw, options), tcf_core::FallbackReason::RankLt2);
-    }
-
-    /// The budget counts the quantizable elements alone, and the raw tensor
-    /// here is larger than both candidates together.
-    #[test]
-    fn allocation_excludes_a_raw_tensor_from_the_ranking_and_the_budget() {
-        let mut tensors = vec![
-            planned(Encoding::Native(NativeEncoding::Q4AS32DT64), false, None),
-            planned(Encoding::Native(NativeEncoding::Q4AS32DT64), false, None),
-            planned(
-                Encoding::Raw(RawEncoding::F32),
-                false,
-                Some(FallbackReason::Rank),
-            ),
-        ];
-        tensors[0].screen_error = Some(0.4);
-        tensors[1].screen_error = Some(0.9);
-        tensors[2].elements = 4096;
-
-        allocate(&mut tensors, TcfOptions::from_profile(TCF_COMPACT)).expect("allocates");
-
-        assert!(!tensors[0].bumped);
-        assert!(tensors[1].bumped, "the worst-reconstructed candidate");
-        assert_eq!(
-            tensors[1].encoding,
-            Encoding::Native(NativeEncoding::Q6S16DT64)
-        );
-        assert!(!tensors[2].bumped, "a raw tensor is no candidate");
-        assert_eq!(tensors[2].encoding, Encoding::Raw(RawEncoding::F32));
-    }
-
-    /// A tensor the bump encoding cannot represent stays at the base, and is
-    /// no more a candidate than a raw one is.
-    #[test]
-    fn a_tensor_the_bump_encoding_refuses_is_no_candidate() {
-        let base = Encoding::Native(NativeEncoding::Q4AS32DT64);
-        let mut tensors = vec![planned(base, false, None), planned(base, false, None)];
-        tensors[0].screen_error = Some(0.9);
-        tensors[0].bumpable = false;
-        tensors[1].screen_error = Some(0.1);
-
-        allocate(&mut tensors, TcfOptions::from_profile(TCF_COMPACT)).expect("allocates");
-
-        assert!(!tensors[0].bumped, "the bump encoding refuses these values");
-        assert!(tensors[1].bumped);
-    }
-
-    /// `TCF-REF` names no bump encoding, so every tensor keeps the base.
-    #[test]
-    fn a_flat_profile_bumps_nothing() {
-        let mut tensors = vec![planned(
-            Encoding::Native(NativeEncoding::Q8S32T64),
-            false,
-            None,
-        )];
-        allocate(&mut tensors, TcfOptions::from_profile(TCF_REF)).expect("allocates");
-        assert!(!tensors[0].bumped);
-    }
-
-    /// A `--tcf-encoding` run has no profile, so nothing is bumped and the
-    /// encoding the flag named stands.
-    #[test]
-    fn a_run_without_a_profile_bumps_nothing() {
-        let options = TcfOptions::uniform(NativeEncoding::Q4S32T64, NativeEncoding::Q4S32T64);
-        let mut tensors = vec![planned(
-            Encoding::Native(NativeEncoding::Q4S32T64),
-            false,
-            None,
-        )];
-        allocate(&mut tensors, options).expect("allocates");
-        assert!(!tensors[0].bumped);
     }
 }

@@ -3,18 +3,22 @@
 //! A profile names three things — a base encoding, a bump encoding, and the
 //! fraction of quantizable parameters the bump covers. `PROFILES.md` Section 2
 //! fixes all three. compressr solves the allocation with the screen in
-//! [`crate::policy::allocation`] and writes the result; it never writes a
-//! profile name into the file, because a name is a claim about how the
-//! allocation was solved and compressr solves only part of it.
+//! [`crate::policy::allocation`], or with a measured sensitivity file when
+//! `--sensitivity` supplies one, and writes the result.
 //!
 //! # What a profile here is not
 //!
 //! `PROFILES.md` Section 4 solves a profile in six steps. Step 2 measures a
-//! task-metric delta on a 128-prompt calibration set, and that measurement is
-//! what separates a profile from a heuristic. compressr runs no model and
-//! holds no calibration set, so step 2 never runs and every sensitivity field
-//! stays unset. `ladder_bpw` is Section 2's arithmetic under Section 4's own
-//! allocation, so it is reported as a target and never as an achieved size.
+//! task-metric delta on a calibration set, and that measurement is what
+//! separates a profile from a heuristic. compressr runs no model, so it never
+//! takes that measurement: without `--sensitivity` step 2 does not run and
+//! every sensitivity field stays unset. `--sensitivity` supplies the
+//! measurement from a harness that did run the model, and the allocation is
+//! ranked by it — see [`crate::policy::sensitivity`]. compressr still writes
+//! no profile name into the file either way: a name is a claim about how the
+//! whole allocation was solved, and steps 4 and 6 have no compressr path.
+//! `ladder_bpw` is Section 2's arithmetic under Section 4's own allocation, so
+//! it is reported as a target and never as an achieved size.
 
 use anyhow::{bail, Result};
 use tcf_core::NativeEncoding;

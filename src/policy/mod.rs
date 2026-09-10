@@ -24,6 +24,8 @@ pub mod mix_components;
 pub mod mix_model;
 pub mod mix_report;
 pub mod mix_rules;
+pub mod sensitivity;
+pub mod sensitivity_rank;
 pub mod tensor_role;
 
 pub use allocation::{relative_rms_error, select_bumped, ScreenedTensor};
@@ -37,6 +39,8 @@ pub use mix_components::{
 pub use mix_model::{mix_model_facts, MixModel};
 pub use mix_report::{plan_format_label, quant_type_label, FormatUsage, MixEntry, MixReport};
 pub use mix_rules::{plan_mixed_tensor, step_down_unquantizable, use_more_bits, MixCounters};
+pub use sensitivity::{parse_sensitivity, SensitivityBaseline, SensitivityMeasurement};
+pub use sensitivity_rank::{select_bumped_measured, BumpCandidate, MeasuredBump};
 pub use tensor_role::{classify, is_quantizable_role, TensorRole, NEVER_QUANTIZED_SUBSTRINGS};
 
 use crate::loader::UnifiedDType;
