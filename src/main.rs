@@ -29,6 +29,19 @@
 //! compressr convert model/ --format tcf --tcf-profile balanced \
 //!     --tcf-objective rms-plus-abs
 //!
+//! # Weight the quantizer by an importance matrix. OPTIONAL: without the flag
+//! # the conversion writes exactly the bytes it always wrote
+//! compressr convert model/ --format gguf --quantization q4_k_m \
+//!     --imatrix model.imatrix
+//! compressr convert model/ --format tcf --tcf-profile balanced \
+//!     --imatrix model.imatrix
+//!
+//! # A TCF importance defaults to the product ggml's K-quant imatrix path
+//! # minimizes. Name the other form to score a measured tensor by the
+//! # importance alone, which is what ggml's Q6_K path does
+//! compressr convert model/ --format tcf --tcf-profile balanced \
+//!     --imatrix model.imatrix --tcf-importance combined
+//!
 //! # Rank that profile's bump set by a measured task-metric delta instead of
 //! # by the weight-error screen
 //! compressr convert model/ --format tcf --tcf-profile balanced \
@@ -55,9 +68,9 @@ mod quant_arg;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use compressr::{
-    parse_sensitivity, parse_tcf_encoding, parse_tcf_objective, parse_tcf_profile,
-    ConversionConfig, OutputFormat, QuantizationConfig, QuantizationMethod, SensitivityMeasurement,
-    TcfObjective, TcfOptions, TcfProfile,
+    parse_sensitivity, parse_tcf_encoding, parse_tcf_importance, parse_tcf_objective,
+    parse_tcf_profile, ConversionConfig, ImportanceMatrix, OutputFormat, QuantizationConfig,
+    QuantizationMethod, SensitivityMeasurement, TcfObjective, TcfOptions, TcfProfile,
 };
 use quant_arg::parse_quantization;
 
@@ -152,6 +165,20 @@ enum Commands {
         #[arg(long, value_name = "OBJECTIVE")]
         tcf_objective: Option<String>,
 
+        /// How a TCF --imatrix importance is applied (combined, replace)
+        ///
+        /// --format tcf with --imatrix only. combined is the default:
+        /// w = q * sqrt(sigma2 + x^2), the importance TIMES the data-derived
+        /// term ggml's K-quant imatrix path minimizes, with
+        /// sigma2 = 2 * mean(x^2). replace is w = q, the importance ALONE,
+        /// which is what ggml's Q6_K imatrix path passes and which replaces
+        /// the objective the tensor's encoding carries. Both apply to a
+        /// MEASURED tensor only: one the calibration run never exercised
+        /// keeps its encoding's objective either way, so a conversion with no
+        /// --imatrix is untouched by this flag and is refused for naming it.
+        #[arg(long, value_name = "FORM")]
+        tcf_importance: Option<String>,
+
         /// Measured task-metric sensitivity, as JSON lines
         ///
         /// One "baseline" record naming the model, the evaluation set and the
@@ -175,6 +202,28 @@ enum Commands {
         /// are counted and reported rather than skipped.
         #[arg(long, value_name = "FILE")]
         sensitivity: Option<String>,
+
+        /// Importance matrix, as boostr's `imatrix` example writes it
+        ///
+        /// OPTIONAL, and off unless this flag names a file: a conversion
+        /// without it writes exactly the bytes it always wrote, for every
+        /// format, and a file produced without one is a normal conforming
+        /// file. Producing a matrix costs a calibration run over a dataset.
+        ///
+        /// The file records, per weight, the mean squared activation each
+        /// input COLUMN saw. The quantizer then weights that weight's
+        /// reconstruction error by it, which changes which values the encoder
+        /// chooses and no bit layout.
+        ///
+        /// Accepted with --format gguf when the quantization is a K-quant
+        /// (q2_k, q3_k, q4_k, q5_k, q6_k) or a K-quant mix (q4_k_s, q4_k_m,
+        /// q5_k_s, q5_k_m), and with --format tcf. A tensor the matrix does
+        /// not measure is quantized UNWEIGHTED, and a tensor whose assigned
+        /// block format has no weighted writer is too; both are counted and
+        /// reported. A matrix whose column counts disagree with the
+        /// checkpoint is refused before any output file is created.
+        #[arg(long, value_name = "FILE")]
+        imatrix: Option<String>,
 
         /// Architecture written to GGUF's general.architecture (e.g. llama, qwen2)
         ///
@@ -267,7 +316,9 @@ fn main() -> Result<()> {
             tcf_preferred_encoding,
             tcf_profile,
             tcf_objective,
+            tcf_importance,
             sensitivity,
+            imatrix,
             arch,
             verbose,
         } => {
@@ -291,7 +342,14 @@ fn main() -> Result<()> {
                 .as_deref()
                 .map(parse_tcf_objective)
                 .transpose()?;
+            let tcf_importance = tcf_importance
+                .as_deref()
+                .map(parse_tcf_importance)
+                .transpose()?;
             let sensitivity = sensitivity.as_deref().map(read_sensitivity).transpose()?;
+            // Read before the output path is defaulted, so a file that is not
+            // an importance matrix fails before any directory is created.
+            let imatrix = imatrix.as_deref().map(read_imatrix).transpose()?;
 
             let output_path = output.unwrap_or_else(|| {
                 default_output_path(
@@ -326,6 +384,12 @@ fn main() -> Result<()> {
             }
             if let Some(tcf_objective) = tcf_objective {
                 config = config.with_tcf_objective(tcf_objective);
+            }
+            if let Some(tcf_importance) = tcf_importance {
+                config = config.with_tcf_importance(tcf_importance);
+            }
+            if let Some(imatrix) = imatrix {
+                config = config.with_importance(imatrix);
             }
             let measured = sensitivity.clone();
             // A measurement ranks whichever promotion set the output format
@@ -709,6 +773,11 @@ fn read_sensitivity(path: &str) -> Result<SensitivityMeasurement> {
     parse_sensitivity(&text).with_context(|| format!("Failed to parse '{path}'"))
 }
 
+/// Read the `--imatrix` file through boostr's own reader.
+fn read_imatrix(path: &str) -> Result<ImportanceMatrix> {
+    compressr::read_importance_matrix(std::path::Path::new(path))
+}
+
 fn parse_method(s: &str) -> Result<QuantizationMethod> {
     match s.to_lowercase().as_str() {
         "gptq" => Ok(QuantizationMethod::Gptq),
@@ -731,6 +800,7 @@ fn parse_method(s: &str) -> Result<QuantizationMethod> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+    use compressr::ImportanceForm;
 
     #[test]
     fn test_cli_definition_is_valid() {
@@ -858,6 +928,51 @@ mod tests {
                 assert_eq!(profile.name, "TCF-BALANCED");
                 assert_eq!(profile.bump_fraction, 0.15);
             }
+            _ => panic!("expected the convert subcommand"),
+        }
+    }
+
+    /// The importance-form flag parses, and a run that does not name it
+    /// names no form at all: the combined product is then the default the
+    /// conversion applies, and the replacement form is unreachable.
+    #[test]
+    fn test_convert_parses_the_tcf_importance_flag() {
+        let cli = Cli::try_parse_from([
+            "compressr",
+            "convert",
+            "model/",
+            "--format",
+            "tcf",
+            "--tcf-profile",
+            "balanced",
+            "--imatrix",
+            "model.imatrix",
+            "--tcf-importance",
+            "replace",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Convert { tcf_importance, .. } => {
+                let form =
+                    parse_tcf_importance(tcf_importance.as_deref().expect("the flag")).unwrap();
+                assert_eq!(form, ImportanceForm::Replace);
+            }
+            _ => panic!("expected the convert subcommand"),
+        }
+
+        let flagless = Cli::try_parse_from([
+            "compressr",
+            "convert",
+            "model/",
+            "--format",
+            "tcf",
+            "--tcf-profile",
+            "balanced",
+        ])
+        .unwrap();
+        match flagless.command {
+            Commands::Convert { tcf_importance, .. } => assert!(tcf_importance.is_none()),
             _ => panic!("expected the convert subcommand"),
         }
     }

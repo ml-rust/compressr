@@ -30,6 +30,7 @@
 //! - Block structures (BlockQ4K, BlockQ5K, etc.)
 
 mod config;
+mod gguf_kernel;
 mod quantizer;
 mod tensor;
 mod types;

@@ -53,6 +53,7 @@ use tcf_core::{Encoding, LogicalTile, NativeEncoding, Payload, TcfError, TcfWrit
 use super::allocate::allocate;
 use super::encoding::{values_f32, TensorShape};
 use super::encoding_table::TCF_ENCODING_NAMES;
+use super::importance::{columns_for, weights_for, EncoderPolicy};
 use super::ladder::ladder_encodings;
 use super::objective_report::report_objectives;
 use super::options::TcfOptions;
@@ -64,6 +65,9 @@ use super::record::{
 };
 use super::spill::PayloadSpill;
 use crate::formats::FormatWriter;
+use crate::importance::{
+    importance_layout_line, ImportanceCounts, ImportanceMatrix, ImportancePath,
+};
 use crate::loader::{LoadedModel, ModelLoader, UnifiedDType};
 use crate::policy::{SensitivityMeasurement, TcfPlan};
 use crate::quantization::QuantType;
@@ -110,6 +114,17 @@ pub struct TcfFormatWriter {
     /// The calibration this file declares, filled by
     /// [`TcfFormatWriter::declare_calibration`] for a measured run only
     calibration: Option<CalibrationFacts>,
+    /// The OPTIONAL importance matrix `--imatrix` supplied
+    ///
+    /// `None` is every run that named no file, which quantizes exactly as it
+    /// always has. A tensor this matrix does not measure is quantized
+    /// unweighted rather than against a synthesized zero vector.
+    importance: Option<ImportanceMatrix>,
+    /// How many tensors took each importance path, counted in pass 1 only
+    ///
+    /// Pass 2 requantizes some tensors from the same matrix, so counting
+    /// there too would double-count them.
+    importance_counts: ImportanceCounts,
     writer: Option<TcfWriter>,
 }
 
@@ -132,6 +147,8 @@ impl TcfFormatWriter {
             sensitivity: None,
             ladder: Vec::new(),
             calibration: None,
+            importance: None,
+            importance_counts: ImportanceCounts::default(),
             writer: None,
         }
     }
@@ -149,6 +166,16 @@ impl TcfFormatWriter {
     pub fn with_sensitivity(mut self, measurement: SensitivityMeasurement) -> Self {
         self.ladder = ladder_encodings(&measurement);
         self.sensitivity = Some(measurement);
+        self
+    }
+
+    /// Set the OPTIONAL importance matrix the quantizer weights measured
+    /// tensors by.
+    ///
+    /// Without it every tensor keeps the objective its encoding carries, and
+    /// the file is byte for byte what it was before this flag existed.
+    pub fn with_importance(mut self, matrix: ImportanceMatrix) -> Self {
+        self.importance = Some(matrix);
         self
     }
 
@@ -328,8 +355,12 @@ impl TcfFormatWriter {
         plan: &PlannedTensor,
         shape: &TensorShape,
         index: usize,
-        options: TcfOptions,
+        policy: EncoderPolicy<'_>,
     ) -> Result<Payload> {
+        let EncoderPolicy {
+            options,
+            importance,
+        } = policy;
         let name = plan.name.as_str();
         // The plan's own encoding drives this, not the run's base encoding: a
         // profile bumps some tensors, and quantizing one at the base here
@@ -351,13 +382,23 @@ impl TcfFormatWriter {
         // exists to prevent. For a tensor still at the base it is the
         // objective pass 1 used, so a payload recomputed here is the payload
         // the spill would have returned.
-        let objective = options.objective_for(encoding);
+        // The same matrix pass 1 read, looked up by the same name, so a
+        // tensor requantized here is scored exactly as it was scored then.
+        let columns = columns_for(importance, name);
+        let weights = weights_for(
+            options,
+            encoding,
+            columns.as_deref(),
+            shape.row_width(),
+            0,
+            values.len(),
+        )?;
         let tiles = quantize_named(
             &values,
             shape.extent(),
             shape.rank(),
             encoding.layout(),
-            objective.weights(),
+            weights.source(),
             name,
         )?;
         Ok(Payload::Quantized(tiles))
@@ -551,7 +592,22 @@ impl FormatWriter for TcfFormatWriter {
             })?
             .clone();
         let options = self.options()?;
-        let settled = settle(options, &registration, data, &self.ladder)?;
+        let columns = columns_for(self.importance.as_ref(), &registration.name);
+        let settled = settle(
+            options,
+            &registration,
+            data,
+            &self.ladder,
+            columns.as_deref(),
+        )?;
+        // Only a tensor the quantizer actually took is counted: one stored
+        // raw was never scored by any objective, weighted or not.
+        if self.importance.is_some() && matches!(settled.plan, TcfPlan::Quantize) {
+            self.importance_counts.record(match columns {
+                Some(_) => ImportancePath::Weighted,
+                None => ImportancePath::Absent,
+            });
+        }
         self.spill_payload(
             settled.tiles.as_deref(),
             options.encoding,
@@ -593,6 +649,14 @@ impl FormatWriter for TcfFormatWriter {
         // After the allocation, because the allocation is what fixes each
         // tensor's encoding and therefore each tensor's objective.
         report_objectives(&self.planned, options);
+        // After the objectives, because an importance changes what those
+        // lines just reported for every tensor it measured. Which change is
+        // the run's importance FORM, so the line names the form that ran.
+        if self.importance.is_some() {
+            log::info!("Importance: {}", self.importance_counts);
+            log::info!("{}", options.importance_form.report());
+            log::info!("{}", importance_layout_line("TCF v1"));
+        }
         self.declare_calibration()?;
         self.register_all()?;
         let writer = self
@@ -642,14 +706,24 @@ impl FormatWriter for TcfFormatWriter {
 
         let planned = &self.planned;
         let shapes = &self.shapes;
+        let importance = self.importance.as_ref();
         // A `produce` error must reach the caller as itself: TcfError has no
         // room for one, so the real error is kept here and raised below.
         let mut failure: Option<anyhow::Error> = None;
         let result = writer.finish_streaming(&mut sink, |index| {
             let produced = match (planned.get(index), shapes.get(index)) {
-                (Some(plan), Some(shape)) => {
-                    Self::payload(&source, &mut model, &mut spill, plan, shape, index, options)
-                }
+                (Some(plan), Some(shape)) => Self::payload(
+                    &source,
+                    &mut model,
+                    &mut spill,
+                    plan,
+                    shape,
+                    index,
+                    EncoderPolicy {
+                        options,
+                        importance,
+                    },
+                ),
                 _ => Err(anyhow!(
                     "TCF asked for tensor {index}, which was never planned"
                 )),

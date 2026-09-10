@@ -3,25 +3,28 @@
 //! Thin wrapper that dispatches to boostr's quantization kernels.
 //! compressr handles user-facing config; boostr does the heavy computation.
 //!
-//! Every GGUF block format is written by `boostr::QuantizeOps`, never here. A
-//! second writer in compressr can agree with compressr's own reader and still
-//! disagree with every real reader — that is exactly how Q6_K once shipped with
-//! a wrong field order. boostr's writers are also the accurate ones: their
-//! K-quant scales come from llama.cpp's iterative per-sub-block search, worth
-//! roughly a tenth of the quantization error against a plain absmax pick.
+//! Every GGUF block format is written by `boostr::QuantizeOps`, never here,
+//! through the single call in [`super::gguf_kernel`]. boostr's writers are
+//! also the accurate ones: their K-quant scales come from llama.cpp's
+//! iterative per-sub-block search, worth roughly a tenth of the quantization
+//! error against a plain absmax pick.
+//!
+//! An OPTIONAL importance matrix reaches those writers through
+//! [`Quantizer::quantize_tensor_weighted`]. It is off unless a run names one,
+//! and it selects a different writer for the five K-quants only.
 //!
 //! NF4 and FP8 stay here: neither is a GGUF block format, and boostr has no
 //! writer for either.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use half::f16;
 
 use super::config::QuantizationConfig;
+use super::gguf_kernel::quantize_gguf;
 use super::tensor::QuantizedTensor;
 use super::types::QuantType;
 
-use boostr::quant::{QuantFormat, QuantizeOps};
-use boostr::{CpuClient, CpuDevice, CpuRuntime, Tensor};
+use boostr::quant::QuantFormat;
 
 // Use boostr's quantization tables and codebooks
 use boostr::quant::tables::f32_to_fp8_e4m3;
@@ -80,6 +83,45 @@ impl Quantizer {
         dtype: crate::loader::UnifiedDType,
         quant_type: QuantType,
     ) -> Result<QuantizedTensor> {
+        self.quantize_tensor_weighted(data, shape, dtype, quant_type, None)
+    }
+
+    /// Quantize a tensor, weighting each COLUMN by `importance`.
+    ///
+    /// `importance` holds one non-negative entry per element of the LAST axis
+    /// — the axis quantization blocks along — so a `[out_features,
+    /// in_features]` weight takes `in_features` entries and every row indexes
+    /// the same vector. It comes from an importance matrix a calibration run
+    /// accumulated, and it is OPTIONAL: `None` is the plain
+    /// [`Quantizer::quantize_tensor_as`] path, which calls boostr's
+    /// unweighted entry point and produces the bytes every earlier run
+    /// produced.
+    ///
+    /// A tensor the matrix never measured is passed `None` by its caller and
+    /// quantized unweighted. A zero vector is never substituted: zero
+    /// importance is legal and says something else.
+    ///
+    /// # Errors
+    /// - `quant_type` has no importance-weighted writer and `importance` is
+    ///   `Some`. Silently dropping the vector would produce a file
+    ///   indistinguishable from an unweighted one.
+    /// - Whatever [`Quantizer::quantize_tensor_as`] raises, plus boostr's
+    ///   refusal of a vector whose length is not the last axis.
+    pub fn quantize_tensor_weighted(
+        &self,
+        data: &[u8],
+        shape: &[usize],
+        dtype: crate::loader::UnifiedDType,
+        quant_type: QuantType,
+        importance: Option<&[f32]>,
+    ) -> Result<QuantizedTensor> {
+        if importance.is_some() && !quant_type.has_importance_writer() {
+            bail!(
+                "{quant_type:?} has no importance-weighted quantize kernel in boostr, so an \
+                 importance matrix cannot change a byte of it. Weighted: Q2_K, Q3_K, Q4_K, \
+                 Q5_K, Q6_K."
+            );
+        }
         log::debug!(
             "Quantizing tensor: shape={:?}, dtype={}, type={:?}",
             shape,
@@ -104,14 +146,50 @@ impl Quantizer {
                     quant_type
                 )
             }
-            QuantType::Q4_0 => quantize_gguf(&f32_data, shape, QuantFormat::Q4_0, QuantType::Q4_0),
-            QuantType::Q4_1 => quantize_gguf(&f32_data, shape, QuantFormat::Q4_1, QuantType::Q4_1),
-            QuantType::Q8_0 => quantize_gguf(&f32_data, shape, QuantFormat::Q8_0, QuantType::Q8_0),
-            QuantType::Q2K => quantize_gguf(&f32_data, shape, QuantFormat::Q2K, QuantType::Q2K),
-            QuantType::Q3K => quantize_gguf(&f32_data, shape, QuantFormat::Q3K, QuantType::Q3K),
-            QuantType::Q4K => quantize_gguf(&f32_data, shape, QuantFormat::Q4K, QuantType::Q4K),
-            QuantType::Q5K => quantize_gguf(&f32_data, shape, QuantFormat::Q5K, QuantType::Q5K),
-            QuantType::Q6K => quantize_gguf(&f32_data, shape, QuantFormat::Q6K, QuantType::Q6K),
+            QuantType::Q4_0 => {
+                quantize_gguf(&f32_data, shape, QuantFormat::Q4_0, QuantType::Q4_0, None)
+            }
+            QuantType::Q4_1 => {
+                quantize_gguf(&f32_data, shape, QuantFormat::Q4_1, QuantType::Q4_1, None)
+            }
+            QuantType::Q8_0 => {
+                quantize_gguf(&f32_data, shape, QuantFormat::Q8_0, QuantType::Q8_0, None)
+            }
+            QuantType::Q2K => quantize_gguf(
+                &f32_data,
+                shape,
+                QuantFormat::Q2K,
+                QuantType::Q2K,
+                importance,
+            ),
+            QuantType::Q3K => quantize_gguf(
+                &f32_data,
+                shape,
+                QuantFormat::Q3K,
+                QuantType::Q3K,
+                importance,
+            ),
+            QuantType::Q4K => quantize_gguf(
+                &f32_data,
+                shape,
+                QuantFormat::Q4K,
+                QuantType::Q4K,
+                importance,
+            ),
+            QuantType::Q5K => quantize_gguf(
+                &f32_data,
+                shape,
+                QuantFormat::Q5K,
+                QuantType::Q5K,
+                importance,
+            ),
+            QuantType::Q6K => quantize_gguf(
+                &f32_data,
+                shape,
+                QuantFormat::Q6K,
+                QuantType::Q6K,
+                importance,
+            ),
             // Q5_0, Q5_1, Q8_1 and FP4 have a GGML block layout and no writer
             // in boostr, so a mix never assigns one and a direct caller is
             // told rather than handed a nearby format.
@@ -252,58 +330,4 @@ impl Quantizer {
             block_size: 1,
         })
     }
-}
-
-/// Quantize into a GGUF block format with boostr's writer kernels.
-///
-/// boostr packs blocks along the LAST axis of `shape`, so a
-/// `[out_features, in_features]` weight blocks along `in_features` — the same
-/// axis GGUF calls `ne[0]`. It requires that axis to be a whole number of
-/// blocks, which [`crate::policy::plan_tensor`] already checks before a tensor
-/// gets here; its error is surfaced rather than swallowed, because the two
-/// rules drifting apart is precisely the failure worth seeing.
-///
-/// The returned blocks carry their own scales inside them, so
-/// [`QuantizedTensor::scales`] stays empty for every format written this way.
-fn quantize_gguf(
-    data: &[f32],
-    shape: &[usize],
-    format: QuantFormat,
-    quant_type: QuantType,
-) -> Result<QuantizedTensor> {
-    let numel: usize = shape.iter().product();
-    if shape.is_empty() || numel != data.len() {
-        bail!(
-            "shape {:?} describes {} elements but the tensor has {}",
-            shape,
-            numel,
-            data.len()
-        );
-    }
-
-    let device = CpuDevice::new();
-    let client = CpuClient::new(device.clone());
-    let input = Tensor::<CpuRuntime>::from_slice(data, shape, &device).map_err(|e| {
-        anyhow!(
-            "failed to stage tensor for {} quantization: {e}",
-            format.name()
-        )
-    })?;
-
-    let quantized = client
-        .quantize(&input, format)
-        .map_err(|e| anyhow!("boostr {} quantization failed: {e}", format.name()))?;
-
-    let packed_data = quantized
-        .to_bytes()
-        .map_err(|e| anyhow!("failed to read back {} blocks: {e}", format.name()))?;
-
-    Ok(QuantizedTensor {
-        packed_data,
-        scales: Vec::new(),
-        original_shape: shape.to_vec(),
-        original_numel: numel,
-        quant_type,
-        block_size: format.block_size(),
-    })
 }

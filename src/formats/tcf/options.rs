@@ -16,6 +16,7 @@
 use tcf_core::NativeEncoding;
 
 use super::encoding_table::default_objective_for;
+use super::importance_form::ImportanceForm;
 use super::objective::{ObjectiveSource, TcfObjective};
 use super::profile::TcfProfile;
 
@@ -48,6 +49,13 @@ pub struct TcfOptions {
     /// `None` is the flagless run: every tensor takes the default its own
     /// encoding carries in the `encoding_table` module's one table.
     pub objective_override: Option<TcfObjective>,
+    /// How an `--imatrix` importance meets the values on a MEASURED tensor
+    ///
+    /// Read only where a tensor has an importance entry, so a run with no
+    /// matrix is untouched by it whatever it holds. The default is
+    /// [`ImportanceForm::Replace`], the importance alone, which a measurement
+    /// minimizes; `--tcf-importance replace` selects the importance alone.
+    pub importance_form: ImportanceForm,
 }
 
 impl TcfOptions {
@@ -58,6 +66,7 @@ impl TcfOptions {
             preferred_encoding,
             profile: None,
             objective_override: None,
+            importance_form: ImportanceForm::Replace,
         }
     }
 
@@ -72,6 +81,7 @@ impl TcfOptions {
             preferred_encoding: profile.base,
             profile: Some(profile),
             objective_override: None,
+            importance_form: ImportanceForm::Replace,
         }
     }
 
@@ -90,6 +100,25 @@ impl TcfOptions {
     /// `None` leaves every tensor on its own encoding's default.
     pub fn with_objective_override(mut self, objective: Option<TcfObjective>) -> Self {
         self.objective_override = objective;
+        self
+    }
+
+    /// Set how an `--imatrix` importance meets a measured tensor's values.
+    ///
+    /// It decides nothing on a run with no matrix: a tensor with no entry
+    /// never reaches the importance path at all.
+    pub fn with_importance_form(mut self, form: ImportanceForm) -> Self {
+        self.importance_form = form;
+        self
+    }
+
+    /// Set the importance form only when a run named one.
+    ///
+    /// `None` leaves the default, which is the combined product.
+    pub fn with_importance_form_override(mut self, form: Option<ImportanceForm>) -> Self {
+        if let Some(form) = form {
+            self.importance_form = form;
+        }
         self
     }
 
@@ -139,6 +168,32 @@ mod tests {
             Some(TcfObjective::Squared)
         );
         assert_eq!(flat.with_objective_override(None).objective_override, None);
+    }
+
+    /// An `--imatrix` run defaults to the combined product, and the
+    /// replacement form is reachable only by naming it.
+    #[test]
+    fn options_start_on_the_combined_importance_form() {
+        let flat = TcfOptions::uniform(NativeEncoding::Q4S32T64, NativeEncoding::Q4S32T64);
+        assert_eq!(flat.importance_form, ImportanceForm::Replace);
+        assert_eq!(
+            TcfOptions::from_profile(super::super::profile::TCF_COMPACT).importance_form,
+            ImportanceForm::Replace
+        );
+        assert_eq!(
+            flat.with_importance_form_override(None).importance_form,
+            ImportanceForm::Replace
+        );
+        assert_eq!(
+            flat.with_importance_form(ImportanceForm::Replace)
+                .importance_form,
+            ImportanceForm::Replace
+        );
+        assert_eq!(
+            flat.with_importance_form_override(Some(ImportanceForm::Replace))
+                .importance_form,
+            ImportanceForm::Replace
+        );
     }
 
     /// A flagless run resolves the objective from the TENSOR's encoding, so

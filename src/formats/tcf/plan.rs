@@ -49,6 +49,7 @@ use tcf_core::{encoding::dequantize, Encoding, LogicalTile, TcfError};
 use tcf_core::NativeEncoding;
 
 use super::encoding::{raw_encoding_for, values_f32, TensorShape};
+use super::importance::weights_for as importance_weights;
 use super::options::TcfOptions;
 use super::parallel::quantize_tensor;
 use super::screen::{bump_accepts, ladder_accepts};
@@ -168,11 +169,16 @@ pub(super) struct Settled {
 /// every tensor the allocation leaves at the base encoding, which is most of
 /// them, so recomputing them in pass 2 was the single largest avoidable cost
 /// in a conversion.
+///
+/// `importance` is the OPTIONAL per-column importance for THIS tensor, from
+/// an `--imatrix` run. `None` — no matrix, or a tensor the calibration run
+/// never exercised — leaves the tensor on the objective its encoding carries.
 pub(super) fn settle(
     options: TcfOptions,
     registration: &Registration,
     data: &[u8],
     ladder: &[NativeEncoding],
+    importance: Option<&[f32]>,
 ) -> Result<Settled> {
     let layout = options.encoding.layout();
     let plan = plan_tcf_tensor(
@@ -200,8 +206,23 @@ pub(super) fn settle(
     // quantizes at. A tensor an allocation later bumps is requantized in pass
     // 2 under the bump encoding's own objective, so neither pass reads an
     // objective belonging to an encoding it is not writing.
-    let weights = options.objective_for(options.encoding).weights();
-    match quantize_tensor(&values, shape.extent(), shape.rank(), layout, weights) {
+    // An importance measured for this tensor REPLACES that objective; a
+    // tensor with no entry keeps it. See [`super::importance`].
+    let weights = importance_weights(
+        options,
+        options.encoding,
+        importance,
+        shape.row_width(),
+        0,
+        values.len(),
+    )?;
+    match quantize_tensor(
+        &values,
+        shape.extent(),
+        shape.rank(),
+        layout,
+        weights.source(),
+    ) {
         Ok(tiles) => {
             // A row that holds a whole number of tiles covers the element
             // space in order, so the reconstruction lines up with `values`

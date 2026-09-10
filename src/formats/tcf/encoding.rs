@@ -164,6 +164,20 @@ impl TensorShape {
         self.rank
     }
 
+    /// The row length: the LAST dimension.
+    ///
+    /// This is the axis a tile runs along, and the axis an importance vector
+    /// carries one entry per, so it is what `tcf_core::column_weights` takes
+    /// as its `row_width`. A dimension that does not fit `usize` answers `0`,
+    /// which that function refuses rather than reading at a wrong stride.
+    pub fn row_width(&self) -> usize {
+        self.extent()
+            .last()
+            .copied()
+            .and_then(|width| usize::try_from(width).ok())
+            .unwrap_or(0)
+    }
+
     /// EXACTLY `rank` dimensions, which is what the codec accepts. Handing it
     /// the padded eight is `E_INVALID_RANK`.
     pub fn extent(&self) -> &[u64] {

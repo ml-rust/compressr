@@ -30,6 +30,19 @@ pub enum QuantType {
 }
 
 impl QuantType {
+    /// Whether boostr has an IMPORTANCE-WEIGHTED writer for this format.
+    ///
+    /// `ggml-quants.c` carries a second writer per K-quant, taken the moment
+    /// an importance matrix is supplied, and boostr reproduces those five.
+    /// Every other block format has one writer, which reads no importance, so
+    /// a matrix cannot change a single byte it produces.
+    pub fn has_importance_writer(&self) -> bool {
+        matches!(
+            self,
+            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K
+        )
+    }
+
     /// Get elements per block for this type
     pub fn block_size(&self) -> usize {
         match self {

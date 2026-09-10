@@ -32,6 +32,17 @@
 //!   half of the file under the objective measured for it. It changes which
 //!   values the encoder chooses and no bit layout, so the file stays a
 //!   conforming TCF v1 file
+//! - Importance matrix: `--imatrix FILE` weights the quantizer's choices by a
+//!   per-column mean square activation a calibration run accumulated
+//!   elsewhere. OPTIONAL and OFF by default — a run that names no file writes
+//!   the bytes it always wrote, for every format. Accepted with a K-quant
+//!   GGUF quantization, flat or a mix, and with TCF. A tensor the matrix does
+//!   not measure is quantized UNWEIGHTED. Inside TCF a measured tensor takes
+//!   the importance ALONE, which is ggml's Q6_K form and which a measurement
+//!   put ahead of the alternative, unless `--tcf-importance combined` selects
+//!   the importance TIMES `sqrt(sigma2 + x^2)`, the product ggml's K-quant
+//!   path minimizes. It changes which values the encoder chooses and no bit
+//!   layout, so the output stays a normal conforming file. See [`importance`]
 //! - GGUF task-metric allocation: the same four mixes, with the promotions
 //!   ranked by that measurement instead of by llama.cpp's positional rules,
 //!   spending the byte budget those rules would have spent. See
@@ -101,6 +112,7 @@
 
 pub mod cast;
 pub mod formats;
+pub mod importance;
 pub mod loader;
 pub mod policy;
 pub mod quantization;
@@ -111,10 +123,16 @@ pub mod python;
 pub use cast::{cast_bytes, parse_target_dtype, torch_dtype_name, ACCEPTED_DTYPE_NAMES};
 pub use formats::{
     default_objective_for, objective_policy, parse_shard_size, parse_tcf_encoding,
-    parse_tcf_objective, parse_tcf_profile, FormatWriter, GgufBatchWriter, GgufFormatWriter,
-    ObjectiveSource, PlannedTensor, SafeTensorsFormatWriter, StreamingGgufWriter, TcfFormatWriter,
-    TcfObjective, TcfOptions, TcfProfile, DEFAULT_MAX_SHARD_SIZE, TCF_ENCODING_NAMES,
-    TCF_OBJECTIVE_NAMES, TCF_PROFILE_NAMES,
+    parse_tcf_importance, parse_tcf_objective, parse_tcf_profile, FormatWriter, GgufBatchWriter,
+    GgufFormatWriter, ImportanceForm, ObjectiveSource, PlannedTensor, SafeTensorsFormatWriter,
+    StreamingGgufWriter, TcfFormatWriter, TcfObjective, TcfOptions, TcfProfile,
+    DEFAULT_MAX_SHARD_SIZE, TCF_ENCODING_NAMES, TCF_IMPORTANCE_NAMES, TCF_OBJECTIVE_NAMES,
+    TCF_PROFILE_NAMES,
+};
+pub use importance::{
+    check_importance_matrix, importance_columns, importance_layout_line, importance_source_line,
+    quantizable_widths, read_importance_matrix, resolve_importance, ImportanceCheck,
+    ImportanceCounts, ImportanceEntry, ImportanceMatrix, ImportancePath, IMPORTANCE_ACCEPTED,
 };
 pub use loader::{
     extract_layer_index, LayerGroup, LoadedModel, ModelLoader, ModelMetadata, TcfFileFacts,
@@ -244,6 +262,17 @@ pub struct ConversionConfig {
     /// stays a conforming TCF v1 file. Rejected by every format but
     /// [`OutputFormat::Tcf`].
     pub tcf_objective: Option<TcfObjective>,
+    /// How an `--imatrix` importance meets a MEASURED tensor's values
+    ///
+    /// `None` is the default form, which is the importance TIMES
+    /// `sqrt(sigma2 + x^2)` — the product ggml's K-quant imatrix path
+    /// minimizes. `Some(ImportanceForm::Replace)` scores a measured tensor by
+    /// the importance ALONE, which is the form ggml's Q6_K path takes and
+    /// replaces the objective the tensor's encoding carries. Requires
+    /// [`ConversionConfig::imatrix`], because both forms describe what to do
+    /// with an importance vector, and is rejected by every format but
+    /// [`OutputFormat::Tcf`].
+    pub tcf_importance: Option<ImportanceForm>,
     /// Measured task-metric sensitivity for the TCF profile's bump set
     ///
     /// Valid only alongside [`ConversionConfig::tcf_profile`], and only for a
@@ -264,6 +293,19 @@ pub struct ConversionConfig {
     /// [`policy::assign_mix`] and the base method is used only for the tensors
     /// no rule moves.
     pub gguf_mix: Option<GgufMix>,
+    /// OPTIONAL importance matrix the quantizer weights its choices by
+    ///
+    /// `None` is every run that named no `--imatrix` file, and its output is
+    /// byte for byte what it always was, for every format. `Some` weights
+    /// each tensor the matrix measured by that tensor's per-column mean
+    /// square activation; a tensor the calibration run never exercised is
+    /// quantized UNWEIGHTED, never against a synthesized zero vector.
+    ///
+    /// Accepted with a K-quant GGUF quantization, flat or a mix, and with
+    /// [`OutputFormat::Tcf`]. It changes which values the encoder chooses and
+    /// no bit layout, so the output stays a normal conforming file either
+    /// way. See [`importance`].
+    pub imatrix: Option<ImportanceMatrix>,
     /// Verbose logging
     pub verbose: bool,
 }
@@ -283,11 +325,21 @@ impl ConversionConfig {
             tcf: None,
             tcf_profile: None,
             tcf_objective: None,
+            tcf_importance: None,
             tcf_sensitivity: None,
             gguf_sensitivity: None,
             gguf_mix: None,
+            imatrix: None,
             verbose: false,
         }
+    }
+
+    /// Set the OPTIONAL importance matrix the quantizer weights its choices by
+    ///
+    /// Leaving it unset is the default and changes nothing about the output.
+    pub fn with_importance(mut self, matrix: ImportanceMatrix) -> Self {
+        self.imatrix = Some(matrix);
+        self
     }
 
     /// Set the llama.cpp mixed-precision allocation for a GGUF output
@@ -323,6 +375,16 @@ impl ConversionConfig {
         self
     }
 
+    /// Set how an `--imatrix` importance meets a measured tensor's values
+    ///
+    /// Unset leaves the combined product, which is what an `--imatrix` run
+    /// takes unless it names the other form. Either way a run with no
+    /// importance matrix is untouched.
+    pub fn with_tcf_importance(mut self, form: ImportanceForm) -> Self {
+        self.tcf_importance = Some(form);
+        self
+    }
+
     /// Set the measured task-metric sensitivity the bump set is ranked by
     pub fn with_tcf_sensitivity(mut self, measurement: SensitivityMeasurement) -> Self {
         self.tcf_sensitivity = Some(measurement);
@@ -341,11 +403,17 @@ impl ConversionConfig {
         // defaulted here: the default belongs to each TENSOR's encoding and
         // is resolved when that encoding is known.
         let objective = self.tcf_objective;
+        // The importance form rides on the same flag for the same reason. It
+        // decides nothing without `--imatrix`: a tensor with no entry never
+        // reaches the importance path.
+        let form = self.tcf_importance;
         match (self.tcf, self.tcf_profile) {
-            (Some(options), _) => Ok(options.with_objective_override(objective)),
-            (None, Some(profile)) => {
-                Ok(TcfOptions::from_profile(profile).with_objective_override(objective))
-            }
+            (Some(options), _) => Ok(options
+                .with_objective_override(objective)
+                .with_importance_form_override(form)),
+            (None, Some(profile)) => Ok(TcfOptions::from_profile(profile)
+                .with_objective_override(objective)
+                .with_importance_form_override(form)),
             (None, None) => bail!("Internal error: --format tcf reached convert with no encoding"),
         }
     }
@@ -563,6 +631,60 @@ impl ConversionConfig {
                 self.output_format,
                 TCF_OBJECTIVE_NAMES.join(", ")
             );
+        } else if self.tcf_importance.is_some() {
+            bail!(
+                "--tcf-importance applies to --format tcf only, but --format is {:?}. It names \
+                 the form an --imatrix importance takes inside TCF's quantizer, and every other \
+                 format's quantizer is not TCF's. Accepted forms: {}",
+                self.output_format,
+                TCF_IMPORTANCE_NAMES.join(", ")
+            );
+        }
+        // Both forms describe what to do with an importance vector, so a run
+        // that named one without a matrix selected nothing. Refused rather
+        // than ignored: such a run would get the flagless bytes and no way to
+        // tell the flag did nothing.
+        if self.tcf_importance.is_some() && self.imatrix.is_none() {
+            bail!(
+                "--tcf-importance was given without --imatrix. It names how an importance \
+                 matrix meets a measured tensor's values, and a run with no matrix measures \
+                 nothing, so there is no form to choose. Accepted forms: {}",
+                TCF_IMPORTANCE_NAMES.join(", ")
+            );
+        }
+        // An importance matrix weights a QUANTIZER's choices, so it needs one
+        // that can read it. Refused here rather than ignored: a run that
+        // supplied a matrix and got an unweighted file would have no way to
+        // tell.
+        if self.imatrix.is_some() {
+            match self.output_format {
+                // Every TCF encoding takes an explicit weight source.
+                OutputFormat::Tcf => {}
+                OutputFormat::Gguf => {
+                    // A mix is a K-quant mix throughout; the tensors it puts
+                    // in another format are quantized unweighted and counted.
+                    let weighted = self.gguf_mix.is_some()
+                        || self
+                            .quantization
+                            .as_ref()
+                            .is_some_and(|quant| quant.method.quant_type().has_importance_writer());
+                    if !weighted {
+                        bail!(
+                            "--imatrix needs a K-quant quantization for a GGUF output. boostr \
+                             has an importance-weighted writer for Q2_K, Q3_K, Q4_K, Q5_K and \
+                             Q6_K only, so every other block format would ignore the file \
+                             entirely. Accepted: {}.",
+                            IMPORTANCE_ACCEPTED
+                        );
+                    }
+                }
+                other => bail!(
+                    "--imatrix applies to {}, but --format is {:?}. It weights the choices a \
+                     quantizer makes, and this format's output runs none.",
+                    IMPORTANCE_ACCEPTED,
+                    other
+                ),
+            }
         }
         if let Some(dtype) = self.target_dtype {
             if !matches!(
@@ -884,6 +1006,9 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
         if let Some(name) = policy::model_name(Path::new(&config.input_path)) {
             tcf_writer = tcf_writer.with_module_name(&name);
         }
+        if let Some(matrix) = config.imatrix.clone() {
+            tcf_writer = tcf_writer.with_importance(matrix);
+        }
         if let Some(measurement) = config.tcf_sensitivity.clone() {
             log::info!(
                 "TCF sensitivity: {} measured tensors over {} evaluation rows at {}, \
@@ -928,6 +1053,20 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
 
     // Collect tensor info for registration (need to collect because we iterate twice)
     let tensor_info: Vec<(String, UnifiedTensorInfo)> = model.tensors().collect();
+
+    // A matrix whose column counts disagree with this checkpoint was
+    // accumulated over a DIFFERENT model, and importance read at the wrong
+    // width is worse than none. Checked at the first point the tensor list
+    // exists, and before any directory or output file is created.
+    if let Some(matrix) = config.imatrix.as_ref() {
+        let widths = importance::quantizable_widths(
+            tensor_info
+                .iter()
+                .map(|(name, info)| (name.as_str(), info.shape.as_slice())),
+        );
+        let check = importance::check_importance_matrix(matrix, &widths)?;
+        log::info!("{}", importance::importance_source_line(matrix, &check));
+    }
 
     // Decide once per tensor what happens to it. The registration loop reserves
     // the byte count and the write loop produces the bytes; a tensor the two
@@ -1038,6 +1177,7 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
     let mut output_size = 0u64;
     let mut counts = PlanCounts::default();
     let mut mix = MixReport::default();
+    let mut importance_counts = ImportanceCounts::default();
 
     for ((name, info), plan) in tensor_info.iter().zip(&plans) {
         if config.verbose {
@@ -1057,11 +1197,27 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
                 let quantizer = quantizer
                     .as_ref()
                     .context("Internal error: a tensor was planned for quantization but no quantizer is configured")?;
-                let quantized = quantizer.quantize_tensor_as(
+                // `None` without a matrix, and `None` for a tensor the
+                // calibration run never exercised or a block format with no
+                // weighted writer. Each of those three is counted apart.
+                let importance = match config.imatrix.as_ref() {
+                    Some(matrix) => {
+                        let (columns, path) = importance::resolve_importance(
+                            matrix,
+                            name,
+                            quant_type.has_importance_writer(),
+                        );
+                        importance_counts.record(path);
+                        columns
+                    }
+                    None => None,
+                };
+                let quantized = quantizer.quantize_tensor_weighted(
                     &tensor_data,
                     &info.shape,
                     info.dtype,
                     quant_type,
+                    importance.as_deref(),
                 )?;
                 quantized.packed_data
             }
@@ -1111,6 +1267,12 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
 
     if quantizer.is_some() {
         log::info!("Quantization: {}", counts);
+    }
+    // The TCF writer quantizes in a pass of its own and reports its own
+    // counts there, so this loop's counts describe a GGUF run only.
+    if config.imatrix.is_some() && config.output_format != OutputFormat::Tcf {
+        log::info!("Importance: {}", importance_counts);
+        log::info!("{}", importance::importance_layout_line("GGUF v3"));
     }
 
     // Step 6: Finalize
@@ -1338,6 +1500,93 @@ mod tests {
         )
     }
 
+    fn one_entry_matrix() -> ImportanceMatrix {
+        let mut matrix = ImportanceMatrix::new(2048);
+        matrix
+            .insert(ImportanceEntry {
+                name: "blk.0.attn_q.weight".to_string(),
+                rows: 2,
+                sums: vec![2.0, 6.0],
+            })
+            .expect("one entry");
+        matrix
+    }
+
+    fn quantization(method: QuantizationMethod) -> QuantizationConfig {
+        QuantizationConfig {
+            method,
+            bits: 4,
+            group_size: 128,
+            calibration_dataset: None,
+            calibration_samples: 0,
+        }
+    }
+
+    /// A format whose output runs no quantizer cannot read an importance
+    /// matrix, so the flag is refused naming everything it is accepted with.
+    #[test]
+    fn test_imatrix_is_refused_for_a_format_that_runs_no_quantizer() {
+        let config = ConversionConfig::new(
+            "input/".into(),
+            "out.safetensors".into(),
+            OutputFormat::Safetensors,
+        )
+        .with_importance(one_entry_matrix());
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("--imatrix applies to"), "{err}");
+        assert!(err.contains("--format tcf"), "{err}");
+        assert!(err.contains("q4_k"), "{err}");
+        assert!(!Path::new("out.safetensors").exists());
+    }
+
+    /// boostr weights the five K-quants and nothing else, so a GGUF run that
+    /// asks for a non-K format with a matrix is told rather than handed a
+    /// file the matrix did not touch.
+    #[test]
+    fn test_imatrix_is_refused_for_a_gguf_format_with_no_weighted_writer() {
+        let config = ConversionConfig::new("input/".into(), "out.gguf".into(), OutputFormat::Gguf)
+            .with_quantization(quantization(QuantizationMethod::Q8_0))
+            .with_importance(one_entry_matrix());
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("--imatrix needs a K-quant"), "{err}");
+        assert!(err.contains("Q6_K"), "{err}");
+        assert!(!Path::new("out.gguf").exists());
+    }
+
+    /// The three combinations the flag IS accepted with: a flat K-quant, a
+    /// K-quant mix, and TCF.
+    #[test]
+    fn test_imatrix_is_accepted_for_a_k_quant_a_mix_and_tcf() {
+        ConversionConfig::new("input/".into(), "out.gguf".into(), OutputFormat::Gguf)
+            .with_quantization(quantization(QuantizationMethod::Q4K))
+            .with_importance(one_entry_matrix())
+            .validate()
+            .expect("a flat K-quant takes an importance matrix");
+
+        ConversionConfig::new("input/".into(), "out.gguf".into(), OutputFormat::Gguf)
+            .with_quantization(quantization(QuantizationMethod::Q4K))
+            .with_gguf_mix(parse_gguf_mix("q4_k_m").expect("a mix name"))
+            .with_importance(one_entry_matrix())
+            .validate()
+            .expect("a K-quant mix takes an importance matrix");
+
+        ConversionConfig::new("input/".into(), "out.tcf".into(), OutputFormat::Tcf)
+            .with_tcf(tcf_options())
+            .with_importance(one_entry_matrix())
+            .validate()
+            .expect("TCF takes an importance matrix");
+    }
+
+    /// A conversion that names no matrix carries none, which is what keeps a
+    /// flagless run on the unweighted writer.
+    #[test]
+    fn test_a_flagless_run_carries_no_importance_matrix() {
+        let config = ConversionConfig::new("input/".into(), "out.gguf".into(), OutputFormat::Gguf)
+            .with_quantization(quantization(QuantizationMethod::Q4K));
+        assert!(config.imatrix.is_none());
+        config.validate().expect("a flagless K-quant run validates");
+    }
+
     /// The module's preferred encoding decides which tensors record a
     /// fallback reason, and no checkpoint carries it. Guessing one would put
     /// a policy compressr never made into the file, so the configuration is
@@ -1465,6 +1714,94 @@ mod tests {
         }
         // The objective moves no encoding: the profile still names its base.
         assert_eq!(profiled.encoding, tcf_core::NativeEncoding::Q4AS32DT64);
+    }
+
+    /// An `--imatrix` TCF run takes the combined product unless it names the
+    /// other form, and the replacement form is reachable only by naming it.
+    #[test]
+    fn test_the_imatrix_form_defaults_to_combined_and_replace_is_explicit() {
+        let combined = ConversionConfig::new("input/".into(), "out.tcf".into(), OutputFormat::Tcf)
+            .with_tcf(tcf_options())
+            .with_importance(one_entry_matrix());
+        assert!(combined.validate().is_ok());
+        assert_eq!(combined.tcf_importance, None);
+        assert_eq!(
+            combined.tcf_options().unwrap().importance_form,
+            ImportanceForm::Replace
+        );
+
+        let replaced = ConversionConfig::new("input/".into(), "out.tcf".into(), OutputFormat::Tcf)
+            .with_tcf(tcf_options())
+            .with_importance(one_entry_matrix())
+            .with_tcf_importance(ImportanceForm::Replace);
+        assert!(replaced.validate().is_ok());
+        assert_eq!(
+            replaced.tcf_options().unwrap().importance_form,
+            ImportanceForm::Replace
+        );
+
+        // The form reaches a profile run the same way it reaches a flat one.
+        let profiled = ConversionConfig::new("input/".into(), "out.tcf".into(), OutputFormat::Tcf)
+            .with_tcf_profile(parse_tcf_profile("compact").unwrap())
+            .with_importance(one_entry_matrix())
+            .with_tcf_importance(ImportanceForm::Replace);
+        assert!(profiled.validate().is_ok());
+        assert_eq!(
+            profiled.tcf_options().unwrap().importance_form,
+            ImportanceForm::Replace
+        );
+    }
+
+    /// A flagless run reaches neither form: it resolves every tensor to the
+    /// default its own encoding carries, which is what keeps its bytes the
+    /// bytes it always wrote.
+    #[test]
+    fn test_a_run_with_no_imatrix_takes_no_importance_form() {
+        let config = ConversionConfig::new("input/".into(), "out.tcf".into(), OutputFormat::Tcf)
+            .with_tcf(tcf_options());
+        assert!(config.validate().is_ok());
+        assert!(config.imatrix.is_none());
+        assert_eq!(config.tcf_importance, None);
+        let options = config.tcf_options().unwrap();
+        assert_eq!(options.objective_override, None);
+        assert_eq!(
+            options.objective_for(tcf_core::NativeEncoding::Q4S32T64),
+            TcfObjective::Uniform
+        );
+        assert_eq!(
+            options.objective_for(tcf_core::NativeEncoding::Q6S16DT64),
+            TcfObjective::RmsPlusAbs
+        );
+    }
+
+    /// The form describes what to do with an importance vector, so naming it
+    /// without a matrix is refused rather than silently ignored.
+    #[test]
+    fn test_the_imatrix_form_needs_a_matrix() {
+        let config = ConversionConfig::new("input/".into(), "out.tcf".into(), OutputFormat::Tcf)
+            .with_tcf(tcf_options())
+            .with_tcf_importance(ImportanceForm::Replace);
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("--tcf-importance was given without --imatrix"),
+            "{err}"
+        );
+        assert!(err.contains("combined"), "{err}");
+        assert!(err.contains("replace"), "{err}");
+    }
+
+    /// Every other format's quantizer is not TCF's, so the flag is refused
+    /// there naming the whole accepted set.
+    #[test]
+    fn test_the_imatrix_form_is_refused_for_another_format() {
+        let config = ConversionConfig::new("input/".into(), "out.gguf".into(), OutputFormat::Gguf)
+            .with_quantization(quantization(QuantizationMethod::Q4K))
+            .with_importance(one_entry_matrix())
+            .with_tcf_importance(ImportanceForm::Replace);
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("--tcf-importance"), "{err}");
+        assert!(err.contains("--format tcf only"), "{err}");
+        assert!(err.contains("replace"), "{err}");
     }
 
     /// A mixed profile with no flag resolves per tensor, never once per file:

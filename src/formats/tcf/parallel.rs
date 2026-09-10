@@ -33,10 +33,21 @@
 //! A group never spans two tiles and a chunk never splits a tile, so a group's
 //! weights are the same whichever chunk its tile lands in, and the chunked
 //! path scores exactly what the whole-tensor path scores. The one source that
-//! would need care is `WeightSource::Explicit`, whose slice is CHUNK-LOCAL:
-//! it has to be narrowed to the chunk before the call, which is what
+//! would need care is an importance source, whose slice is CHUNK-LOCAL: it
+//! has to be narrowed to the chunk before the call, which is what
 //! `WeightSource::slice` and `tcf_core::column_weights`'s `first_element` are
-//! for. compressr passes no explicit slice today.
+//! for. An `--imatrix` run does pass one —
+//! [`super::objective_weights::ResolvedWeights`] expands the per-column
+//! importance over the WHOLE tensor once, and the narrowing below cuts it
+//! exactly where the values are cut. Every element keeps the weight of the
+//! column it sits in, so the chunked path scores what a whole-tensor call
+//! scores under `WeightSource::Explicit` too.
+//!
+//! `WeightSource::Combined` adds a `sigma2` taken over the super-block, which
+//! is the one term that reads values outside the group. [`super::chunk`]
+//! rounds every chunk to a whole number of super-blocks, so a super-block
+//! never spans two chunks and its `sigma2` is the same value either path
+//! computes.
 
 use anyhow::{anyhow, Context, Result};
 use rayon::prelude::*;

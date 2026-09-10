@@ -24,12 +24,28 @@
 //!
 //! # Where an imatrix attaches
 //!
-//! `tcf_core::WeightSource::Explicit` is a per-ELEMENT slice parallel to the
-//! values of one call, and `tcf_core::column_weights` expands a per-COLUMN
-//! importance vector onto it. That is a fourth variant of [`TcfObjective`]
-//! carrying the vector, resolved to a `WeightSource` per call rather than
-//! once — see [`TcfObjective::weights`], which is the single point every call
-//! site already goes through.
+//! Not here. [`TcfObjective`] is a POLICY SELECTOR: it names a rule and
+//! carries no data, so it stays free of a lifetime and every type that stores
+//! it — `TcfOptions`, `ConversionConfig`, the public API — stays free of one
+//! too. An importance is data, per-COLUMN where `tcf-core` wants per-ELEMENT,
+//! so it is expanded at the point a tensor is quantized into the owning
+//! [`super::objective_weights::ResolvedWeights`], which
+//! [`super::importance::weights_for`] returns for both call sites.
+//!
+//! # An importance takes one of two forms, and `--tcf-importance` picks it
+//!
+//! llama.cpp splits rather than settling it: Q3_K, Q4_K and Q5_K multiply the
+//! importance by a data-derived term, and Q6_K passes the RAW importance.
+//! `tcf-core` defines both rules beside the bit positions —
+//! `WeightSource::Combined` and `WeightSource::Explicit` — so compressr
+//! selects one rather than computing a codec semantic of its own.
+//!
+//! The product is the default, because the encodings compressr ships at are
+//! the 4-bit and 6-bit tiers whose ggml counterparts are the K-quants.
+//! [`super::importance_form`] owns the choice and the flag.
+//!
+//! A tensor the calibration run never exercised takes NEITHER form: it keeps
+//! the objective its encoding carries, or the one `--tcf-objective` named.
 
 use anyhow::{bail, Result};
 use tcf_core::WeightSource;
@@ -41,9 +57,14 @@ pub const TCF_OBJECTIVE_NAMES: [&str; 3] = ["uniform", "squared", "rms-plus-abs"
 ///
 /// Every variant is VALUE-DERIVED: its weights come from the group's own
 /// values, so nothing outside the group is read and no caller supplies data.
-/// A group never spans two tiles and a chunk never splits a tile, so the
-/// choice is chunk-invariant: the threaded path scores what a whole-tensor
+/// A group never spans two tiles and a chunk never splits a tile, so all
+/// three are chunk-invariant: the threaded path scores what a whole-tensor
 /// call scores.
+///
+/// It carries no data on purpose. An importance matrix is data, and it
+/// reaches the quantizer through
+/// [`super::objective_weights::ResolvedWeights`] instead — see the module
+/// documentation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TcfObjective {
     /// `w_i = 1`: the plain squared reconstruction error.
@@ -60,12 +81,12 @@ pub enum TcfObjective {
 }
 
 impl TcfObjective {
-    /// The `tcf-core` weight source this objective names.
+    /// The `tcf-core` source that names this rule.
     ///
-    /// Every quantizer call site resolves its source here, so an objective
-    /// that carried data — an imatrix vector — would be expanded in this one
-    /// function and reach every call site unchanged.
-    pub fn weights(self) -> WeightSource<'static> {
+    /// It carries nothing and allocates nothing, which is why it is
+    /// `'static`: the weight is read from each group's own values inside
+    /// `tcf-core`.
+    pub fn source(self) -> WeightSource<'static> {
         match self {
             Self::Uniform => WeightSource::Uniform,
             Self::Squared => WeightSource::Squared,
@@ -103,6 +124,9 @@ impl TcfObjective {
 /// Case, underscores and hyphens are ignored, exactly as they are for an
 /// encoding name, so `rms-plus-abs`, `RMS_PLUS_ABS` and `rmsplusabs` are the
 /// same objective.
+///
+/// An importance has no name here on purpose: it is a vector, it comes from
+/// `--imatrix` and never from a flag value, and it is not an objective.
 ///
 /// # Errors
 /// The name is not one of [`TCF_OBJECTIVE_NAMES`].
@@ -159,10 +183,28 @@ mod tests {
     fn the_fallback_objective_is_uniform() {
         assert_eq!(TcfObjective::default(), TcfObjective::Uniform);
         assert!(TcfObjective::default().is_uniform());
-        assert!(TcfObjective::default().weights().is_uniform());
+        assert!(TcfObjective::default().source().is_uniform());
         assert!(!TcfObjective::Squared.is_uniform());
-        assert!(!TcfObjective::Squared.weights().is_uniform());
-        assert!(!TcfObjective::RmsPlusAbs.weights().is_uniform());
+        assert!(!TcfObjective::Squared.source().is_uniform());
+        assert!(!TcfObjective::RmsPlusAbs.source().is_uniform());
+    }
+
+    /// Every objective names a rule `tcf-core` derives from the group's own
+    /// values, so none of them carries data.
+    #[test]
+    fn every_objective_resolves_to_a_derived_source() {
+        assert!(matches!(
+            TcfObjective::Uniform.source(),
+            WeightSource::Uniform
+        ));
+        assert!(matches!(
+            TcfObjective::Squared.source(),
+            WeightSource::Squared
+        ));
+        assert!(matches!(
+            TcfObjective::RmsPlusAbs.source(),
+            WeightSource::RmsPlusAbs
+        ));
     }
 
     #[test]
