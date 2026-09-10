@@ -29,7 +29,7 @@ This section is the SINGLE source of truth on what works. Everything below assum
 | TCF quantization   | Q4S32_T64, Q4AS32_T64, Q4AS64_T64, Q6S32_T64, Q6S16D_T64, Q4AS32D_T64, Q8S32_T64 |
 | TCF threading      | One tensor's tile chunks quantize across rayon's pool, bytes unchanged |
 | dtype cast         | F32, F16, BF16, round-to-nearest-even                      |
-| GGUF quantization  | Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K                         |
+| GGUF quantization  | Q4_0, Q4_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K              |
 | Sidecar copying    | Tokenizer and config files follow the weights              |
 | GGUF mixed precision | Q4_K_S, Q4_K_M, Q5_K_S, Q5_K_M — llama.cpp's per-tensor allocation, reproduced from `llama_tensor_get_type` |
 | GGUF measured allocation | `--sensitivity` ranks a mix's promotions by measured task damage per element, spending the byte budget llama.cpp's positional rules would have spent on the same checkpoint |
@@ -48,7 +48,7 @@ This section is the SINGLE source of truth on what works. Everything below assum
 | Python API          | The PyO3 module exports `__version__` only                              |
 | Triple-buffered I/O | A prefetch/compute/write pipeline; reads and writes are serial today    |
 | Parallel shard I/O  | Reads are sequential; rayon parallelizes TCF quantization, never I/O    |
-| Q2_K, Q3_K and IQ mixes | A Q2_K/Q3_K/I-quant WRITER in boostr; `q2_k_s`, `q3_k_s`, `q3_k_m` and `q3_k_l` are refused by name |
+| Q2_K/Q3_K mixes, IQ mixes | Mix rules for Q2_K/Q3_K, and an I-quant WRITER in boostr; `q2_k`, `q2_k_s`, `q3_k_s`, `q3_k_m` and `q3_k_l` are refused by name |
 
 The `optimize` subcommand parses its flags but every method it accepts is a roadmap item, so it always errors.
 

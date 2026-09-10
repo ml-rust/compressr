@@ -107,15 +107,17 @@ impl Quantizer {
             QuantType::Q4_0 => quantize_gguf(&f32_data, shape, QuantFormat::Q4_0, QuantType::Q4_0),
             QuantType::Q4_1 => quantize_gguf(&f32_data, shape, QuantFormat::Q4_1, QuantType::Q4_1),
             QuantType::Q8_0 => quantize_gguf(&f32_data, shape, QuantFormat::Q8_0, QuantType::Q8_0),
+            QuantType::Q2K => quantize_gguf(&f32_data, shape, QuantFormat::Q2K, QuantType::Q2K),
+            QuantType::Q3K => quantize_gguf(&f32_data, shape, QuantFormat::Q3K, QuantType::Q3K),
             QuantType::Q4K => quantize_gguf(&f32_data, shape, QuantFormat::Q4K, QuantType::Q4K),
             QuantType::Q5K => quantize_gguf(&f32_data, shape, QuantFormat::Q5K, QuantType::Q5K),
             QuantType::Q6K => quantize_gguf(&f32_data, shape, QuantFormat::Q6K, QuantType::Q6K),
-            // Q5_0, Q5_1, Q8_1, Q2_K, Q3_K and FP4 have a GGML block layout
-            // and no writer in boostr, so a mix never assigns one and a direct
-            // caller is told rather than handed a nearby format.
+            // Q5_0, Q5_1, Q8_1 and FP4 have a GGML block layout and no writer
+            // in boostr, so a mix never assigns one and a direct caller is
+            // told rather than handed a nearby format.
             other => anyhow::bail!(
                 "{other:?} has no quantize kernel in boostr, so compressr cannot pack it. \
-                 Writable: Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K."
+                 Writable: Q4_0, Q4_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K."
             ),
         }
     }

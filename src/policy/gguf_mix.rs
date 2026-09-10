@@ -9,10 +9,11 @@
 //! place compressr's version approximates it.
 //!
 //! Q4_K_S, Q4_K_M, Q5_K_S and Q5_K_M draw only on Q4_K, Q5_K, Q6_K and Q8_0,
-//! which boostr writes. Q2_K, Q2_K_S, Q3_K_S, Q3_K_M and Q3_K_L need a Q2_K or
-//! Q3_K writer, and the IQ mixes need the I-quant grids; boostr reads those and
-//! writes none of them, so [`parse_gguf_mix`] refuses them by name rather than
-//! substituting a nearer format.
+//! which boostr writes. Q2_K, Q2_K_S, Q3_K_S, Q3_K_M and Q3_K_L need
+//! llama.cpp's Q2_K/Q3_K mix rules, which this module does not reproduce, even
+//! though boostr now writes flat Q2_K and Q3_K; the IQ mixes need the I-quant
+//! grids, which boostr neither reads nor writes. [`parse_gguf_mix`] refuses
+//! all of these by name rather than substituting a nearer format.
 //!
 //! Upstream matches GGUF tensor names; compressr writes the names its input
 //! carried, so [`super::tensor_role`] maps both onto one role set.
@@ -89,8 +90,8 @@ impl GgufMix {
 /// One spelling per mix, the one `llama-quantize` accepts.
 ///
 /// # Errors
-/// The name is a real llama.cpp mix whose base format has no writer in
-/// boostr, or it is not a mix name at all.
+/// The name is a real llama.cpp mix this module has no rule table for
+/// (Q2_K/Q3_K, or an I-quant grid), or it is not a mix name at all.
 pub fn parse_gguf_mix(name: &str) -> Result<GgufMix> {
     match name.to_ascii_lowercase().as_str() {
         "q4_k_s" => Ok(GgufMix::Q4KS),
@@ -98,8 +99,9 @@ pub fn parse_gguf_mix(name: &str) -> Result<GgufMix> {
         "q5_k_s" => Ok(GgufMix::Q5KS),
         "q5_k_m" => Ok(GgufMix::Q5KM),
         "q2_k" | "q2_k_s" | "q3_k_s" | "q3_k_m" | "q3_k_l" => bail!(
-            "Mix `{name}` is not implemented: its base format is Q2_K or Q3_K, and boostr \
-             has a reader for those but no writer, so compressr cannot pack them. \
+            "Mix `{name}` is not implemented: its base format is Q2_K or Q3_K, which \
+             boostr now writes, but this module has no llama.cpp mix rule table for \
+             either, so compressr cannot allocate the per-tensor exceptions. \
              Implemented mixes: {}.",
             GGUF_MIX_NAMES.join(", ")
         ),

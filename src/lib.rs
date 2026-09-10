@@ -13,11 +13,12 @@
 //! - SafeTensors out, sharded at a byte limit with a matching index
 //! - GGUF v3 out, one self-contained file
 //! - Element-type casts between F32, F16 and BF16, round-to-nearest-even
-//! - GGUF block quantization: Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K
+//! - GGUF block quantization: Q4_0, Q4_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K
 //! - GGUF mixed precision: Q4_K_S, Q4_K_M, Q5_K_S and Q5_K_M, which assign a
 //!   different block format per tensor by role and by layer, reproducing
-//!   llama.cpp's `llama_tensor_get_type`. Q2_K, Q3_K and the I-quant mixes are
-//!   refused by name: boostr reads those formats and writes none of them.
+//!   llama.cpp's `llama_tensor_get_type`. The Q2_K/Q3_K mixes and the I-quant
+//!   mixes are refused by name: each needs mix rules that do not exist here,
+//!   even though Q2_K and Q3_K are writable as flat formats.
 //! - TCF v1 out, quantized once from the full-precision source
 //! - TCF profile allocation: a base encoding plus a bump encoding on the
 //!   worst-reconstructed share of the parameters
@@ -383,7 +384,8 @@ impl ConversionConfig {
                 bail!(
                     "Quantization method {:?} is not implemented: compressr has no on-disk \
                      layout for its scales, so the output would carry packed weights that \
-                     nothing can dequantize. Implemented: q4_0, q4_1, q8_0, q4_k, q5_k, q6_k.",
+                     nothing can dequantize. Implemented: q4_0, q4_1, q8_0, q2_k, q3_k, \
+                     q4_k, q5_k, q6_k.",
                     quant.method
                 );
             }

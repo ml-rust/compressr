@@ -81,7 +81,7 @@ enum Commands {
         #[arg(short, long, value_name = "PATH")]
         output: Option<String>,
 
-        /// Quantization level (q4_0, q4_1, q8_0, q4_k, q5_k, q6_k, nf4, fp8)
+        /// Quantization level (q4_0, q4_1, q8_0, q2_k, q3_k, q4_k, q5_k, q6_k, nf4, fp8)
         ///
         /// Also accepts llama.cpp's mixed-precision names — q4_k_s, q4_k_m,
         /// q5_k_s, q5_k_m — which assign a different GGUF block format to
@@ -437,6 +437,8 @@ fn main() -> Result<()> {
                 QuantizationMethod::Q4_0
                 | QuantizationMethod::Q4_1
                 | QuantizationMethod::Q8_0
+                | QuantizationMethod::Q2K
+                | QuantizationMethod::Q3K
                 | QuantizationMethod::Q4K
                 | QuantizationMethod::Q5K
                 | QuantizationMethod::Q6K => OutputFormat::Gguf,
@@ -653,10 +655,12 @@ fn parse_method(s: &str) -> Result<QuantizationMethod> {
         "q4_0" => Ok(QuantizationMethod::Q4_0),
         "q4_1" => Ok(QuantizationMethod::Q4_1),
         "q8_0" => Ok(QuantizationMethod::Q8_0),
+        "q2_k" | "q2k" => Ok(QuantizationMethod::Q2K),
+        "q3_k" | "q3k" => Ok(QuantizationMethod::Q3K),
         "q4_k" | "q4k" => Ok(QuantizationMethod::Q4K),
         "q5_k" | "q5k" => Ok(QuantizationMethod::Q5K),
         "q6_k" | "q6k" => Ok(QuantizationMethod::Q6K),
-        _ => anyhow::bail!("Unsupported method: {}. Supported: gptq, awq, nf4, fp8, q4_0, q4_1, q8_0, q4_k, q5_k, q6_k", s),
+        _ => anyhow::bail!("Unsupported method: {}. Supported: gptq, awq, nf4, fp8, q4_0, q4_1, q8_0, q2_k, q3_k, q4_k, q5_k, q6_k", s),
     }
 }
 

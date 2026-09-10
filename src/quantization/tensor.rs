@@ -61,6 +61,8 @@ impl QuantizedTensor {
             QuantType::Q4_0 => self.dequantize_ggml(32, 18, dequant::dequant_q4_0),
             QuantType::Q8_0 => self.dequantize_ggml(32, 34, dequant::dequant_q8_0),
             QuantType::Q4_1 => self.dequantize_ggml(32, 20, dequant::dequant_q4_1),
+            QuantType::Q2K => self.dequantize_ggml(256, 84, dequant::dequant_q2k),
+            QuantType::Q3K => self.dequantize_ggml(256, 110, dequant::dequant_q3k),
             QuantType::Q4K => self.dequantize_ggml(256, 144, dequant::dequant_q4k),
             QuantType::Q5K => self.dequantize_ggml(256, 176, dequant::dequant_q5k),
             QuantType::Q6K => self.dequantize_ggml(256, 210, dequant::dequant_q6k),

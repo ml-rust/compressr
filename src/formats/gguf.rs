@@ -144,8 +144,8 @@ impl GgmlType {
             GgmlType::Q5_1 => 24, // 2 (scale) + 2 (min) + 4 (high bits) + 16 (low nibbles)
             GgmlType::Q8_0 => 34, // 2 (scale) + 32 (int8s)
             GgmlType::Q8_1 => 40, // 4 (scale) + 4 (sum) + 32 (int8s)
-            GgmlType::Q2K => 84,  // 2 + 2 + 16 + 64
-            GgmlType::Q3K => 110, // 2 + 32 + 64 + 12
+            GgmlType::Q2K => 84,  // 16 (scales) + 64 (qs) + 2 (d) + 2 (dmin)
+            GgmlType::Q3K => 110, // 32 (hmask) + 64 (qs) + 12 (scales) + 2 (d)
             GgmlType::Q4K => 144, // 2 + 2 + 12 + 128
             GgmlType::Q5K => 176, // 2 + 2 + 12 + 32 + 128
             GgmlType::Q6K => 210, // 128 (ql) + 64 (qh) + 16 (scales) + 2 (d, last)

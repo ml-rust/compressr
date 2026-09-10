@@ -24,8 +24,9 @@ pub struct QuantizationChoice {
 ///
 /// # Errors
 /// The value names no format, or it names a mix whose base format has no
-/// writer in boostr — Q2_K and Q3_K have a reader and no writer, so the
-/// `q2_k*` and `q3_k*` mixes are refused by name.
+/// writer in boostr — flat `q2_k` and `q3_k` are writable, but the
+/// `q2_k*` and `q3_k*` MIXES need llama.cpp's mix rules for them, which do
+/// not exist here, so those mixes are refused by name.
 pub fn parse_quantization(s: &str) -> Result<QuantizationChoice> {
     let lowered = s.to_lowercase();
 
@@ -45,14 +46,16 @@ pub fn parse_quantization(s: &str) -> Result<QuantizationChoice> {
         "q4_0" | "q4.0" => QuantizationMethod::Q4_0,
         "q4_1" | "q4.1" => QuantizationMethod::Q4_1,
         "q8_0" | "q8.0" => QuantizationMethod::Q8_0,
+        "q2_k" | "q2k" => QuantizationMethod::Q2K,
+        "q3_k" | "q3k" => QuantizationMethod::Q3K,
         "q4_k" | "q4k" => QuantizationMethod::Q4K,
         "q5_k" | "q5k" => QuantizationMethod::Q5K,
         "q6_k" | "q6k" => QuantizationMethod::Q6K,
         "nf4" => QuantizationMethod::Nf4,
         "fp8" => QuantizationMethod::Fp8,
         _ => anyhow::bail!(
-            "Unsupported quantization: {}. Flat formats: q4_0, q4_1, q8_0, q4_k, q5_k, \
-             q6_k, nf4, fp8. Mixed precision: {}.",
+            "Unsupported quantization: {}. Flat formats: q4_0, q4_1, q8_0, q2_k, q3_k, \
+             q4_k, q5_k, q6_k, nf4, fp8. Mixed precision: {}.",
             s,
             GGUF_MIX_NAMES.join(", ")
         ),
@@ -77,6 +80,8 @@ fn method_config(method: QuantizationMethod) -> QuantizationConfig {
     let (bits, group_size) = match method {
         QuantizationMethod::Q4_0 | QuantizationMethod::Q4_1 | QuantizationMethod::Nf4 => (4, 32),
         QuantizationMethod::Q8_0 => (8, 32),
+        QuantizationMethod::Q2K => (2, 256),
+        QuantizationMethod::Q3K => (3, 256),
         QuantizationMethod::Q4K => (4, 256),
         QuantizationMethod::Q5K => (5, 256),
         QuantizationMethod::Q6K => (6, 256),
