@@ -21,6 +21,9 @@ pub mod gguf_mix;
 pub mod mix_allocation;
 pub mod mix_assign;
 pub mod mix_components;
+pub mod mix_measured;
+pub mod mix_measured_encoding;
+pub mod mix_measured_report;
 pub mod mix_model;
 pub mod mix_report;
 pub mod mix_rules;
@@ -36,11 +39,17 @@ pub use mix_assign::{assign_mix, assign_mix_reported};
 pub use mix_components::{
     partition_components, principal_component, split_component, Component, UNLAYERED_COMPONENT,
 };
+pub use mix_measured::{assign_mix_measured, MeasuredTensor};
+pub use mix_measured_encoding::check_measurement_encoding;
+pub use mix_measured_report::MeasuredMixAllocation;
 pub use mix_model::{mix_model_facts, MixModel};
 pub use mix_report::{plan_format_label, quant_type_label, FormatUsage, MixEntry, MixReport};
 pub use mix_rules::{plan_mixed_tensor, step_down_unquantizable, use_more_bits, MixCounters};
 pub use sensitivity::{parse_sensitivity, SensitivityBaseline, SensitivityMeasurement};
-pub use sensitivity_rank::{select_bumped_measured, BumpCandidate, MeasuredBump};
+pub use sensitivity_rank::{
+    rank_candidates, select_bumped_measured, BumpCandidate, MeasuredBump, MeasuredRanking,
+    RankedCandidate,
+};
 pub use tensor_role::{classify, is_quantizable_role, TensorRole, NEVER_QUANTIZED_SUBSTRINGS};
 
 use crate::loader::UnifiedDType;

@@ -47,6 +47,30 @@ pub struct BumpCandidate<'a> {
     pub elements: u64,
 }
 
+/// One candidate's place in the measured order.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RankedCandidate {
+    /// The candidate's position in the caller's plan list
+    pub index: usize,
+    /// Elements in the tensor
+    pub elements: u64,
+    /// The measured task delta, always positive
+    pub delta: f64,
+}
+
+/// The measured order over one candidate set.
+///
+/// The order is the whole ranking, not a selection: what a budget can afford
+/// depends on what the budget is spent in, and that differs between a TCF
+/// profile (elements) and a GGUF mix (bytes). Both walk this same order.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MeasuredRanking {
+    /// Candidates with a positive delta, most damaged per element first
+    pub order: Vec<RankedCandidate>,
+    /// Candidates the measurement showed no damage on, so never promoted
+    pub excluded_nonpositive: usize,
+}
+
 /// What the measured ranking selected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeasuredBump {
@@ -71,7 +95,47 @@ pub fn select_bumped_measured(
     candidates: &[BumpCandidate<'_>],
     fraction: f64,
 ) -> Result<MeasuredBump> {
-    let mut ranked: Vec<(usize, f64, u64)> = Vec::with_capacity(candidates.len());
+    let ranking = rank_candidates(measurement, candidates)?;
+    if fraction <= 0.0 || candidates.is_empty() {
+        return Ok(MeasuredBump {
+            bumped: Vec::new(),
+            excluded_nonpositive: ranking.excluded_nonpositive,
+        });
+    }
+
+    let total: u64 = candidates.iter().map(|candidate| candidate.elements).sum();
+    let budget = total as f64 * fraction;
+
+    let mut spent = 0.0f64;
+    let mut bumped = Vec::new();
+    for ranked in ranking.order {
+        if spent >= budget {
+            break;
+        }
+        bumped.push(ranked.index);
+        spent += ranked.elements as f64;
+    }
+    bumped.sort_unstable();
+    Ok(MeasuredBump {
+        bumped,
+        excluded_nonpositive: ranking.excluded_nonpositive,
+    })
+}
+
+/// Put the candidates in measured order, most damaged per element first.
+///
+/// This is the ranking itself, with no budget: the caller decides what the
+/// budget is and what it is spent in. A candidate with a delta that is not
+/// positive is left out entirely rather than placed at the bottom, for the
+/// reason this module's header gives.
+///
+/// # Errors
+/// Any candidate has no record in the measurement.
+pub fn rank_candidates(
+    measurement: &SensitivityMeasurement,
+    candidates: &[BumpCandidate<'_>],
+) -> Result<MeasuredRanking> {
+    let mut order: Vec<RankedCandidate> = Vec::with_capacity(candidates.len());
     let mut unmatched: Vec<&str> = Vec::new();
     let mut excluded_nonpositive = 0usize;
     for candidate in candidates {
@@ -80,7 +144,11 @@ pub fn select_bumped_measured(
             continue;
         };
         if delta > 0.0 {
-            ranked.push((candidate.index, delta, candidate.elements));
+            order.push(RankedCandidate {
+                index: candidate.index,
+                elements: candidate.elements,
+                delta,
+            });
         } else {
             excluded_nonpositive += 1;
         }
@@ -91,33 +159,13 @@ pub fn select_bumped_measured(
             unmatched_error(measurement, &unmatched, candidates.len())
         );
     }
-    if fraction <= 0.0 || candidates.is_empty() {
-        return Ok(MeasuredBump {
-            bumped: Vec::new(),
-            excluded_nonpositive,
-        });
-    }
-
-    let total: u64 = candidates.iter().map(|candidate| candidate.elements).sum();
-    let budget = total as f64 * fraction;
-    ranked.sort_by(|left, right| {
-        per_element(right.1, right.2)
-            .total_cmp(&per_element(left.1, left.2))
-            .then(left.0.cmp(&right.0))
+    order.sort_by(|left, right| {
+        per_element(right.delta, right.elements)
+            .total_cmp(&per_element(left.delta, left.elements))
+            .then(left.index.cmp(&right.index))
     });
-
-    let mut spent = 0.0f64;
-    let mut bumped = Vec::new();
-    for (index, _, elements) in ranked {
-        if spent >= budget {
-            break;
-        }
-        bumped.push(index);
-        spent += elements as f64;
-    }
-    bumped.sort_unstable();
-    Ok(MeasuredBump {
-        bumped,
+    Ok(MeasuredRanking {
+        order,
         excluded_nonpositive,
     })
 }

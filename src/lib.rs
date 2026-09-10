@@ -23,6 +23,10 @@
 //!   worst-reconstructed share of the parameters
 //! - TCF task-metric allocation: the same profile, with the bump set ranked by
 //!   a measured sensitivity file instead
+//! - GGUF task-metric allocation: the same four mixes, with the promotions
+//!   ranked by that measurement instead of by llama.cpp's positional rules,
+//!   spending the byte budget those rules would have spent. See
+//!   [`policy::mix_measured`].
 //!
 //! A TCF profile is allocated from a WEIGHT-ERROR screen by default.
 //! `PROFILES.md` Section 4 step 2 measures a task-metric delta on a
@@ -106,13 +110,14 @@ pub use loader::{
     TcfModuleFacts, TcfTensorFacts, UnifiedDType, UnifiedTensorInfo,
 };
 pub use policy::{
-    assign_mix, assign_mix_reported, mix_model_facts, parse_gguf_mix, parse_sensitivity,
-    partition_components, plan_format_label, plan_mixed_tensor, plan_tcf_tensor, plan_tensor,
-    principal_component, quant_type_label, relative_rms_error, select_bumped,
-    select_bumped_measured, split_component, use_more_bits, BumpCandidate, ComponentAllocation,
-    FallbackReason, FormatUsage, GgufMix, LayerCountSource, MeasuredBump, MixAllocation, MixEntry,
-    MixModel, MixReport, PlanCounts, ScreenedTensor, SensitivityBaseline, SensitivityMeasurement,
-    TcfPlan, TensorPlan, TensorRole, GGUF_MIX_NAMES, UNLAYERED_COMPONENT,
+    assign_mix, assign_mix_measured, assign_mix_reported, check_measurement_encoding,
+    mix_model_facts, parse_gguf_mix, parse_sensitivity, partition_components, plan_format_label,
+    plan_mixed_tensor, plan_tcf_tensor, plan_tensor, principal_component, quant_type_label,
+    relative_rms_error, select_bumped, select_bumped_measured, split_component, use_more_bits,
+    BumpCandidate, ComponentAllocation, FallbackReason, FormatUsage, GgufMix, LayerCountSource,
+    MeasuredBump, MeasuredMixAllocation, MeasuredTensor, MixAllocation, MixEntry, MixModel,
+    MixReport, PlanCounts, ScreenedTensor, SensitivityBaseline, SensitivityMeasurement, TcfPlan,
+    TensorPlan, TensorRole, GGUF_MIX_NAMES, UNLAYERED_COMPONENT,
 };
 pub use quantization::{
     QuantType, QuantizationConfig, QuantizationMethod, QuantizedTensor, Quantizer,
@@ -223,6 +228,13 @@ pub struct ConversionConfig {
     /// profile that names a bump encoding. Without it the bump set is ranked
     /// by the weight-error screen and no sensitivity field is written.
     pub tcf_sensitivity: Option<SensitivityMeasurement>,
+    /// Measured task-metric sensitivity for a GGUF mix's promotion set
+    ///
+    /// Valid only alongside [`ConversionConfig::gguf_mix`]. Without it the
+    /// promotions come from llama.cpp's positional rules, which measured
+    /// nothing. With it the same byte budget is spent by measured task damage
+    /// instead. See [`policy::mix_measured`].
+    pub gguf_sensitivity: Option<SensitivityMeasurement>,
     /// llama.cpp mixed-precision allocation for a GGUF output
     ///
     /// Set alongside [`ConversionConfig::quantization`], whose method is the
@@ -249,6 +261,7 @@ impl ConversionConfig {
             tcf: None,
             tcf_profile: None,
             tcf_sensitivity: None,
+            gguf_sensitivity: None,
             gguf_mix: None,
             verbose: false,
         }
@@ -257,6 +270,12 @@ impl ConversionConfig {
     /// Set the llama.cpp mixed-precision allocation for a GGUF output
     pub fn with_gguf_mix(mut self, mix: GgufMix) -> Self {
         self.gguf_mix = Some(mix);
+        self
+    }
+
+    /// Set the measured task-metric sensitivity a GGUF mix's promotions follow
+    pub fn with_gguf_sensitivity(mut self, measurement: SensitivityMeasurement) -> Self {
+        self.gguf_sensitivity = Some(measurement);
         self
     }
 
@@ -340,6 +359,9 @@ impl ConversionConfig {
     /// - `--sensitivity` was given without a TCF profile that names a bump
     ///   encoding, or with a measurement taken at another encoding. A ranking
     ///   measured at one encoding does not transfer to another.
+    /// - `--sensitivity` was given for a GGUF output with no mixed-precision
+    ///   quantization, or with a measurement whose bit width does not suit the
+    ///   mix's base format. See [`policy::check_measurement_encoding`].
     ///
     /// Every check runs BEFORE any output file is created, because a mismatch
     /// caught by the writer instead surfaces halfway through the tensor loop
@@ -398,6 +420,26 @@ impl ConversionConfig {
                     mix.name()
                 );
             }
+        }
+        // A measurement ranks a promotion set against a budget. A flat
+        // quantization writes one format for every tensor, so it has no
+        // promotion set and nothing to rank.
+        if let Some(ref measurement) = self.gguf_sensitivity {
+            if self.output_format != OutputFormat::Gguf {
+                bail!(
+                    "--sensitivity was given for a GGUF mix, but --format is {:?}.",
+                    self.output_format
+                );
+            }
+            let Some(mix) = self.gguf_mix else {
+                bail!(
+                    "--sensitivity needs a mixed-precision quantization for a GGUF output. A \
+                     flat method writes one format for every tensor, so there is no promotion \
+                     set for a measurement to rank. Accepted mixes: {}.",
+                    GGUF_MIX_NAMES.join(", ")
+                );
+            };
+            policy::check_measurement_encoding(mix, measurement)?;
         }
         if self.output_format == OutputFormat::Tcf {
             // A TCF module record ranks the encodings its producer prefers,
@@ -569,6 +611,13 @@ pub struct ConversionStats {
     /// a layer count and a walk order, so a report that states the formats
     /// without stating those cannot be checked against llama.cpp.
     pub allocation: Option<MixAllocation>,
+    /// What a measured GGUF allocation did, against the positional one
+    ///
+    /// `Some` only for a `--sensitivity` run of a GGUF mix. It carries the
+    /// promotion counts of both policies, their overlap, the parameters the
+    /// measurement wanted to promote and GGUF's super-block could not hold,
+    /// and the bpw each achieved.
+    pub measured_allocation: Option<MeasuredMixAllocation>,
 }
 
 impl std::fmt::Display for ConversionStats {
@@ -823,6 +872,7 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
     // loops disagreed about would shift every later offset in the output file
     // without raising an error, so both read this one list.
     let mut allocation: Option<policy::MixAllocation> = None;
+    let mut measured_allocation: Option<policy::MeasuredMixAllocation> = None;
     let plans: Vec<TensorPlan> = match config.gguf_mix {
         // A mix assigns a format per tensor from its role and its layer, so
         // the plan list is built from that assignment rather than from one
@@ -840,13 +890,28 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
                 facts.n_expert,
                 if facts.is_70b { "on" } else { "off" }
             );
-            let (assigned, computed) = policy::assign_mix_reported(
-                mix,
-                tensor_info
-                    .iter()
-                    .map(|(name, info)| (name.as_str(), info.shape.as_slice())),
-                &facts,
-            );
+            // Without --sensitivity this is llama.cpp's positional
+            // allocation and nothing else, byte for byte.
+            let (assigned, computed) = match config.gguf_sensitivity.as_ref() {
+                Some(measurement) => {
+                    let measured_tensors: Vec<policy::MeasuredTensor<'_>> = tensor_info
+                        .iter()
+                        .map(|(name, info)| (name.as_str(), info.shape.as_slice(), info.dtype))
+                        .collect();
+                    let (assigned, positional, measured) =
+                        policy::assign_mix_measured(mix, &measured_tensors, &facts, measurement)?;
+                    log::info!("{measured}");
+                    measured_allocation = Some(measured);
+                    (assigned, positional)
+                }
+                None => policy::assign_mix_reported(
+                    mix,
+                    tensor_info
+                        .iter()
+                        .map(|(name, info)| (name.as_str(), info.shape.as_slice())),
+                    &facts,
+                ),
+            };
             // A model built from several transformer stacks is not the shape
             // upstream's rules were written for. The conversion still runs —
             // the per-role assignments are unchanged — but the log says what
@@ -1031,6 +1096,7 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
         elapsed_secs: elapsed,
         mix,
         allocation,
+        measured_allocation,
     };
 
     log::info!("Conversion complete: {}", stats);
@@ -1508,6 +1574,7 @@ mod tests {
             elapsed_secs: 30.5,
             mix: MixReport::default(),
             allocation: None,
+            measured_allocation: None,
         };
 
         let display = format!("{}", stats);

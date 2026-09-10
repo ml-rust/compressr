@@ -47,6 +47,18 @@ impl GgufMix {
         }
     }
 
+    /// The format a promoted tensor takes.
+    ///
+    /// All four mixes raise to `Q6_K`: it is what llama.cpp's rules put on
+    /// the output weight and on the selected attention-V and FFN-down
+    /// tensors. A measured allocation
+    /// ([`super::mix_measured::assign_mix_measured`]) draws on the same two
+    /// formats as the positional one, so the two differ in WHERE the bits go
+    /// and in nothing else.
+    pub fn promoted(self) -> QuantType {
+        QuantType::Q6K
+    }
+
     /// The name llama.cpp's `llama-quantize` accepts for this mix.
     pub fn name(self) -> &'static str {
         match self {

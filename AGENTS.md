@@ -32,6 +32,7 @@ This section is the SINGLE source of truth on what works. Everything below assum
 | GGUF quantization  | Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K                         |
 | Sidecar copying    | Tokenizer and config files follow the weights              |
 | GGUF mixed precision | Q4_K_S, Q4_K_M, Q5_K_S, Q5_K_M — llama.cpp's per-tensor allocation, reproduced from `llama_tensor_get_type` |
+| GGUF measured allocation | `--sensitivity` ranks a mix's promotions by measured task damage per element, spending the byte budget llama.cpp's positional rules would have spent on the same checkpoint |
 | Conversion report  | The format every tensor was written in, and the measured bits per weight |
 
 **Roadmap. Each has an enum variant and each is REFUSED before any output file is created:**

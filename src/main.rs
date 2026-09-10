@@ -135,13 +135,25 @@ enum Commands {
 
         /// Measured task-metric sensitivity, as JSON lines
         ///
-        /// Requires --tcf-profile with a bump encoding. One "baseline" record
-        /// naming the model, the evaluation set and the encoding measured,
-        /// then one "sensitivity" record per tensor carrying its task delta.
-        /// The profile's bump set is then ranked by measured damage per
-        /// element, and sensitivity_delta, sensitivity_samples and
-        /// calibration_id are written from the measurement. Without it the
-        /// ranking is a weight-error screen and those fields stay unset.
+        /// One "baseline" record naming the model, the evaluation set and the
+        /// encoding measured, then one "sensitivity" record per tensor
+        /// carrying its task delta. Whatever the promotion set is, it is
+        /// ranked by measured damage per element instead of by a rule that
+        /// measured nothing.
+        ///
+        /// With --format tcf: requires --tcf-profile with a bump encoding.
+        /// The profile's bump set is ranked by the measurement, and
+        /// sensitivity_delta, sensitivity_samples and calibration_id are
+        /// written from it. Without the flag the ranking is a weight-error
+        /// screen and those fields stay unset.
+        ///
+        /// With --format gguf: requires a mixed-precision --quantization
+        /// (q4_k_s, q4_k_m, q5_k_s, q5_k_m). The mix's promotions are then
+        /// ranked by the measurement, spending exactly the bytes llama.cpp's
+        /// positional rules would have spent on the same checkpoint, so the
+        /// two artifacts are size matched. Tensors whose row is not a whole
+        /// number of 256-element super-blocks cannot be promoted at all, and
+        /// are counted and reported rather than skipped.
         #[arg(long, value_name = "FILE")]
         sensitivity: Option<String>,
 
@@ -289,8 +301,13 @@ fn main() -> Result<()> {
                 config = config.with_tcf_profile(tcf_profile);
             }
             let measured = sensitivity.clone();
+            // A measurement ranks whichever promotion set the output format
+            // has: a TCF profile's bump set, or a GGUF mix's promotions.
             if let Some(measurement) = sensitivity {
-                config = config.with_tcf_sensitivity(measurement);
+                config = match output_format {
+                    OutputFormat::Gguf => config.with_gguf_sensitivity(measurement),
+                    _ => config.with_tcf_sensitivity(measurement),
+                };
             }
 
             let stats = compressr::convert(config)?;
@@ -311,6 +328,12 @@ fn main() -> Result<()> {
             // assume.
             if let Some(allocation) = &stats.allocation {
                 println!("{allocation}");
+            }
+            // With --sensitivity the line above is the allocation llama.cpp's
+            // rules WOULD have made, which is the budget this run matched.
+            // What was written is this.
+            if let Some(measured) = &stats.measured_allocation {
+                println!("{measured}");
             }
             if verbose && !stats.mix.entries().is_empty() {
                 // A mix moves a tensor OFF its base format, so marking those
