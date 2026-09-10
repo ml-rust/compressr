@@ -18,6 +18,40 @@ pub const TCF_ENCODING_NAMES: [&str; 7] = [
     "q8s32t64",
 ];
 
+/// One encoding name with its case, underscores and hyphens removed.
+///
+/// Two spellings of one encoding are one encoding. Every place that compares
+/// encoding names — the parser below, and the sensitivity file's per-encoding
+/// records — compares this form, so a file spelling `Q4AS32D_T64` and one
+/// spelling `q4as32dt64` name the same rung rather than two.
+pub fn normalized_encoding_name(s: &str) -> String {
+    s.chars()
+        .filter(|c| *c != '_' && *c != '-')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// The spelling `PROFILES.md` and a sensitivity file use for one encoding.
+///
+/// A report names encodings, and a ladder breaks a tie between two of them by
+/// name, so the name has to be one fixed string rather than whatever a caller
+/// happened to read out of a file.
+pub fn tcf_encoding_name(encoding: NativeEncoding) -> &'static str {
+    match encoding {
+        NativeEncoding::Q4S32T64 => "Q4S32_T64",
+        NativeEncoding::Q4AS32T64 => "Q4AS32_T64",
+        NativeEncoding::Q4AS32DT64 => "Q4AS32D_T64",
+        NativeEncoding::Q4AS64T64 => "Q4AS64_T64",
+        NativeEncoding::Q6S32T64 => "Q6S32_T64",
+        NativeEncoding::Q6S16DT64 => "Q6S16D_T64",
+        NativeEncoding::Q8S32T64 => "Q8S32_T64",
+        // `NativeEncoding` is `#[non_exhaustive]`: a rung tcf-core adds and
+        // compressr has no name for is reported by its identifier rather than
+        // by a name invented here.
+        _ => "unnamed TCF encoding",
+    }
+}
+
 /// Parse a `NativeEncoding` name.
 ///
 /// Bit width alone does not name a TCF encoding: symmetry and group size are
@@ -28,11 +62,7 @@ pub const TCF_ENCODING_NAMES: [&str; 7] = [
 /// # Errors
 /// The name is not one of [`TCF_ENCODING_NAMES`].
 pub fn parse_tcf_encoding(s: &str) -> Result<NativeEncoding> {
-    let normalized: String = s
-        .chars()
-        .filter(|c| *c != '_' && *c != '-')
-        .flat_map(char::to_lowercase)
-        .collect();
+    let normalized = normalized_encoding_name(s);
     match normalized.as_str() {
         "q4s32t64" => Ok(NativeEncoding::Q4S32T64),
         "q4as32t64" => Ok(NativeEncoding::Q4AS32T64),
@@ -212,6 +242,41 @@ impl TensorShape {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every encoding names itself, and that name parses back to it.
+    #[test]
+    fn a_name_round_trips_through_the_parser() {
+        for encoding in [
+            NativeEncoding::Q4S32T64,
+            NativeEncoding::Q4AS32T64,
+            NativeEncoding::Q4AS32DT64,
+            NativeEncoding::Q4AS64T64,
+            NativeEncoding::Q6S32T64,
+            NativeEncoding::Q6S16DT64,
+            NativeEncoding::Q8S32T64,
+        ] {
+            let name = tcf_encoding_name(encoding);
+            assert_eq!(
+                parse_tcf_encoding(name).expect("parses"),
+                encoding,
+                "{name}"
+            );
+        }
+    }
+
+    /// Case, underscores and hyphens never separate two spellings of one
+    /// encoding.
+    #[test]
+    fn one_encoding_has_one_normalized_name() {
+        assert_eq!(
+            normalized_encoding_name("Q4AS32D_T64"),
+            normalized_encoding_name("q4as32d-t64")
+        );
+        assert_ne!(
+            normalized_encoding_name("Q4AS32D_T64"),
+            normalized_encoding_name("Q4AS32_T64")
+        );
+    }
 
     #[test]
     fn parses_every_encoding_name() {

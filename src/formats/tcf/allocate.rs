@@ -11,6 +11,11 @@
 //! model compressr never runs, and [`crate::policy::sensitivity_rank`] ranks
 //! the same budget by measured task damage per element.
 //!
+//! A measurement that scored SEVERAL encodings per tensor is not a ranking at
+//! all: it is a menu, and [`super::ladder`] chooses one encoding per tensor
+//! from it under the same byte ceiling. That path allocates the whole profile
+//! and returns, so nothing below it runs.
+//!
 //! The selection is all this module does. Both rankings live in
 //! [`crate::policy`], and the record fields the measured path fills are
 //! written by [`super::record`].
@@ -20,6 +25,7 @@ use anyhow::{anyhow, Result};
 use tcf_core::Encoding;
 
 use super::encoding::TcfOptions;
+use super::ladder::allocate_ladder_profile;
 use super::plan::PlannedTensor;
 use crate::policy::{
     select_bumped, select_bumped_measured, BumpCandidate, ScreenedTensor, SensitivityMeasurement,
@@ -52,6 +58,17 @@ pub(super) fn allocate(
     let Some(profile) = options.profile else {
         return Ok(());
     };
+
+    // A measurement that scored several encodings per tensor makes the base a
+    // choice rather than a floor, so it allocates the whole profile — a flat
+    // one included, which has no bump set to rank but can still demote.
+    if let Some(measurement) = sensitivity {
+        measurement.check_encoding(profile.base)?;
+        if allocate_ladder_profile(planned, profile, measurement)? {
+            return Ok(());
+        }
+    }
+
     let Some(bump) = profile.bump else {
         log::info!(
             "TCF profile {}: {:?} for every quantizable tensor, no bump set",
@@ -188,7 +205,9 @@ mod tests {
             screen_error: fallback.is_none().then_some(0.1),
             elements: 64,
             bumpable: fallback.is_none(),
+            accepts: Vec::new(),
             bumped,
+            demoted: false,
             sensitivity_delta: None,
         }
     }
@@ -261,6 +280,30 @@ mod tests {
         tensors[0].screen_error = Some(0.9);
         tensors[1].screen_error = Some(0.1);
         tensors
+    }
+
+    /// A file measuring ONE encoding per tensor is the two-way allocation,
+    /// unchanged: the ranked subset is raised to the bump encoding and nothing
+    /// is demoted. This is the compatibility guarantee the ladder keeps.
+    #[test]
+    fn a_single_encoding_measurement_takes_the_two_way_path() {
+        let mut tensors = two_candidates();
+        let measured = measurement(&[("a.weight", 0.1), ("b.weight", 0.4)]);
+        assert!(!measured.is_ladder());
+
+        allocate(
+            &mut tensors,
+            TcfOptions::from_profile(TCF_COMPACT),
+            Some(&measured),
+        )
+        .expect("allocates");
+
+        // The file damages `b.weight` most per element, so it is the one
+        // bumped, and no two-way allocation demotes anything.
+        assert!(!tensors[0].bumped);
+        assert!(tensors[1].bumped);
+        assert!(!tensors[0].demoted);
+        assert!(!tensors[1].demoted);
     }
 
     /// A measured run ranks by the file, not by the screen, and records every

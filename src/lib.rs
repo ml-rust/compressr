@@ -115,8 +115,9 @@ pub use policy::{
     mix_model_facts, parse_gguf_mix, parse_sensitivity, partition_components, plan_format_label,
     plan_mixed_tensor, plan_tcf_tensor, plan_tensor, principal_component, quant_type_label,
     relative_rms_error, select_bumped, select_bumped_measured, split_component, use_more_bits,
-    BumpCandidate, ComponentAllocation, FallbackReason, FormatUsage, GgufMix, LayerCountSource,
-    MeasuredBump, MeasuredMixAllocation, MeasuredTensor, MixAllocation, MixEntry, MixModel,
+    BumpCandidate, ComponentAllocation, FallbackReason, FormatUsage, GgufMix, LadderChoice,
+    LadderMenu, LadderOption, LadderOutcome, LadderReport, LayerCountSource, MeasuredBump,
+    MeasuredMixAllocation, MeasuredOption, MeasuredTensor, MixAllocation, MixEntry, MixModel,
     MixReport, PlanCounts, ScreenedTensor, SensitivityBaseline, SensitivityMeasurement, TcfPlan,
     TensorPlan, TensorRole, GGUF_MIX_NAMES, UNLAYERED_COMPONENT,
 };
@@ -473,9 +474,9 @@ impl ConversionConfig {
                      meaning beside it."
                 );
             }
-            // A measurement ranks one set against one budget. Without a
-            // profile there is no bump set to rank, and a profile that names
-            // no bump encoding has nothing to raise a tensor to.
+            // A measurement ranks one set against one budget, or offers a
+            // menu per tensor. Without a profile there is neither: nothing
+            // names a base encoding to allocate against.
             if let Some(ref measurement) = self.tcf_sensitivity {
                 let Some(profile) = self.tcf_profile else {
                     bail!(
@@ -486,12 +487,19 @@ impl ConversionConfig {
                         TCF_PROFILE_NAMES.join(", ")
                     );
                 };
-                if profile.bump.is_none() {
+                // A flat profile has nothing to raise a tensor TO, so a file
+                // measured at one encoding can do nothing with it. A file
+                // measuring several is a menu, and a flat profile allocated
+                // from one can still put a tensor on a cheaper rung.
+                if profile.bump.is_none() && !measurement.is_ladder() {
                     bail!(
                         "--sensitivity was given with profile {}, which names no bump \
-                         encoding. Every tensor is written at {:?}, so there is no bump set \
-                         for a measurement to rank.",
+                         encoding, and the file measures one encoding ({}). Every tensor is \
+                         written at {:?}, so there is no bump set for a measurement to rank. \
+                         A file measuring several encodings per tensor is a menu, and a flat \
+                         profile can be allocated from one.",
                         profile.name,
+                        measurement.baseline().encoding,
                         profile.base
                     );
                 }

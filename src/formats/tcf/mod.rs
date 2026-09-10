@@ -20,14 +20,19 @@
 
 mod allocate;
 mod encoding;
+mod ladder;
+mod ladder_menu;
 mod parallel;
 mod plan;
 mod profile;
 mod record;
+mod screen;
 mod spill;
 mod writer;
 
-pub use encoding::{parse_tcf_encoding, TcfOptions, TCF_ENCODING_NAMES};
+pub use encoding::{
+    normalized_encoding_name, parse_tcf_encoding, tcf_encoding_name, TcfOptions, TCF_ENCODING_NAMES,
+};
 pub use plan::PlannedTensor;
 pub use profile::{parse_tcf_profile, TcfProfile, TCF_PROFILE_NAMES};
 pub use writer::TcfFormatWriter;

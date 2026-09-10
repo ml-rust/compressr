@@ -52,6 +52,7 @@ use tcf_core::{Encoding, LogicalTile, NativeEncoding, Payload, TcfError, TcfWrit
 
 use super::allocate::allocate;
 use super::encoding::{values_f32, TcfOptions, TensorShape, TCF_ENCODING_NAMES};
+use super::ladder::ladder_encodings;
 use super::parallel::quantize_named;
 use super::plan::{plan_one, reason_for, settle, PlannedTensor, Registration};
 use super::record::{
@@ -96,6 +97,13 @@ pub struct TcfFormatWriter {
     ///
     /// `None` runs the weight-error screen and writes no sensitivity field.
     sensitivity: Option<SensitivityMeasurement>,
+    /// Every encoding the measurement scores, which a ladder allocation may
+    /// reach and which each tensor is therefore screened against
+    ///
+    /// Empty without `--sensitivity`, and empty for a file measured at one
+    /// encoding: that file allocates two ways and reaches nothing but the
+    /// profile's base and bump.
+    ladder: Vec<NativeEncoding>,
     /// The calibration this file declares, filled by
     /// [`TcfFormatWriter::declare_calibration`] for a measured run only
     calibration: Option<CalibrationFacts>,
@@ -119,6 +127,7 @@ impl TcfFormatWriter {
             shapes: Vec::new(),
             spill: None,
             sensitivity: None,
+            ladder: Vec::new(),
             calibration: None,
             writer: None,
         }
@@ -135,6 +144,7 @@ impl TcfFormatWriter {
     /// Without this the ranking is the weight-error screen and every
     /// sensitivity field stays unset. See [`crate::policy::sensitivity`].
     pub fn with_sensitivity(mut self, measurement: SensitivityMeasurement) -> Self {
+        self.ladder = ladder_encodings(&measurement);
         self.sensitivity = Some(measurement);
         self
     }
@@ -529,7 +539,7 @@ impl FormatWriter for TcfFormatWriter {
             })?
             .clone();
         let options = self.options()?;
-        let settled = settle(options, &registration, data)?;
+        let settled = settle(options, &registration, data, &self.ladder)?;
         self.spill_payload(
             settled.tiles.as_deref(),
             options.encoding,

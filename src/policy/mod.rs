@@ -18,22 +18,35 @@
 pub mod allocation;
 pub mod config_facts;
 pub mod gguf_mix;
+pub mod ladder;
+pub mod ladder_report;
+pub mod ladder_rungs;
 pub mod mix_allocation;
 pub mod mix_assign;
+pub mod mix_bytes;
 pub mod mix_components;
+pub mod mix_ladder;
+pub mod mix_ladder_format;
 pub mod mix_measured;
 pub mod mix_measured_encoding;
 pub mod mix_measured_report;
 pub mod mix_model;
+pub mod mix_promote;
 pub mod mix_report;
 pub mod mix_rules;
+pub mod mix_spend;
+pub mod name_examples;
 pub mod sensitivity;
+pub mod sensitivity_options;
 pub mod sensitivity_rank;
+pub mod sensitivity_record;
 pub mod tensor_role;
 
 pub use allocation::{relative_rms_error, select_bumped, ScreenedTensor};
 pub use config_facts::{find_config_usize, LayerCountSource, LAYER_COUNT_KEYS};
 pub use gguf_mix::{parse_gguf_mix, GgufMix, GGUF_MIX_NAMES};
+pub use ladder::{allocate_ladder, LadderChoice, LadderMenu, LadderOption, LadderOutcome};
+pub use ladder_report::LadderReport;
 pub use mix_allocation::{ComponentAllocation, MixAllocation};
 pub use mix_assign::{assign_mix, assign_mix_reported};
 pub use mix_components::{
@@ -45,7 +58,9 @@ pub use mix_measured_report::MeasuredMixAllocation;
 pub use mix_model::{mix_model_facts, MixModel};
 pub use mix_report::{plan_format_label, quant_type_label, FormatUsage, MixEntry, MixReport};
 pub use mix_rules::{plan_mixed_tensor, step_down_unquantizable, use_more_bits, MixCounters};
+pub use name_examples::examples;
 pub use sensitivity::{parse_sensitivity, SensitivityBaseline, SensitivityMeasurement};
+pub use sensitivity_options::{MeasuredOption, MeasuredOptions};
 pub use sensitivity_rank::{
     rank_candidates, select_bumped_measured, BumpCandidate, MeasuredBump, MeasuredRanking,
     RankedCandidate,

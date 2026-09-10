@@ -31,10 +31,8 @@
 
 use anyhow::{bail, Result};
 
+use super::name_examples::examples;
 use super::SensitivityMeasurement;
-
-/// How many names each side of an unmatched-candidate error lists.
-const EXAMPLE_NAMES: usize = 5;
 
 /// One bump candidate offered to the measured ranking.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -194,21 +192,6 @@ fn unmatched_error(
         examples(unmatched),
         examples(&measurement.measured_names())
     )
-}
-
-/// Up to [`EXAMPLE_NAMES`] names, quoted, with a count of the rest.
-fn examples(names: &[&str]) -> String {
-    let shown: Vec<String> = names
-        .iter()
-        .take(EXAMPLE_NAMES)
-        .map(|name| format!("'{name}'"))
-        .collect();
-    let rest = names.len().saturating_sub(shown.len());
-    if rest == 0 {
-        shown.join(", ")
-    } else {
-        format!("{} and {rest} more", shown.join(", "))
-    }
 }
 
 #[cfg(test)]

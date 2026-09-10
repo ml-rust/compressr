@@ -46,8 +46,11 @@ use anyhow::{anyhow, Context, Result};
 
 use tcf_core::{encoding::dequantize, Encoding, LogicalTile, TcfError};
 
+use tcf_core::NativeEncoding;
+
 use super::encoding::{raw_encoding_for, values_f32, TcfOptions, TensorShape};
-use super::parallel::{accepts_tensor, quantize_tensor};
+use super::parallel::quantize_tensor;
+use super::screen::{bump_accepts, ladder_accepts};
 use crate::loader::UnifiedDType;
 use crate::policy::{
     plan_tcf_tensor, relative_rms_error, tcf_fallback_reason, FallbackReason, TcfPlan,
@@ -93,8 +96,21 @@ pub struct PlannedTensor {
     /// bump set is fixed before any payload is written, and a quantizer error
     /// during the payload pass would abort the run over a truncated file.
     pub bumpable: bool,
-    /// True when a profile allocation raised this tensor to its bump encoding
+    /// Encodings this tensor's VALUES can be written at
+    ///
+    /// The base encoding is not in it: a quantized tensor took the base by
+    /// definition. Every other entry was asked of the same values by
+    /// [`accepts_tensor`], because a ladder allocation may put this tensor at
+    /// any of them and the payload pass must never meet an encoding its record
+    /// already fixed.
+    pub accepts: Vec<NativeEncoding>,
+    /// True when an allocation raised this tensor above the profile's base
     pub bumped: bool,
+    /// True when a ladder allocation put this tensor BELOW the profile's base
+    ///
+    /// Only a measurement that scored the cheaper encoding on this tensor can
+    /// set it. A two-way allocation never demotes: its base is a floor.
+    pub demoted: bool,
     /// The tensor's measured task-metric delta, when `--sensitivity` gave one
     ///
     /// `None` for every run without the flag, and for a tensor the measurement
@@ -105,12 +121,14 @@ pub struct PlannedTensor {
 }
 
 /// What the screen learned about one quantizable tensor.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(super) struct Screen {
     /// Relative RMS reconstruction error at the base encoding
     pub(super) relative_rms: f64,
     /// True when the profile's bump encoding also accepts these values
     pub(super) bumpable: bool,
+    /// Every other encoding the ladder may reach that accepts these values
+    pub(super) accepts: Vec<NativeEncoding>,
 }
 
 /// One tensor's screening verdict, and the payload that verdict came from.
@@ -153,6 +171,7 @@ pub(super) fn settle(
     options: TcfOptions,
     registration: &Registration,
     data: &[u8],
+    ladder: &[NativeEncoding],
 ) -> Result<Settled> {
     let layout = options.encoding.layout();
     let plan = plan_tcf_tensor(
@@ -188,11 +207,13 @@ pub(super) fn settle(
             let relative_rms = relative_rms_error(&values, &reconstructed)
                 .with_context(|| format!("Failed to screen tensor '{name}'"))?;
             let bumpable = bump_accepts(options, &values, &shape, name)?;
+            let accepts = ladder_accepts(options, ladder, &values, &shape, registration)?;
             Ok(Settled {
                 plan: TcfPlan::Quantize,
                 screen: Some(Screen {
                     relative_rms,
                     bumpable,
+                    accepts,
                 }),
                 tiles: Some(tiles),
             })
@@ -213,50 +234,6 @@ pub(super) fn settle(
             Err(anyhow!(other)).with_context(|| format!("Failed to quantize tensor '{name}'"))
         }
     }
-}
-
-/// Whether the profile's bump encoding can represent these values.
-///
-/// Returns `false` when no profile names a bump encoding, and when the bump
-/// encoding refuses the values a base-encoded quantize accepted. That
-/// guarantees the payload pass never meets an encoding its record already
-/// fixed.
-///
-/// This is a representability question, so it is answered by
-/// [`accepts_tensor`] and never by a quantize. `accepts_tensor` reads each
-/// group once for its extremes and decides Section 13.1's two value-dependent
-/// rejections from those; a quantize would have searched 19 or 22 scale
-/// candidates per group, refined a sub-scale, built every tile, and then
-/// dropped all of it to keep one bool. The verdict is the same one, never an
-/// approximation of it: a group the extremes cannot settle runs the full fit.
-///
-/// The bump payload is not produced here, and it was not kept when it was. A
-/// profile bumps a small share of its candidates, so spilling every
-/// candidate's bump payload would write a second model's worth of bytes to
-/// save requantizing that share. The base payload is the opposite trade:
-/// every tensor the allocation leaves alone reads its own back.
-///
-/// # Errors
-/// The bump layout was refused for a reason that is not value-dependent.
-fn bump_accepts(
-    options: TcfOptions,
-    values: &[f32],
-    shape: &TensorShape,
-    name: &str,
-) -> Result<bool> {
-    let Some(bump) = options.profile.and_then(|profile| profile.bump) else {
-        return Ok(false);
-    };
-    let accepted = accepts_tensor(values, shape.extent(), shape.rank(), bump.layout())
-        .map_err(|e| anyhow!(e))
-        .with_context(|| format!("Failed to screen tensor '{name}' at {bump:?}"))?;
-    if !accepted {
-        log::warn!(
-            "Tensor '{name}' cannot be represented at {bump:?}: it stays at the base \
-             encoding and is no bump candidate"
-        );
-    }
-    Ok(accepted)
 }
 
 /// Keep one settled tensor's plan, at the base encoding.
@@ -290,15 +267,24 @@ pub(super) fn plan_one(
         ),
     };
 
+    // A raw tensor was never screened, so it has no error, no bump verdict
+    // and no ladder: it is a candidate for nothing.
+    let (screen_error, bumpable, accepts) = match screen {
+        Some(screen) => (Some(screen.relative_rms), screen.bumpable, screen.accepts),
+        None => (None, false, Vec::new()),
+    };
+
     Ok(PlannedTensor {
         name: registration.name.clone(),
         dtype: registration.dtype,
         fallback,
         encoding,
-        screen_error: screen.map(|screen| screen.relative_rms),
+        screen_error,
         elements,
-        bumpable: screen.is_some_and(|screen| screen.bumpable),
+        bumpable,
+        accepts,
         bumped: false,
+        demoted: false,
         sensitivity_delta: None,
     })
 }
@@ -318,7 +304,10 @@ pub(super) fn reason_for(plan: &PlannedTensor, options: TcfOptions) -> tcf_core:
     if let Some(reason) = plan.fallback {
         return tcf_fallback_reason(reason);
     }
-    if plan.bumped {
+    if plan.bumped || plan.demoted {
+        // A demotion is a task-sensitivity decision exactly as a promotion is:
+        // the measurement said this tensor takes no damage at the cheaper
+        // encoding, and the allocation spent the difference elsewhere.
         return tcf_core::FallbackReason::TaskSensitivity;
     }
     if plan.encoding == Encoding::Native(options.preferred_encoding) {
@@ -347,7 +336,9 @@ mod tests {
             screen_error: fallback.is_none().then_some(0.1),
             elements: 64,
             bumpable: fallback.is_none(),
+            accepts: Vec::new(),
             bumped,
+            demoted: false,
             sensitivity_delta: None,
         }
     }

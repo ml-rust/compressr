@@ -33,6 +33,7 @@ This section is the SINGLE source of truth on what works. Everything below assum
 | Sidecar copying    | Tokenizer and config files follow the weights              |
 | GGUF mixed precision | Q4_K_S, Q4_K_M, Q5_K_S, Q5_K_M — llama.cpp's per-tensor allocation, reproduced from `llama_tensor_get_type` |
 | GGUF measured allocation | `--sensitivity` ranks a mix's promotions by measured task damage per element, spending the byte budget llama.cpp's positional rules would have spent on the same checkpoint |
+| Measured ladder allocation | A `--sensitivity` file carrying one record per (tensor, encoding) pair is a MENU: each tensor's encoding is chosen from its measured options under the same byte budget, so a tensor measured as undamaged at a cheaper encoding is demoted instead of paying the base price. Both TCF profiles and GGUF mixes take this path; a file measuring one encoding still allocates two ways, byte for byte |
 | Conversion report  | The format every tensor was written in, and the measured bits per weight |
 
 **Roadmap. Each has an enum variant and each is REFUSED before any output file is created:**

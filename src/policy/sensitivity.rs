@@ -12,6 +12,16 @@
 //! flag neither runs, and the weight-error screen in [`super::allocation`] is
 //! unchanged.
 //!
+//! # One record per tensor, or one per (tensor, encoding) pair
+//!
+//! A file measured at ONE encoding carries one record per tensor, and says
+//! only what that encoding did: that is a two-way allocation's whole input.
+//! A file measuring SEVERAL encodings carries one record per (tensor,
+//! encoding) pair, each naming its own encoding and the payload bytes that
+//! pair costs. That is a menu, and [`super::ladder`] picks one rung per tensor
+//! from it. Both shapes parse here, and
+//! [`SensitivityMeasurement::encodings`] tells them apart.
+//!
 //! # Why the encoding must match
 //!
 //! A delta says how much task damage one encoding did to one tensor. At
@@ -19,13 +29,14 @@
 //! different order. A ranking therefore does not carry over, and a file
 //! measured elsewhere is refused rather than reused.
 
-use std::collections::HashMap;
-
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 use tcf_core::{hash_128, NativeEncoding};
 
 use crate::formats::parse_tcf_encoding;
+
+use super::sensitivity_options::{MeasuredOption, MeasuredOptions};
+use super::sensitivity_record::{read_record, PendingOption, SensitivityRecord};
 
 /// The measurement's identity, from the file's one `baseline` record.
 ///
@@ -48,27 +59,36 @@ pub struct SensitivityBaseline {
     pub baseline_total: f64,
 }
 
-/// A parsed sensitivity file: its identity, and one delta per tensor.
+/// A parsed sensitivity file: its identity, and every measured option.
 #[derive(Debug, Clone)]
 pub struct SensitivityMeasurement {
     baseline: SensitivityBaseline,
-    deltas: HashMap<String, f64>,
+    options: MeasuredOptions,
 }
 
 /// Read a JSON-lines sensitivity file.
 ///
-/// A `baseline` record and at least one `sensitivity` record are required.
-/// `skipped` records, and any record kind this version does not know, are
-/// ignored: the harness reports what it could not measure, and a tensor it
-/// could not measure is simply absent from the ranking.
+/// A `baseline` record and at least one `sensitivity` record are required. A
+/// `sensitivity` record may name its own `encoding` and its own payload
+/// `bytes`; one that names neither is the (tensor, baseline encoding) pair,
+/// which is what every file written before the ladder carries.
+///
+/// A `skipped` record is kept as a refusal rather than dropped: it names a
+/// pair the harness could not measure, and an allocator must not reach that
+/// pair from its own shape arithmetic. It is not a delta, so a tensor with
+/// nothing but skipped pairs is absent from every ranking. Any record kind
+/// this version does not know is ignored.
 ///
 /// # Errors
 /// A line is not JSON, a record is missing a field this reads, the file
-/// carries no baseline or no sensitivity record, or one tensor is measured
-/// twice.
+/// carries no baseline or no measured tensor, or one (tensor, encoding) pair
+/// is measured twice.
 pub fn parse_sensitivity(text: &str) -> Result<SensitivityMeasurement> {
     let mut baseline: Option<SensitivityBaseline> = None;
-    let mut deltas: HashMap<String, f64> = HashMap::new();
+    // A record may name no encoding, and the baseline that resolves it may be
+    // any line of the file, so the pairs are held until the whole file is
+    // read.
+    let mut pending: Vec<(String, PendingOption)> = Vec::new();
 
     for (offset, line) in text.lines().enumerate() {
         let number = offset + 1;
@@ -78,11 +98,8 @@ pub fn parse_sensitivity(text: &str) -> Result<SensitivityMeasurement> {
         }
         let value: Value = serde_json::from_str(line)
             .with_context(|| format!("Sensitivity file line {number} is not one JSON object"))?;
-        let kind = value.get("record").and_then(Value::as_str).ok_or_else(|| {
-            anyhow!("Sensitivity file line {number} has no \"record\" field naming its kind")
-        })?;
-        match kind {
-            "baseline" => {
+        match read_record(&value, number)? {
+            SensitivityRecord::Baseline(read) => {
                 if baseline.is_some() {
                     bail!(
                         "Sensitivity file line {number} is a second \"baseline\" record. One \
@@ -90,19 +107,10 @@ pub fn parse_sensitivity(text: &str) -> Result<SensitivityMeasurement> {
                          whose deltas do not compare."
                     );
                 }
-                baseline = Some(read_baseline(&value, number)?);
+                baseline = Some(read);
             }
-            "sensitivity" => {
-                let name = string_field(&value, "name", number)?;
-                let delta = f64_field(&value, "delta", number)?;
-                if deltas.insert(name.clone(), delta).is_some() {
-                    bail!(
-                        "Sensitivity file measures tensor '{name}' twice, so nothing names \
-                         which delta is this tensor's."
-                    );
-                }
-            }
-            _ => {}
+            SensitivityRecord::Measured { name, option } => pending.push((name, option)),
+            SensitivityRecord::Unknown => {}
         }
     }
 
@@ -112,13 +120,18 @@ pub fn parse_sensitivity(text: &str) -> Result<SensitivityMeasurement> {
              model or the row count the deltas were measured at."
         )
     })?;
-    if deltas.is_empty() {
+
+    let mut options = MeasuredOptions::default();
+    for (name, option) in pending {
+        options.insert(&name, option.resolve(&baseline.encoding))?;
+    }
+    if options.measured_tensors() == 0 {
         bail!(
             "Sensitivity file holds no \"sensitivity\" record, so there is no measured tensor \
              to rank."
         );
     }
-    Ok(SensitivityMeasurement { baseline, deltas })
+    Ok(SensitivityMeasurement { baseline, options })
 }
 
 impl SensitivityMeasurement {
@@ -127,22 +140,48 @@ impl SensitivityMeasurement {
         &self.baseline
     }
 
-    /// Tensors the file carries a delta for.
+    /// Tensors the file carries at least one delta for.
     pub fn measured(&self) -> usize {
-        self.deltas.len()
+        self.options.measured_tensors()
     }
 
     /// Every measured tensor name, ascending.
     pub fn measured_names(&self) -> Vec<&str> {
-        let mut names: Vec<&str> = self.deltas.keys().map(String::as_str).collect();
-        names.sort_unstable();
-        names
+        self.options.measured_names()
     }
 
-    /// One tensor's measured task delta, `None` when the file has no record
-    /// for that name.
+    /// One tensor's measured task delta at the encoding a two-way allocation
+    /// ranks from, `None` when the file has no such record for that name.
+    ///
+    /// This is the two-way read, and it is what every allocation made before
+    /// the ladder used. A tensor measured at exactly one encoding answers with
+    /// that encoding's delta; a tensor with a menu answers at the baseline
+    /// record's encoding, which is the one the file says it ranks from.
     pub fn delta_for(&self, name: &str) -> Option<f64> {
-        self.deltas.get(name).copied()
+        self.options.baseline_delta(name, &self.baseline.encoding)
+    }
+
+    /// Every option the file carries for one tensor, skipped pairs included.
+    ///
+    /// The skipped pairs are part of the answer: one says the harness could
+    /// not measure that tensor at that encoding, which is usually because the
+    /// tensor cannot take it at all.
+    pub fn options_for(&self, name: &str) -> &[MeasuredOption] {
+        self.options.options_for(name)
+    }
+
+    /// Distinct encodings the file measures, ascending.
+    ///
+    /// One encoding is a two-way file. More than one is a ladder, and
+    /// [`super::ladder`] picks one rung per tensor from the menu.
+    pub fn encodings(&self) -> Vec<&str> {
+        self.options.encodings()
+    }
+
+    /// True when the file measures more than one encoding, which is what a
+    /// ladder allocation needs and a two-way file does not carry.
+    pub fn is_ladder(&self) -> bool {
+        self.options.encodings().len() > 1
     }
 
     /// Check the measurement was taken at the encoding the profile bumps from.
@@ -223,49 +262,6 @@ impl SensitivityMeasurement {
     }
 }
 
-/// Read the one `baseline` record.
-fn read_baseline(value: &Value, number: usize) -> Result<SensitivityBaseline> {
-    let eval_rows = u64_field(value, "eval_rows", number)?;
-    Ok(SensitivityBaseline {
-        checkpoint: string_field(value, "ckpt", number)?,
-        dataset: string_field(value, "manifest", number)?,
-        encoding: string_field(value, "encoding", number)?,
-        eval_rows: u32::try_from(eval_rows).with_context(|| {
-            format!("Sensitivity file line {number} reports more eval rows than TCF records")
-        })?,
-        eval_seed: u64_field(value, "eval_seed", number)?,
-        baseline_total: f64_field(value, "baseline_total", number)?,
-    })
-}
-
-/// One string field, or an error naming it and its line.
-fn string_field(value: &Value, field: &str, number: usize) -> Result<String> {
-    value
-        .get(field)
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| anyhow!("Sensitivity file line {number} has no string field \"{field}\""))
-}
-
-/// One finite float field, or an error naming it and its line.
-fn f64_field(value: &Value, field: &str, number: usize) -> Result<f64> {
-    let read = value
-        .get(field)
-        .and_then(Value::as_f64)
-        .ok_or_else(|| anyhow!("Sensitivity file line {number} has no number field \"{field}\""))?;
-    if !read.is_finite() {
-        bail!("Sensitivity file line {number} has a non-finite \"{field}\"");
-    }
-    Ok(read)
-}
-
-/// One unsigned integer field, or an error naming it and its line.
-fn u64_field(value: &Value, field: &str, number: usize) -> Result<u64> {
-    value.get(field).and_then(Value::as_u64).ok_or_else(|| {
-        anyhow!("Sensitivity file line {number} has no unsigned integer field \"{field}\"")
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,8 +316,10 @@ mod tests {
         assert!(error.contains("line 1 is not one JSON object"), "{error}");
     }
 
+    /// One PAIR twice is what nothing can name a delta for. The record with
+    /// no encoding is the baseline encoding's, so this is the same pair.
     #[test]
-    fn a_tensor_measured_twice_is_refused() {
+    fn one_tensor_and_encoding_measured_twice_is_refused() {
         let doubled = format!(
             "{}\n{}",
             file(),
@@ -330,10 +328,40 @@ mod tests {
         let error = parse_sensitivity(&doubled)
             .expect_err("two deltas")
             .to_string();
-        assert!(
-            error.contains("measures tensor 'a.weight' twice"),
-            "{error}"
+        assert!(error.contains("'a.weight'"), "{error}");
+        assert!(error.contains("twice"), "{error}");
+    }
+
+    /// One tensor at two encodings is a menu, and both deltas are kept.
+    #[test]
+    fn one_tensor_at_two_encodings_is_a_menu() {
+        let laddered = format!(
+            "{}\n{}",
+            file(),
+            r#"{"record":"sensitivity","name":"a.weight","encoding":"Q6S16D_T64","delta":0.05,"bytes":210}"#
         );
+        let measurement = parse_sensitivity(&laddered).expect("parses");
+        assert!(measurement.is_ladder());
+        assert_eq!(measurement.encodings(), vec!["Q4AS32D_T64", "Q6S16D_T64"]);
+        assert_eq!(measurement.options_for("a.weight").len(), 2);
+        // The two-way read still answers at the baseline encoding.
+        assert_eq!(measurement.delta_for("a.weight"), Some(0.5));
+        // Two tensors, not three: the menu is one tensor's.
+        assert_eq!(measurement.measured(), 2);
+    }
+
+    /// A file measured at one encoding is not a ladder, and its skipped
+    /// records name no encoding of their own.
+    #[test]
+    fn a_two_way_file_is_not_a_ladder() {
+        let measurement = parse_sensitivity(&file()).expect("parses");
+        assert!(!measurement.is_ladder());
+        assert_eq!(measurement.encodings(), vec!["Q4AS32D_T64"]);
+        // The skipped pair is kept, at the baseline encoding.
+        let skipped = measurement.options_for("c.weight");
+        assert_eq!(skipped.len(), 1);
+        assert!(skipped[0].skipped);
+        assert_eq!(skipped[0].encoding, "Q4AS32D_T64");
     }
 
     /// The measurement is only a ranking of the encoding it was taken at.

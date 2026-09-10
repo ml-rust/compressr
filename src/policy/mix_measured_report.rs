@@ -12,8 +12,13 @@
 //! row is a whole number of 256-element super-blocks or it is nothing. That
 //! number is the direct evidence for or against a finer-grained container.
 
+use super::ladder_report::LadderReport;
+
 /// A measured GGUF allocation, and the positional one it is matched against.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Eq` is not derived: the ladder report it can carry holds measured damage,
+/// which is a float.
+#[derive(Debug, Clone, PartialEq)]
 pub struct MeasuredMixAllocation {
     /// The mix, as llama.cpp names it
     pub mix_name: String,
@@ -53,6 +58,13 @@ pub struct MeasuredMixAllocation {
     pub measured_bytes: u64,
     /// Elements over every tensor, quantized or not
     pub total_elements: u64,
+    /// What the ladder allocation did, when one ran
+    ///
+    /// `Some` when the sensitivity file measured several encodings per tensor,
+    /// which is what lets a tensor land BELOW the base format instead of only
+    /// above it. `None` for a file measured at one encoding, which the two-way
+    /// promotion above still allocates exactly as it always has.
+    pub ladder: Option<LadderReport>,
 }
 
 impl MeasuredMixAllocation {
@@ -123,7 +135,7 @@ impl std::fmt::Display for MeasuredMixAllocation {
             self.spent_bytes,
             self.unspent_bytes()
         )?;
-        write!(
+        writeln!(
             f,
             "  bpw over {} weights: measured {:.3} ({} bytes) against positional {:.3} ({} \
              bytes), weight payload only",
@@ -132,7 +144,16 @@ impl std::fmt::Display for MeasuredMixAllocation {
             self.measured_bytes,
             self.heuristic_bpw(),
             self.heuristic_bytes
-        )
+        )?;
+        match &self.ladder {
+            Some(ladder) => write!(f, "{ladder}"),
+            None => write!(
+                f,
+                "  the sensitivity file measures one encoding, so this is the two-way \
+                 allocation: every candidate at the base format, a ranked subset promoted, and \
+                 none demoted"
+            ),
+        }
     }
 }
 
@@ -161,6 +182,7 @@ mod tests {
             heuristic_bytes: 708,
             measured_bytes: 642,
             total_elements: 1024,
+            ladder: None,
         }
     }
 
@@ -176,6 +198,9 @@ mod tests {
         let text = allocation.to_string();
         assert!(text.contains("256-element super-blocks"), "{text}");
         assert!(text.contains("1 tensor(s) in both sets"), "{text}");
+        // A two-way allocation says so, rather than leaving a reader to infer
+        // that nothing was demoted.
+        assert!(text.contains("none demoted"), "{text}");
     }
 
     #[test]

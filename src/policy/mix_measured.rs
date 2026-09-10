@@ -9,45 +9,47 @@
 //! # What is held fixed
 //!
 //! The comparison is only about WHERE the bits go, so everything else is
-//! pinned to the positional mix:
+//! pinned to the positional mix: the same formats, the same fallbacks, and
+//! the same byte budget — what the positional allocation spends ABOVE an
+//! all-base allocation of the same checkpoint. The two artifacts are size
+//! matched, and the difference between them is the allocation policy alone.
 //!
-//! - The same two formats. Every quantizable tensor takes the mix's base
-//!   format, and a promoted one takes [`GgufMix::promoted`].
-//! - The same byte budget. The positional allocation is computed first, its
-//!   bytes are measured, and the ranking may spend exactly what that
-//!   allocation spends ABOVE an all-base allocation of the same checkpoint —
-//!   see [`assign_mix_measured`]. The two artifacts are therefore size
-//!   matched, and the difference between them is the allocation policy alone.
-//! - The same fallbacks. A tensor no mix quantizes is untouched, and
-//!   [`step_down_unquantizable`] still runs.
+//! # Two ways, or a ladder
+//!
+//! A file measured at ONE encoding says only what the base format did, so the
+//! allocation it drives is two-way: base, or promoted. A file measuring
+//! SEVERAL encodings per tensor is a menu, and [`super::mix_ladder`] spends
+//! the same budget over it — a tensor can then land BELOW the base as well as
+//! above it. The two-way path is unchanged and still runs for every file that
+//! carries one encoding.
 //!
 //! # Why the blocked count is the point
 //!
 //! A K-quant row is a whole number of 256-element super-blocks or it cannot
 //! be packed at all. So a tensor the measurement ranks first can be one GGUF
 //! cannot place a single extra bit in. Those tensors are counted, with their
-//! parameters, and reported — never silently skipped. That count is the
-//! direct evidence for or against a finer-grained container.
+//! parameters, and reported — never silently skipped.
 //!
 //! Without `--sensitivity` none of this runs and [`super::mix_assign`]'s
 //! allocation is byte-identical to what it has always been.
 
 use anyhow::Result;
 
-use crate::formats::GgmlType;
 use crate::loader::UnifiedDType;
 use crate::quantization::QuantType;
 
 use super::gguf_mix::GgufMix;
 use super::mix_allocation::MixAllocation;
 use super::mix_assign::assign_mix_reported;
+use super::mix_bytes::{element_count, holds_format, plan_bytes};
 use super::mix_measured_report::MeasuredMixAllocation;
 use super::mix_model::MixModel;
+use super::mix_promote::PromotionFormats;
 use super::mix_report::quant_type_label;
 use super::mix_rules::{plan_mixed_tensor, step_down_unquantizable};
+use super::mix_spend::{spend_budget, SpendInputs};
 use super::sensitivity::SensitivityMeasurement;
-use super::sensitivity_rank::{rank_candidates, BumpCandidate};
-use super::TensorPlan;
+use super::sensitivity_rank::BumpCandidate;
 
 /// One tensor as the measured allocation reads it: name, shape, element type.
 pub type MeasuredTensor<'a> = (&'a str, &'a [usize], UnifiedDType);
@@ -145,34 +147,20 @@ pub fn assign_mix_measured(
     }
 
     let budget_bytes = heuristic_bytes.saturating_sub(floor_bytes);
-    let ranking = rank_candidates(measurement, &candidates)?;
 
-    let mut spent_bytes = 0u64;
-    let mut measured_promoted = 0usize;
-    let mut overlap = 0usize;
-    let mut wanted_blocked_tensors = 0usize;
-    let mut wanted_blocked_parameters = 0u64;
-
-    if budget_bytes > 0 {
-        for ranked in &ranking.order {
-            let (_, shape, dtype) = tensors[ranked.index];
-            if !holds_format(shape, promoted) {
-                wanted_blocked_tensors += 1;
-                wanted_blocked_parameters += ranked.elements;
-                continue;
-            }
-            let cost = promotion_cost(shape, dtype, ranked.elements, base, promoted);
-            if spent_bytes + cost > budget_bytes {
-                break;
-            }
-            assigned[ranked.index] = Some(step_down_unquantizable(promoted, shape));
-            spent_bytes += cost;
-            measured_promoted += 1;
-            if promoted_by_heuristic[ranked.index] {
-                overlap += 1;
-            }
-        }
-    }
+    let spend = spend_budget(
+        mix,
+        tensors,
+        &candidates,
+        &mut assigned,
+        &promoted_by_heuristic,
+        SpendInputs {
+            formats: PromotionFormats { base, promoted },
+            floor_bytes,
+            budget_bytes,
+        },
+        measurement,
+    )?;
 
     let allocation = MeasuredMixAllocation {
         mix_name: mix.name().to_string(),
@@ -180,69 +168,24 @@ pub fn assign_mix_measured(
         promoted_format: quant_type_label(promoted).to_string(),
         baseline_encoding: measurement.baseline().encoding.clone(),
         candidates: candidates.len(),
-        excluded_nonpositive: ranking.excluded_nonpositive,
+        excluded_nonpositive: spend.excluded_nonpositive,
         heuristic_promoted,
-        measured_promoted,
-        overlap,
+        measured_promoted: spend.promoted,
+        overlap: spend.overlap,
         blocked_tensors,
         blocked_parameters,
-        wanted_blocked_tensors,
-        wanted_blocked_parameters,
+        wanted_blocked_tensors: spend.wanted_blocked_tensors,
+        wanted_blocked_parameters: spend.wanted_blocked_parameters,
         budget_bytes,
-        spent_bytes,
+        spent_bytes: spend.spent_bytes,
         floor_bytes,
         heuristic_bytes,
-        measured_bytes: floor_bytes + spent_bytes,
+        measured_bytes: spend.measured_bytes,
         total_elements,
+        ladder: spend.ladder,
     };
 
     Ok((assigned, positional, allocation))
-}
-
-/// Elements in a tensor of this shape.
-fn element_count(shape: &[usize]) -> u64 {
-    shape.iter().product::<usize>() as u64
-}
-
-/// Whether a row of this shape is a whole number of the format's blocks.
-///
-/// GGUF packs blocks along a ROW, which is the LAST dimension of the standard
-/// order shape. For `Q4_K` and `Q6_K` that block is 256 elements, so a row
-/// that is not a multiple of 256 can hold neither.
-fn holds_format(shape: &[usize], format: QuantType) -> bool {
-    shape.len() >= 2 && shape[shape.len() - 1].is_multiple_of(format.block_size())
-}
-
-/// Extra bytes promoting one tensor costs, over leaving it at the base format.
-fn promotion_cost(
-    shape: &[usize],
-    dtype: UnifiedDType,
-    elements: u64,
-    base: QuantType,
-    promoted: QuantType,
-) -> u64 {
-    let at = |format: QuantType| {
-        plan_bytes(
-            plan_mixed_tensor(shape, dtype, Some(format)),
-            elements,
-            dtype,
-        )
-    };
-    at(promoted).saturating_sub(at(base))
-}
-
-/// Bytes one plan writes for a tensor of this many elements, read from the
-/// GGUF writer's own block table rather than from a nominal bit width.
-fn plan_bytes(plan: TensorPlan, elements: u64, dtype: UnifiedDType) -> u64 {
-    match plan {
-        TensorPlan::Quantize(format) => {
-            GgmlType::from_quant_type(format).tensor_bytes(elements as usize) as u64
-        }
-        // An unquantizable tensor is stored as F32, which is what the
-        // registration loop reserves for it.
-        TensorPlan::StoreF32(_) => elements * 4,
-        TensorPlan::StoreAsIs => elements * dtype.element_size().unwrap_or(4) as u64,
-    }
 }
 
 #[cfg(test)]
@@ -262,8 +205,8 @@ mod tests {
         }
     }
 
-    /// A measurement at the encoding a `q4_k_*` base is ranked from.
-    fn measurement(deltas: &[(&str, f64)]) -> SensitivityMeasurement {
+    /// A file measured at the encoding a `q4_k_*` base is ranked from.
+    fn file(deltas: &[(&str, f64)]) -> String {
         let mut lines = vec![
             r#"{"record":"baseline","ckpt":"cache/models/example/abcdef","manifest":"manifests/eval.tsv","encoding":"Q4AS32D_T64","eval_rows":12,"eval_seed":7,"baseline_total":1.17}"#
                 .to_string(),
@@ -273,7 +216,11 @@ mod tests {
                 r#"{{"record":"sensitivity","name":"{name}","delta":{delta}}}"#
             ));
         }
-        parse_sensitivity(&lines.join("\n")).expect("parses")
+        lines.join("\n")
+    }
+
+    fn measurement(deltas: &[(&str, f64)]) -> SensitivityMeasurement {
+        parse_sensitivity(&file(deltas)).expect("parses")
     }
 
     /// One transformer block, plus an output weight the positional rules
@@ -318,6 +265,42 @@ mod tests {
         assert_eq!(report.measured_promoted, report.heuristic_promoted);
         // The ranking took the three most damaged, not the positional set.
         assert!(report.overlap < report.measured_promoted);
+    }
+
+    /// A file measured at one encoding takes the two-way path, and a file
+    /// measuring several takes the ladder. This is the compatibility
+    /// guarantee: a single-encoding menu allocates exactly as it always has.
+    #[test]
+    fn one_encoding_allocates_two_ways_and_a_menu_ladders() {
+        let shape = [512usize, 512];
+        let tensors = block(&shape);
+        let deltas = [
+            ("output.weight", 0.1),
+            ("blk.0.attn_q.weight", 0.9),
+            ("blk.0.attn_v.weight", 0.8),
+            ("blk.0.ffn_down.weight", 0.7),
+            ("blk.0.ffn_up.weight", 0.6),
+        ];
+        let two_way = measurement(&deltas);
+        let (_, _, report) =
+            assign_mix_measured(GgufMix::Q4KM, &tensors, &dense(1), &two_way).expect("ranks");
+        assert!(report.ladder.is_none());
+        assert!(report.to_string().contains("none demoted"));
+
+        // The same file, plus a rung at another encoding, is a menu.
+        let mut text = file(&deltas);
+        for (name, delta) in &deltas {
+            text.push_str(&format!(
+                "\n{{\"record\":\"sensitivity\",\"name\":\"{name}\",\"encoding\":\"Q6S16D_T64\",\"delta\":{}}}",
+                delta / 8.0
+            ));
+        }
+        let laddered = parse_sensitivity(&text).expect("parses");
+        let (_, _, report) =
+            assign_mix_measured(GgufMix::Q4KM, &tensors, &dense(1), &laddered).expect("allocates");
+        let ladder = report.ladder.expect("a ladder ran");
+        assert_eq!(ladder.tensors, 5);
+        assert!(ladder.to_string().contains("DEMOTED below the base"));
     }
 
     /// A tensor the base format did not damage is never promoted, whatever
