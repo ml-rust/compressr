@@ -25,6 +25,10 @@
 //! # Or let a profile allocate the encodings, mixed precision
 //! compressr convert model/ --format tcf --tcf-profile balanced
 //!
+//! # Override every encoding's default objective with one of your own
+//! compressr convert model/ --format tcf --tcf-profile balanced \
+//!     --tcf-objective rms-plus-abs
+//!
 //! # Rank that profile's bump set by a measured task-metric delta instead of
 //! # by the weight-error screen
 //! compressr convert model/ --format tcf --tcf-profile balanced \
@@ -51,8 +55,9 @@ mod quant_arg;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use compressr::{
-    parse_sensitivity, parse_tcf_encoding, parse_tcf_profile, ConversionConfig, OutputFormat,
-    QuantizationConfig, QuantizationMethod, SensitivityMeasurement, TcfOptions,
+    parse_sensitivity, parse_tcf_encoding, parse_tcf_objective, parse_tcf_profile,
+    ConversionConfig, OutputFormat, QuantizationConfig, QuantizationMethod, SensitivityMeasurement,
+    TcfObjective, TcfOptions, TcfProfile,
 };
 use quant_arg::parse_quantization;
 
@@ -132,6 +137,20 @@ enum Commands {
         /// --sensitivity supplies a measured task-metric delta.
         #[arg(long, value_name = "PROFILE")]
         tcf_profile: Option<String>,
+
+        /// TCF error objective (uniform, squared, rms-plus-abs)
+        ///
+        /// --format tcf only. Names WHICH error the quantizer minimizes:
+        /// uniform is w = 1, the plain squared reconstruction error; squared
+        /// is w = x^2; rms-plus-abs is w = sqrt(mean(x^2)) + |x| over each
+        /// group. Unset, each tensor takes the default its own ENCODING
+        /// carries, so a mixed-precision profile minimizes each half of the
+        /// file under the objective measured for it. Set, this objective
+        /// OVERRIDES that default on every tensor. Either way it changes
+        /// which values the encoder chooses and no bit layout, so the file it
+        /// writes is a normal conforming TCF file.
+        #[arg(long, value_name = "OBJECTIVE")]
+        tcf_objective: Option<String>,
 
         /// Measured task-metric sensitivity, as JSON lines
         ///
@@ -247,6 +266,7 @@ fn main() -> Result<()> {
             tcf_encoding,
             tcf_preferred_encoding,
             tcf_profile,
+            tcf_objective,
             sensitivity,
             arch,
             verbose,
@@ -267,6 +287,10 @@ fn main() -> Result<()> {
             let tcf_options =
                 parse_tcf_options(tcf_encoding.as_deref(), tcf_preferred_encoding.as_deref())?;
             let tcf_profile = tcf_profile.as_deref().map(parse_tcf_profile).transpose()?;
+            let tcf_objective = tcf_objective
+                .as_deref()
+                .map(parse_tcf_objective)
+                .transpose()?;
             let sensitivity = sensitivity.as_deref().map(read_sensitivity).transpose()?;
 
             let output_path = output.unwrap_or_else(|| {
@@ -299,6 +323,9 @@ fn main() -> Result<()> {
             }
             if let Some(tcf_profile) = tcf_profile {
                 config = config.with_tcf_profile(tcf_profile);
+            }
+            if let Some(tcf_objective) = tcf_objective {
+                config = config.with_tcf_objective(tcf_objective);
             }
             let measured = sensitivity.clone();
             // A measurement ranks whichever promotion set the output format
@@ -368,6 +395,15 @@ fn main() -> Result<()> {
                 }
             }
             if output_format == OutputFormat::Tcf {
+                // Printed on a flagless run too: the summary already names the
+                // encoding, and the objective is the other half of what the
+                // encoder was told to do. The line states the POLICY and every
+                // encoding it covers, never one objective for a mixed file;
+                // the conversion log states what each encoding resolved to.
+                match tcf_objective_policy(tcf_options, tcf_profile, tcf_objective) {
+                    Ok(policy) => println!("{policy}"),
+                    Err(error) => println!("TCF objective: {error}"),
+                }
                 println!(
                     "TCF activation contract: exact F32 activations, F32 accumulate, F32 out. \
                      workload_profile_id is unset: compressr measures no workload. No \
@@ -636,6 +672,33 @@ fn parse_tcf_options(
     }
 }
 
+/// What the summary says about the objective this TCF run quantized under.
+///
+/// Built from the same two flags the conversion is, so the summary cannot
+/// name a policy the conversion did not run. It states whether the objective
+/// came from the per-encoding defaults or from an explicit
+/// `--tcf-objective`, and for a mixed-precision profile it names every
+/// encoding rather than implying one objective covered the file.
+///
+/// # Errors
+/// Neither TCF flag was given, which the conversion refuses first.
+fn tcf_objective_policy(
+    options: Option<TcfOptions>,
+    profile: Option<TcfProfile>,
+    objective: Option<TcfObjective>,
+) -> Result<String> {
+    let options = match (options, profile) {
+        (Some(options), _) => options,
+        (None, Some(profile)) => TcfOptions::from_profile(profile),
+        (None, None) => anyhow::bail!(
+            "--format tcf needs --tcf-encoding or --tcf-profile, and neither was given"
+        ),
+    };
+    Ok(compressr::objective_policy(
+        options.with_objective_override(objective),
+    ))
+}
+
 /// Read and parse a `--sensitivity` file.
 ///
 /// Parsed here rather than in the writer so a malformed or empty file fails
@@ -797,6 +860,94 @@ mod tests {
             }
             _ => panic!("expected the convert subcommand"),
         }
+    }
+
+    /// The flag parses, and a flagless run names no objective at all — every
+    /// tensor then takes the default its own encoding carries.
+    #[test]
+    fn test_convert_parses_the_tcf_objective_flag() {
+        let cli = Cli::try_parse_from([
+            "compressr",
+            "convert",
+            "model/",
+            "--format",
+            "tcf",
+            "--tcf-profile",
+            "balanced",
+            "--tcf-objective",
+            "rms-plus-abs",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Convert { tcf_objective, .. } => {
+                let objective =
+                    parse_tcf_objective(tcf_objective.as_deref().expect("the flag")).unwrap();
+                assert_eq!(objective, compressr::TcfObjective::RmsPlusAbs);
+            }
+            _ => panic!("expected the convert subcommand"),
+        }
+
+        let flagless = Cli::try_parse_from([
+            "compressr",
+            "convert",
+            "model/",
+            "--format",
+            "tcf",
+            "--tcf-profile",
+            "balanced",
+        ])
+        .unwrap();
+        match flagless.command {
+            Commands::Convert { tcf_objective, .. } => {
+                assert!(tcf_objective.is_none());
+                assert_eq!(
+                    tcf_objective
+                        .as_deref()
+                        .map(parse_tcf_objective)
+                        .transpose()
+                        .unwrap(),
+                    None
+                );
+            }
+            _ => panic!("expected the convert subcommand"),
+        }
+    }
+
+    /// The summary states where the objective came from, and a mixed profile
+    /// is never reported as though one objective covered the whole file.
+    #[test]
+    fn test_the_summary_states_the_objective_policy() {
+        let compact = parse_tcf_profile("compact").unwrap();
+        let defaults = tcf_objective_policy(None, Some(compact), None).unwrap();
+        assert!(defaults.contains("none named"), "{defaults}");
+        assert!(defaults.contains("MIXED precision"), "{defaults}");
+        assert!(
+            defaults.contains("Q6S16D_T64 quantizes under rms-plus-abs"),
+            "{defaults}"
+        );
+        assert!(
+            defaults.contains("does NOT reproduce byte for byte"),
+            "{defaults}"
+        );
+
+        let explicit =
+            tcf_objective_policy(None, Some(compact), Some(compressr::TcfObjective::Squared))
+                .unwrap();
+        assert!(explicit.contains("explicit --tcf-objective"), "{explicit}");
+        assert!(
+            explicit.contains("overrides the per-encoding default"),
+            "{explicit}"
+        );
+
+        assert!(tcf_objective_policy(None, None, None).is_err());
+    }
+
+    #[test]
+    fn test_unknown_tcf_objective_is_refused() {
+        let err = parse_tcf_objective("imatrix").unwrap_err().to_string();
+        assert!(err.contains("Unsupported TCF objective: imatrix"), "{err}");
+        assert!(err.contains("rms-plus-abs"), "{err}");
     }
 
     /// A profile name is a rung of the ladder, so an unknown one is refused

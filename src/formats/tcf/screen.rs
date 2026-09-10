@@ -14,7 +14,8 @@ use anyhow::{anyhow, Context, Result};
 
 use tcf_core::NativeEncoding;
 
-use super::encoding::{TcfOptions, TensorShape};
+use super::encoding::TensorShape;
+use super::options::TcfOptions;
 use super::parallel::accepts_tensor;
 use super::plan::Registration;
 use crate::policy::{plan_tcf_tensor, TcfPlan};

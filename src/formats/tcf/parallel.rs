@@ -4,8 +4,9 @@
 //!
 //! `tcf-core` permits exactly one dependency, blake3, and CONFORMANCE.md makes
 //! its scalar implementation the definition of codec semantics. So it gains a
-//! chunk-aware entry point — [`quantize_tile_chunk`] — and nothing else; the
-//! scheduling that calls it lives in the consumer, which is this module.
+//! chunk-aware entry point — [`quantize_tile_chunk_weighted`] — and nothing
+//! else; the scheduling that calls it lives in the consumer, which is this
+//! module.
 //!
 //! # Why WITHIN a tensor, never across tensors
 //!
@@ -19,19 +20,33 @@
 //!
 //! Determinism is a TCF format guarantee. Every scale fit, sub-scale refit and
 //! code is computed inside one group or one super-block, and a chunk boundary
-//! never splits either: [`quantize_tile_chunk`] refuses a chunk that would.
-//! Nothing is accumulated across tiles, so no float is reassociated. Chunks
-//! are concatenated in tile order, and the first error IN TILE ORDER is the
-//! one returned, so even a rejected tensor takes the serial path's fallback
-//! reason.
+//! never splits either: [`quantize_tile_chunk_weighted`] refuses a chunk that
+//! would. Nothing is accumulated across tiles, so no float is reassociated.
+//! Chunks are concatenated in tile order, and the first error IN TILE ORDER is
+//! the one returned, so even a rejected tensor takes the serial path's
+//! fallback reason.
+//!
+//! # Why the objective does not move them either
+//!
+//! A weighted objective weights each element by a rule read from the GROUP's
+//! own values — `w = x^2`, or `w = sqrt(mean(x^2)) + |x|` over that group.
+//! A group never spans two tiles and a chunk never splits a tile, so a group's
+//! weights are the same whichever chunk its tile lands in, and the chunked
+//! path scores exactly what the whole-tensor path scores. The one source that
+//! would need care is `WeightSource::Explicit`, whose slice is CHUNK-LOCAL:
+//! it has to be narrowed to the chunk before the call, which is what
+//! `WeightSource::slice` and `tcf_core::column_weights`'s `first_element` are
+//! for. compressr passes no explicit slice today.
 
 use anyhow::{anyhow, Context, Result};
 use rayon::prelude::*;
 
 use tcf_core::encoding::{
-    accepts, accepts_tile_chunk, quantize, quantize_tile_chunk, tile_count, SUPER_BLOCK_TILES,
+    accepts, accepts_tile_chunk, quantize_tile_chunk_weighted, quantize_weighted, tile_count,
 };
-use tcf_core::{LogicalTile, QuantLayout, TcfError};
+use tcf_core::{LogicalTile, QuantLayout, TcfError, WeightSource};
+
+use super::chunk::{chunk_bounds, chunk_slice, chunk_start, chunk_tiles};
 
 /// Tiles below which a tensor is quantized serially, with no rayon call at
 /// all.
@@ -43,40 +58,34 @@ use tcf_core::{LogicalTile, QuantLayout, TcfError};
 /// stay on the serial path entirely.
 const MIN_PARALLEL_TILES: u64 = 512;
 
-/// Smallest chunk the split ever produces, in tiles.
-///
-/// 64 tiles is 4096 weights, hundreds of microseconds of work — orders above
-/// rayon's per-task overhead, so the split never degenerates into scheduling.
-const MIN_CHUNK_TILES: u64 = 64;
-
-/// Chunks aimed at per thread. More than one so a thread that draws an
-/// expensive chunk does not hold up the tensor; few enough that the queue
-/// stays short.
-const CHUNKS_PER_THREAD: u64 = 4;
-
 /// Quantize a whole tensor, splitting its tiles across rayon's pool.
 ///
-/// Byte-for-byte what `tcf_core::encoding::quantize` returns for the same
-/// arguments — this is a scheduling change and nothing else. `values` holds
-/// the tensor row-major, `dims[0..rank]` is its shape.
+/// Byte-for-byte what `tcf_core::encoding::quantize_weighted` returns for the
+/// same arguments — this is a scheduling change and nothing else. `values`
+/// holds the tensor row-major, `dims[0..rank]` is its shape, and `weights`
+/// names the error objective every group is scored by.
+///
+/// `WeightSource::Uniform` is the objective every earlier run used, and
+/// `tcf-core` reproduces the unweighted bytes exactly under it.
 ///
 /// # Errors
-/// Whatever `tcf_core::encoding::quantize` raises, and for the same values.
-/// When several chunks fail, the failure of the LOWEST tile index is
+/// Whatever `tcf_core::encoding::quantize_weighted` raises, and for the same
+/// values. When several chunks fail, the failure of the LOWEST tile index is
 /// returned, which is the one a serial run would have hit first.
 pub(super) fn quantize_tensor(
     values: &[f32],
     dims: &[u64],
     rank: u32,
     layout: QuantLayout,
+    weights: WeightSource<'_>,
 ) -> Result<Vec<LogicalTile>, TcfError> {
     let tile = usize::from(layout.geometry.tile);
     let total = tile_count(dims, rank, layout.geometry.tile)?;
     if total < MIN_PARALLEL_TILES {
-        // The serial path is `quantize` itself, not a one-chunk call: a small
-        // tensor then touches no scheduling code at all, and the two paths
-        // cannot drift.
-        return quantize(values, dims, rank, layout);
+        // The serial path is `quantize_weighted` itself, not a one-chunk
+        // call: a small tensor then touches no scheduling code at all, and
+        // the two paths cannot drift.
+        return quantize_weighted(values, dims, rank, layout, weights);
     }
 
     let chunk = chunk_tiles(total, rayon::current_num_threads());
@@ -92,7 +101,12 @@ pub(super) fn quantize_tensor(
         .map(|(first, count)| {
             let slice = chunk_slice(values, tile, first, count)?;
             let final_chunk = first.saturating_add(count) == total;
-            quantize_tile_chunk(slice, count, first, final_chunk, layout)
+            // The weights are narrowed the same way the values are, so a
+            // source that carries data stays parallel to the chunk it scores.
+            // Every value-derived source narrows to itself.
+            let start = chunk_start(tile, first)?;
+            let weights = weights.slice(start, start.saturating_add(slice.len()));
+            quantize_tile_chunk_weighted(slice, count, first, final_chunk, layout, weights)
         })
         .collect();
 
@@ -117,6 +131,11 @@ pub(super) fn quantize_tensor(
 /// The split is still `quantize_tensor`'s, so the two paths cut a tensor the
 /// same way and one threshold governs both.
 ///
+/// It takes no objective. The question is whether a group's values can be
+/// represented at all — a NaN, an infinity, or a scale that underflows
+/// binary16 — and a weight scores candidates rather than admitting values, so
+/// every objective answers this identically.
+///
 /// # Errors
 /// Whatever `tcf_core::encoding::accepts` raises: a geometry or tiling
 /// rejection, never a value-dependent one.
@@ -130,7 +149,7 @@ pub(super) fn accepts_tensor(
     let total = tile_count(dims, rank, layout.geometry.tile)?;
     if total < MIN_PARALLEL_TILES {
         // The serial path is `accepts` itself, for the same reason the
-        // quantize path calls `quantize`: the two cannot drift.
+        // quantize path calls `quantize_weighted`: the two cannot drift.
         return accepts(values, dims, rank, layout);
     }
 
@@ -155,29 +174,6 @@ pub(super) fn accepts_tensor(
     Ok(true)
 }
 
-/// The `count` tiles starting at tile `first`, as a sub-slice of a tensor's
-/// row-major values.
-///
-/// Tiles never cross a row boundary and a row holds a whole number of tiles,
-/// so tile `t` covers `t * tile .. (t + 1) * tile` and a chunk is a plain
-/// sub-slice.
-fn chunk_slice(values: &[f32], tile: usize, first: u64, count: u64) -> Result<&[f32], TcfError> {
-    let offset = usize::try_from(first).map_err(|_| TcfError::TileArithmeticOverflow)?;
-    let held = usize::try_from(count).map_err(|_| TcfError::TileArithmeticOverflow)?;
-    let start = offset
-        .checked_mul(tile)
-        .ok_or(TcfError::TileArithmeticOverflow)?;
-    let span = held
-        .checked_mul(tile)
-        .ok_or(TcfError::TileArithmeticOverflow)?;
-    let end = start
-        .checked_add(span)
-        .ok_or(TcfError::TileArithmeticOverflow)?;
-    values
-        .get(start..end)
-        .ok_or(TcfError::TileArithmeticOverflow)
-}
-
 /// Quantize a whole tensor, reporting the tensor name on failure.
 ///
 /// The `anyhow` wrapper the writer and the planner both want, kept in one
@@ -190,49 +186,26 @@ pub(super) fn quantize_named(
     dims: &[u64],
     rank: u32,
     layout: QuantLayout,
+    weights: WeightSource<'_>,
     name: &str,
 ) -> Result<Vec<LogicalTile>> {
-    quantize_tensor(values, dims, rank, layout)
+    quantize_tensor(values, dims, rank, layout, weights)
         .map_err(|e| anyhow!(e))
         .with_context(|| format!("Failed to quantize tensor '{name}'"))
-}
-
-/// Tiles per chunk: `total / (threads * CHUNKS_PER_THREAD)`, rounded UP to a
-/// multiple of [`SUPER_BLOCK_TILES`] and floored at [`MIN_CHUNK_TILES`].
-///
-/// The multiple-of-four rounding is what keeps a two-level super-block whole:
-/// every chunk boundary then lands on a super-block boundary, so only the
-/// final chunk can be short and its trailing partial block is the tensor's
-/// own. [`MIN_CHUNK_TILES`] is already a multiple of four, so the floor
-/// cannot undo the rounding.
-fn chunk_tiles(total: u64, threads: usize) -> u64 {
-    let threads = u64::try_from(threads).unwrap_or(1).max(1);
-    let target = threads.saturating_mul(CHUNKS_PER_THREAD).max(1);
-    let even = total.div_ceil(target).max(1);
-    let span = u64::from(SUPER_BLOCK_TILES).max(1);
-    even.div_ceil(span)
-        .saturating_mul(span)
-        .max(MIN_CHUNK_TILES)
-}
-
-/// `(first_tile_index, tile_count)` for each chunk, in tile order.
-fn chunk_bounds(total: u64, chunk: u64) -> Vec<(u64, u64)> {
-    let chunk = chunk.max(1);
-    let mut bounds = Vec::new();
-    let mut first = 0u64;
-    while first < total {
-        let count = chunk.min(total.saturating_sub(first));
-        bounds.push((first, count));
-        first = first.saturating_add(count);
-    }
-    bounds
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tcf_core::encoding::pack;
+    use tcf_core::encoding::{pack, quantize, quantize_weighted};
     use tcf_core::NativeEncoding;
+
+    /// The objectives a `--tcf-objective` run can select.
+    const OBJECTIVES: [WeightSource<'static>; 3] = [
+        WeightSource::Uniform,
+        WeightSource::Squared,
+        WeightSource::RmsPlusAbs,
+    ];
 
     const ENCODINGS: [NativeEncoding; 7] = [
         NativeEncoding::Q4S32T64,
@@ -257,35 +230,6 @@ mod tests {
             .collect()
     }
 
-    /// Every chunk boundary lands on a super-block, whatever the thread
-    /// count, so a two-level block is never split.
-    #[test]
-    fn every_chunk_size_is_a_multiple_of_the_super_block() {
-        for threads in [1usize, 2, 8, 24, 128] {
-            for total in [512u64, 513, 1000, 4096, 1_000_003] {
-                let chunk = chunk_tiles(total, threads);
-                assert_eq!(chunk % u64::from(SUPER_BLOCK_TILES), 0, "{total} {threads}");
-                assert!(chunk >= MIN_CHUNK_TILES, "{total} {threads}");
-            }
-        }
-    }
-
-    /// Only the last chunk may be short, and the bounds cover every tile
-    /// exactly once in order.
-    #[test]
-    fn chunk_bounds_cover_every_tile_in_order() {
-        let bounds = chunk_bounds(1000, 64);
-        assert_eq!(bounds.first(), Some(&(0, 64)));
-        assert_eq!(bounds.last(), Some(&(960, 40)));
-        let mut expected = 0u64;
-        for (first, count) in &bounds {
-            assert_eq!(*first, expected);
-            expected += count;
-        }
-        assert_eq!(expected, 1000);
-        assert!(chunk_bounds(0, 64).is_empty());
-    }
-
     /// The whole point: the parallel path is byte-identical to `quantize`,
     /// for every encoding, on a tensor whose tiles-per-row is not a multiple
     /// of four and whose tile count is not either.
@@ -299,7 +243,8 @@ mod tests {
         for encoding in ENCODINGS {
             let layout = encoding.layout();
             let serial = quantize(&source, &shape, 2, layout).expect("serial quantize");
-            let parallel = quantize_tensor(&source, &shape, 2, layout).expect("parallel quantize");
+            let parallel = quantize_tensor(&source, &shape, 2, layout, WeightSource::Uniform)
+                .expect("parallel quantize");
             assert_eq!(parallel.len(), serial.len(), "{encoding:?}");
             let left = pack(&parallel, layout).expect("parallel packs");
             let right = pack(&serial, layout).expect("serial packs");
@@ -315,7 +260,8 @@ mod tests {
         for encoding in ENCODINGS {
             let layout = encoding.layout();
             let serial = quantize(&source, &shape, 2, layout).expect("serial quantize");
-            let parallel = quantize_tensor(&source, &shape, 2, layout).expect("parallel quantize");
+            let parallel = quantize_tensor(&source, &shape, 2, layout, WeightSource::Uniform)
+                .expect("parallel quantize");
             let left = pack(&parallel, layout).expect("parallel packs");
             let right = pack(&serial, layout).expect("serial packs");
             assert_eq!(left, right, "{encoding:?}");
@@ -347,11 +293,50 @@ mod tests {
             for encoding in ENCODINGS {
                 let layout = encoding.layout();
                 for (name, source) in &cases {
-                    let quantized = quantize_tensor(source, &shape, 2, layout).is_ok();
+                    let quantized =
+                        quantize_tensor(source, &shape, 2, layout, WeightSource::Uniform).is_ok();
                     let accepted = accepts_tensor(source, &shape, 2, layout).expect("decides");
                     assert_eq!(accepted, quantized, "{encoding:?} {name} {shape:?}");
                 }
             }
+        }
+    }
+
+    /// A weighted objective is scored from each GROUP's own values, and a
+    /// chunk never splits a group, so the split path must match the
+    /// whole-tensor path under every objective — not only the uniform one.
+    #[test]
+    fn the_parallel_path_matches_the_serial_one_under_every_objective() {
+        let shape = [65u64, 640];
+        let source = values(65 * 640);
+        for encoding in ENCODINGS {
+            let layout = encoding.layout();
+            for weights in OBJECTIVES {
+                let serial = quantize_weighted(&source, &shape, 2, layout, weights)
+                    .expect("serial quantize");
+                let parallel = quantize_tensor(&source, &shape, 2, layout, weights)
+                    .expect("parallel quantize");
+                let left = pack(&parallel, layout).expect("parallel packs");
+                let right = pack(&serial, layout).expect("serial packs");
+                assert_eq!(left, right, "{encoding:?} {weights:?}");
+            }
+        }
+    }
+
+    /// The uniform objective is the one every earlier run used, so it writes
+    /// the bytes the unweighted entry point writes — exactly, not nearly.
+    #[test]
+    fn the_uniform_objective_is_the_unweighted_one() {
+        let shape = [65u64, 640];
+        let source = values(65 * 640);
+        for encoding in ENCODINGS {
+            let layout = encoding.layout();
+            let unweighted = quantize(&source, &shape, 2, layout).expect("unweighted quantize");
+            let uniform = quantize_tensor(&source, &shape, 2, layout, WeightSource::Uniform)
+                .expect("uniform quantize");
+            let left = pack(&uniform, layout).expect("uniform packs");
+            let right = pack(&unweighted, layout).expect("unweighted packs");
+            assert_eq!(left, right, "{encoding:?}");
         }
     }
 
@@ -364,7 +349,8 @@ mod tests {
         source[30_000] = f32::NAN;
         let layout = NativeEncoding::Q4S32T64.layout();
         let serial = quantize(&source, &shape, 2, layout).unwrap_err();
-        let parallel = quantize_tensor(&source, &shape, 2, layout).unwrap_err();
+        let parallel =
+            quantize_tensor(&source, &shape, 2, layout, WeightSource::Uniform).unwrap_err();
         assert_eq!(parallel, serial);
         assert!(matches!(parallel, TcfError::SourceNonfinite { .. }));
     }

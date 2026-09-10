@@ -34,7 +34,7 @@ use tcf_core::{
     TensorFlags, TensorRecord,
 };
 
-use super::encoding::TcfOptions;
+use super::options::TcfOptions;
 use crate::policy::SensitivityMeasurement;
 
 /// The id every `ModuleRecord` and `TensorRecord` compressr writes points at.

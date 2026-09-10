@@ -48,7 +48,8 @@ use tcf_core::{encoding::dequantize, Encoding, LogicalTile, TcfError};
 
 use tcf_core::NativeEncoding;
 
-use super::encoding::{raw_encoding_for, values_f32, TcfOptions, TensorShape};
+use super::encoding::{raw_encoding_for, values_f32, TensorShape};
+use super::options::TcfOptions;
 use super::parallel::quantize_tensor;
 use super::screen::{bump_accepts, ladder_accepts};
 use crate::loader::UnifiedDType;
@@ -195,7 +196,12 @@ pub(super) fn settle(
         screen: None,
         tiles: None,
     };
-    match quantize_tensor(&values, shape.extent(), shape.rank(), layout) {
+    // Resolved from the BASE encoding, which is the encoding this call
+    // quantizes at. A tensor an allocation later bumps is requantized in pass
+    // 2 under the bump encoding's own objective, so neither pass reads an
+    // objective belonging to an encoding it is not writing.
+    let weights = options.objective_for(options.encoding).weights();
+    match quantize_tensor(&values, shape.extent(), shape.rank(), layout, weights) {
         Ok(tiles) => {
             // A row that holds a whole number of tiles covers the element
             // space in order, so the reconstruction lines up with `values`

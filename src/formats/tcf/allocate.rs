@@ -24,8 +24,8 @@ use anyhow::{anyhow, Result};
 
 use tcf_core::Encoding;
 
-use super::encoding::TcfOptions;
 use super::ladder::allocate_ladder_profile;
+use super::options::TcfOptions;
 use super::plan::PlannedTensor;
 use crate::policy::{
     select_bumped, select_bumped_measured, BumpCandidate, ScreenedTensor, SensitivityMeasurement,

@@ -51,8 +51,11 @@ use std::path::{Path, PathBuf};
 use tcf_core::{Encoding, LogicalTile, NativeEncoding, Payload, TcfError, TcfWriter};
 
 use super::allocate::allocate;
-use super::encoding::{values_f32, TcfOptions, TensorShape, TCF_ENCODING_NAMES};
+use super::encoding::{values_f32, TensorShape};
+use super::encoding_table::TCF_ENCODING_NAMES;
 use super::ladder::ladder_encodings;
+use super::objective_report::report_objectives;
+use super::options::TcfOptions;
 use super::parallel::quantize_named;
 use super::plan::{plan_one, reason_for, settle, PlannedTensor, Registration};
 use super::record::{
@@ -325,6 +328,7 @@ impl TcfFormatWriter {
         plan: &PlannedTensor,
         shape: &TensorShape,
         index: usize,
+        options: TcfOptions,
     ) -> Result<Payload> {
         let name = plan.name.as_str();
         // The plan's own encoding drives this, not the run's base encoding: a
@@ -341,11 +345,19 @@ impl TcfFormatWriter {
         }
         let bytes = Self::reread(source, model, name)?;
         let values = values_f32(&bytes, plan.dtype, name)?;
+        // Resolved from THIS tensor's encoding, not the run's base: a profile
+        // mixes encodings, and a bumped tensor quantized under the base
+        // encoding's objective would be the mixed-file defect this resolution
+        // exists to prevent. For a tensor still at the base it is the
+        // objective pass 1 used, so a payload recomputed here is the payload
+        // the spill would have returned.
+        let objective = options.objective_for(encoding);
         let tiles = quantize_named(
             &values,
             shape.extent(),
             shape.rank(),
             encoding.layout(),
+            objective.weights(),
             name,
         )?;
         Ok(Payload::Quantized(tiles))
@@ -578,6 +590,9 @@ impl FormatWriter for TcfFormatWriter {
 
         let options = self.options()?;
         allocate(&mut self.planned, options, self.sensitivity.as_ref())?;
+        // After the allocation, because the allocation is what fixes each
+        // tensor's encoding and therefore each tensor's objective.
+        report_objectives(&self.planned, options);
         self.declare_calibration()?;
         self.register_all()?;
         let writer = self
@@ -633,7 +648,7 @@ impl FormatWriter for TcfFormatWriter {
         let result = writer.finish_streaming(&mut sink, |index| {
             let produced = match (planned.get(index), shapes.get(index)) {
                 (Some(plan), Some(shape)) => {
-                    Self::payload(&source, &mut model, &mut spill, plan, shape, index)
+                    Self::payload(&source, &mut model, &mut spill, plan, shape, index, options)
                 }
                 _ => Err(anyhow!(
                     "TCF asked for tensor {index}, which was never planned"

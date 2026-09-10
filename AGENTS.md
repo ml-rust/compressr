@@ -28,6 +28,7 @@ This section is the SINGLE source of truth on what works. Everything below assum
 | TCF output         | TCF v1, one self-contained file, written through tcf-core  |
 | TCF quantization   | Q4S32_T64, Q4AS32_T64, Q4AS64_T64, Q6S32_T64, Q6S16D_T64, Q4AS32D_T64, Q8S32_T64 |
 | TCF threading      | One tensor's tile chunks quantize across rayon's pool, bytes unchanged |
+| TCF error objective | The default is PER ENCODING, from one table beside the encoding definitions: 4-bit and Q8S32_T64 take `uniform` (`w = 1`), the 6-bit encodings take `rms-plus-abs` (`w = sqrt(mean(x^2)) + \|x\|`), each chosen by measurement. It is resolved per TENSOR from that tensor's encoding, so a mixed profile minimizes each half of the file under its own objective. `--tcf-objective uniform\|squared\|rms-plus-abs` OVERRIDES that default on every tensor. Changes which values the encoder chooses, never a bit layout, so the file stays a conforming TCF v1 file. A 6-bit file written before this default does not reproduce byte for byte; `--tcf-objective uniform` writes the earlier bytes |
 | dtype cast         | F32, F16, BF16, round-to-nearest-even                      |
 | GGUF quantization  | Q4_0, Q4_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K              |
 | Sidecar copying    | Tokenizer and config files follow the weights              |

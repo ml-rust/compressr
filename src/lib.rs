@@ -24,6 +24,14 @@
 //!   worst-reconstructed share of the parameters
 //! - TCF task-metric allocation: the same profile, with the bump set ranked by
 //!   a measured sensitivity file instead
+//! - TCF error objective: each encoding carries its own default, and
+//!   `--tcf-objective` overrides that default on every tensor — `uniform`
+//!   (`w = 1`), `squared` (`w = x^2`) or `rms-plus-abs`
+//!   (`w = sqrt(mean(x^2)) + |x|` over each group). It is resolved per tensor
+//!   from that tensor's encoding, so a mixed-precision profile minimizes each
+//!   half of the file under the objective measured for it. It changes which
+//!   values the encoder chooses and no bit layout, so the file stays a
+//!   conforming TCF v1 file
 //! - GGUF task-metric allocation: the same four mixes, with the promotions
 //!   ranked by that measurement instead of by llama.cpp's positional rules,
 //!   spending the byte budget those rules would have spent. See
@@ -102,9 +110,11 @@ pub mod python;
 
 pub use cast::{cast_bytes, parse_target_dtype, torch_dtype_name, ACCEPTED_DTYPE_NAMES};
 pub use formats::{
-    parse_shard_size, parse_tcf_encoding, parse_tcf_profile, FormatWriter, GgufBatchWriter,
-    GgufFormatWriter, PlannedTensor, SafeTensorsFormatWriter, StreamingGgufWriter, TcfFormatWriter,
-    TcfOptions, TcfProfile, DEFAULT_MAX_SHARD_SIZE, TCF_ENCODING_NAMES, TCF_PROFILE_NAMES,
+    default_objective_for, objective_policy, parse_shard_size, parse_tcf_encoding,
+    parse_tcf_objective, parse_tcf_profile, FormatWriter, GgufBatchWriter, GgufFormatWriter,
+    ObjectiveSource, PlannedTensor, SafeTensorsFormatWriter, StreamingGgufWriter, TcfFormatWriter,
+    TcfObjective, TcfOptions, TcfProfile, DEFAULT_MAX_SHARD_SIZE, TCF_ENCODING_NAMES,
+    TCF_OBJECTIVE_NAMES, TCF_PROFILE_NAMES,
 };
 pub use loader::{
     extract_layer_index, LayerGroup, LoadedModel, ModelLoader, ModelMetadata, TcfFileFacts,
@@ -224,6 +234,16 @@ pub struct ConversionConfig {
     /// quantizable parameters the bump covers, so it sets one encoding per
     /// tensor rather than one for the whole model.
     pub tcf_profile: Option<TcfProfile>,
+    /// Error objective the TCF quantizer minimizes, for either TCF flag
+    ///
+    /// `None` leaves every tensor on the default its own ENCODING carries, so
+    /// a mixed-precision profile minimizes each half of the file under the
+    /// objective measured for it. `Some` overrides that default on every
+    /// tensor, whatever encoding it is written in. Either way the objective
+    /// changes which values the encoder chooses and no bit layout, so the file
+    /// stays a conforming TCF v1 file. Rejected by every format but
+    /// [`OutputFormat::Tcf`].
+    pub tcf_objective: Option<TcfObjective>,
     /// Measured task-metric sensitivity for the TCF profile's bump set
     ///
     /// Valid only alongside [`ConversionConfig::tcf_profile`], and only for a
@@ -262,6 +282,7 @@ impl ConversionConfig {
             arch: None,
             tcf: None,
             tcf_profile: None,
+            tcf_objective: None,
             tcf_sensitivity: None,
             gguf_sensitivity: None,
             gguf_mix: None,
@@ -293,6 +314,15 @@ impl ConversionConfig {
         self
     }
 
+    /// Set the error objective the TCF quantizer minimizes
+    ///
+    /// Unset leaves every tensor on its own encoding's default. Set overrides
+    /// that default on every tensor.
+    pub fn with_tcf_objective(mut self, objective: TcfObjective) -> Self {
+        self.tcf_objective = Some(objective);
+        self
+    }
+
     /// Set the measured task-metric sensitivity the bump set is ranked by
     pub fn with_tcf_sensitivity(mut self, measurement: SensitivityMeasurement) -> Self {
         self.tcf_sensitivity = Some(measurement);
@@ -305,9 +335,17 @@ impl ConversionConfig {
     /// Neither was given. [`ConversionConfig::validate`] refuses that first,
     /// so reaching this is an internal error.
     pub fn tcf_options(&self) -> Result<TcfOptions> {
+        // The objective rides on whichever flag named the encodings: it is
+        // orthogonal to both, so applying it in one place keeps a flat run
+        // and a profile run from diverging. `None` is carried as `None`, not
+        // defaulted here: the default belongs to each TENSOR's encoding and
+        // is resolved when that encoding is known.
+        let objective = self.tcf_objective;
         match (self.tcf, self.tcf_profile) {
-            (Some(options), _) => Ok(options),
-            (None, Some(profile)) => Ok(TcfOptions::from_profile(profile)),
+            (Some(options), _) => Ok(options.with_objective_override(objective)),
+            (None, Some(profile)) => {
+                Ok(TcfOptions::from_profile(profile).with_objective_override(objective))
+            }
             (None, None) => bail!("Internal error: --format tcf reached convert with no encoding"),
         }
     }
@@ -516,6 +554,14 @@ impl ConversionConfig {
                 "--sensitivity applies to --format tcf only, but --format is {:?}. It ranks a \
                  TCF profile's bump set, and no other format has one.",
                 self.output_format
+            );
+        } else if self.tcf_objective.is_some() {
+            bail!(
+                "--tcf-objective applies to --format tcf only, but --format is {:?}. It names \
+                 the error the TCF quantizer minimizes, and every other format's quantizer is \
+                 not TCF's. Accepted objectives: {}",
+                self.output_format,
+                TCF_OBJECTIVE_NAMES.join(", ")
             );
         }
         if let Some(dtype) = self.target_dtype {
@@ -864,6 +910,12 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
                 options.preferred_encoding
             ),
         }
+        // Stated on every run, uniform included: a reader comparing two files
+        // has to be able to see which error each one minimized, and a line
+        // that appears only sometimes cannot answer that. The writer states
+        // the RESULT per encoding once the allocation has fixed them; this
+        // line states the policy those results come from.
+        log::info!("{}", formats::objective_policy(options));
         log::info!(
             "TCF activation contract: exact F32 activations, F32 accumulate, F32 out; a \
              conversion that calibrated no activations tunes nothing for a \
@@ -1348,6 +1400,98 @@ mod tests {
             .with_tcf(tcf_options());
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("--format tcf only"), "{err}");
+    }
+
+    /// The objective names the error TCF's own quantizer minimizes, so it is
+    /// refused for every other format rather than silently ignored.
+    #[test]
+    fn test_tcf_objective_is_refused_for_another_format() {
+        let config = ConversionConfig::new("input/".into(), "out.gguf".into(), OutputFormat::Gguf)
+            .with_tcf_objective(TcfObjective::Squared);
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("--tcf-objective"), "{err}");
+        assert!(err.contains("--format tcf only"), "{err}");
+        assert!(err.contains("rms-plus-abs"), "{err}");
+    }
+
+    /// A run that names no objective leaves every tensor on its own
+    /// encoding's default, and an explicit one reaches a profile run and a
+    /// flat run alike.
+    #[test]
+    fn test_the_objective_defaults_per_encoding_and_reaches_both_tcf_flags() {
+        let flagless = ConversionConfig::new("input/".into(), "out.tcf".into(), OutputFormat::Tcf)
+            .with_tcf(tcf_options());
+        assert!(flagless.validate().is_ok());
+        let flagless = flagless.tcf_options().unwrap();
+        assert_eq!(flagless.objective_override, None);
+        // Q4S32_T64 is a 4-bit rung, whose default is the unweighted
+        // objective every earlier run wrote.
+        assert_eq!(
+            flagless.objective_for(tcf_core::NativeEncoding::Q4S32T64),
+            TcfObjective::Uniform
+        );
+        // The same flagless run resolves a 6-bit rung to the weighted
+        // objective a measurement chose for it.
+        assert_eq!(
+            flagless.objective_for(tcf_core::NativeEncoding::Q6S16DT64),
+            TcfObjective::RmsPlusAbs
+        );
+
+        let flat = ConversionConfig::new("input/".into(), "out.tcf".into(), OutputFormat::Tcf)
+            .with_tcf(tcf_options())
+            .with_tcf_objective(TcfObjective::Squared);
+        assert!(flat.validate().is_ok());
+        assert_eq!(
+            flat.tcf_options().unwrap().objective_override,
+            Some(TcfObjective::Squared)
+        );
+
+        let profiled = ConversionConfig::new("input/".into(), "out.tcf".into(), OutputFormat::Tcf)
+            .with_tcf_profile(parse_tcf_profile("compact").unwrap())
+            .with_tcf_objective(TcfObjective::RmsPlusAbs);
+        assert!(profiled.validate().is_ok());
+        let profiled = profiled.tcf_options().unwrap();
+        // An explicit flag wins on BOTH halves of a mixed profile.
+        for encoding in [
+            tcf_core::NativeEncoding::Q4AS32DT64,
+            tcf_core::NativeEncoding::Q6S16DT64,
+        ] {
+            assert_eq!(
+                profiled.objective_for(encoding),
+                TcfObjective::RmsPlusAbs,
+                "{encoding:?}"
+            );
+            assert!(profiled.objective_choice(encoding).1.is_explicit());
+        }
+        // The objective moves no encoding: the profile still names its base.
+        assert_eq!(profiled.encoding, tcf_core::NativeEncoding::Q4AS32DT64);
+    }
+
+    /// A mixed profile with no flag resolves per tensor, never once per file:
+    /// its 4-bit base and its 6-bit bump take different objectives.
+    #[test]
+    fn test_a_mixed_profile_resolves_the_objective_per_tensor() {
+        let config = ConversionConfig::new("input/".into(), "out.tcf".into(), OutputFormat::Tcf)
+            .with_tcf_profile(parse_tcf_profile("compact").unwrap());
+        assert!(config.validate().is_ok());
+        let options = config.tcf_options().unwrap();
+        assert_eq!(
+            options.objective_for(tcf_core::NativeEncoding::Q4AS32DT64),
+            TcfObjective::Uniform
+        );
+        assert_eq!(
+            options.objective_for(tcf_core::NativeEncoding::Q6S16DT64),
+            TcfObjective::RmsPlusAbs
+        );
+        assert!(!options
+            .objective_choice(tcf_core::NativeEncoding::Q6S16DT64)
+            .1
+            .is_explicit());
+        // The policy line has to say the file is mixed rather than name one
+        // objective for all of it.
+        let line = objective_policy(options);
+        assert!(line.contains("MIXED precision"), "{line}");
+        assert!(line.contains("does NOT reproduce byte for byte"), "{line}");
     }
 
     /// A cast target names one element type for every float tensor, which is

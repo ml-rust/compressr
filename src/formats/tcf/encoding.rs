@@ -4,19 +4,8 @@
 use anyhow::{bail, Context, Result};
 use tcf_core::{NativeEncoding, RawEncoding};
 
-use super::profile::TcfProfile;
+use super::encoding_table::{definition, definition_by_name, TCF_ENCODING_NAMES};
 use crate::loader::UnifiedDType;
-
-/// The `--tcf-encoding` values, in the order the CLI help lists them.
-pub const TCF_ENCODING_NAMES: [&str; 7] = [
-    "q4s32t64",
-    "q4as32t64",
-    "q4as64t64",
-    "q6s32t64",
-    "q6s16dt64",
-    "q4as32dt64",
-    "q8s32t64",
-];
 
 /// One encoding name with its case, underscores and hyphens removed.
 ///
@@ -37,18 +26,12 @@ pub fn normalized_encoding_name(s: &str) -> String {
 /// name, so the name has to be one fixed string rather than whatever a caller
 /// happened to read out of a file.
 pub fn tcf_encoding_name(encoding: NativeEncoding) -> &'static str {
-    match encoding {
-        NativeEncoding::Q4S32T64 => "Q4S32_T64",
-        NativeEncoding::Q4AS32T64 => "Q4AS32_T64",
-        NativeEncoding::Q4AS32DT64 => "Q4AS32D_T64",
-        NativeEncoding::Q4AS64T64 => "Q4AS64_T64",
-        NativeEncoding::Q6S32T64 => "Q6S32_T64",
-        NativeEncoding::Q6S16DT64 => "Q6S16D_T64",
-        NativeEncoding::Q8S32T64 => "Q8S32_T64",
+    match definition(encoding) {
+        Some(def) => def.display_name,
         // `NativeEncoding` is `#[non_exhaustive]`: a rung tcf-core adds and
-        // compressr has no name for is reported by its identifier rather than
+        // compressr has no row for is reported by its identifier rather than
         // by a name invented here.
-        _ => "unnamed TCF encoding",
+        None => "unnamed TCF encoding",
     }
 }
 
@@ -63,62 +46,13 @@ pub fn tcf_encoding_name(encoding: NativeEncoding) -> &'static str {
 /// The name is not one of [`TCF_ENCODING_NAMES`].
 pub fn parse_tcf_encoding(s: &str) -> Result<NativeEncoding> {
     let normalized = normalized_encoding_name(s);
-    match normalized.as_str() {
-        "q4s32t64" => Ok(NativeEncoding::Q4S32T64),
-        "q4as32t64" => Ok(NativeEncoding::Q4AS32T64),
-        "q4as64t64" => Ok(NativeEncoding::Q4AS64T64),
-        "q6s32t64" => Ok(NativeEncoding::Q6S32T64),
-        "q6s16dt64" => Ok(NativeEncoding::Q6S16DT64),
-        "q4as32dt64" => Ok(NativeEncoding::Q4AS32DT64),
-        "q8s32t64" => Ok(NativeEncoding::Q8S32T64),
-        _ => bail!(
+    match definition_by_name(&normalized) {
+        Some(def) => Ok(def.encoding),
+        None => bail!(
             "Unsupported TCF encoding: {}. Supported: {}",
             s,
             TCF_ENCODING_NAMES.join(", ")
         ),
-    }
-}
-
-/// What a TCF conversion quantizes into, and what its module says it prefers.
-///
-/// Both are explicit. `preferred_encoding` has no source of truth in a
-/// checkpoint, and TCF reads it to decide which tensors carry a
-/// `fallback_reason`, so compressr requires it rather than inventing one.
-///
-/// `--tcf-encoding` sets one encoding for every tensor. `--tcf-profile` sets
-/// `encoding` and `preferred_encoding` to the profile's base and carries the
-/// profile, which raises the screened tensors to its bump encoding.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct TcfOptions {
-    /// The encoding a quantizable tensor is written in unless a profile bumps it
-    pub encoding: NativeEncoding,
-    /// The module's highest-ranked `preferred_encoding`
-    pub preferred_encoding: NativeEncoding,
-    /// The profile driving a mixed-precision allocation, if one was named
-    pub profile: Option<TcfProfile>,
-}
-
-impl TcfOptions {
-    /// One encoding for every quantizable tensor, as `--tcf-encoding` sets it.
-    pub fn uniform(encoding: NativeEncoding, preferred_encoding: NativeEncoding) -> Self {
-        Self {
-            encoding,
-            preferred_encoding,
-            profile: None,
-        }
-    }
-
-    /// A profile's allocation, as `--tcf-profile` sets it.
-    ///
-    /// The base encoding is also the module preference, so a tensor left at
-    /// the base records no fallback reason and a bumped one records
-    /// `TaskSensitivity`.
-    pub fn from_profile(profile: TcfProfile) -> Self {
-        Self {
-            encoding: profile.base,
-            preferred_encoding: profile.base,
-            profile: Some(profile),
-        }
     }
 }
 

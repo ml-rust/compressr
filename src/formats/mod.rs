@@ -33,8 +33,10 @@ pub use safetensors::{
 };
 
 pub use tcf::{
-    normalized_encoding_name, parse_tcf_encoding, parse_tcf_profile, tcf_encoding_name,
-    PlannedTensor, TcfFormatWriter, TcfOptions, TcfProfile, TCF_ENCODING_NAMES, TCF_PROFILE_NAMES,
+    default_objective_for, normalized_encoding_name, objective_policy, parse_tcf_encoding,
+    parse_tcf_objective, parse_tcf_profile, tcf_encoding_name, ObjectiveSource, PlannedTensor,
+    TcfFormatWriter, TcfObjective, TcfOptions, TcfProfile, TCF_ENCODING_NAMES, TCF_OBJECTIVE_NAMES,
+    TCF_PROFILE_NAMES,
 };
 
 use anyhow::{bail, Context, Result};
