@@ -53,8 +53,8 @@ pub const EXACT_F32_CONTRACT_ID: u32 = 1;
 /// and `qmax` describe an activation quantization grid that `F32` does not
 /// have, so they stay zero; Section 9.2 defines them for `A8S32_DYNAMIC`
 /// alone. `quant_axis`, `rounding_mode` and `scale_compute_dtype` carry the
-/// one value v1 defines for each. `kernel_semantics_id` and `calibration_id`
-/// stay zero: compressr names no kernel and runs no calibration.
+/// one value v1 defines for each. `calibration_id` stays zero: compressr
+/// runs no calibration.
 ///
 /// `math_mode` is `REASSOCIATION_ALLOWED`. compressr places no constraint on
 /// the order a consumer's kernel accumulates in — it never measured an error
@@ -79,7 +79,6 @@ pub fn contract_record() -> ContractRecord {
         dot_accumulator: DotAccumulator::F32,
         output_dtype: OutputDtype::F32,
         math_mode: MathMode::ReassociationAllowed,
-        kernel_semantics_id: 0,
         calibration_id: 0,
         flags: ContractFlags::NONE,
         contract_digest: [0u8; 16],
@@ -293,7 +292,6 @@ mod tests {
         assert_eq!(contract.quant_group, 0);
         assert_eq!(contract.qmin, 0);
         assert_eq!(contract.qmax, 0);
-        assert_eq!(contract.kernel_semantics_id, 0);
         assert_eq!(contract.calibration_id, 0);
         assert_eq!(contract.contract_digest, [0u8; 16]);
     }
