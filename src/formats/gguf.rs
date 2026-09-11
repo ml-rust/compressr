@@ -188,6 +188,7 @@ impl GgmlType {
             QuantType::Q4K => GgmlType::Q4K,
             QuantType::Q5K => GgmlType::Q5K,
             QuantType::Q6K => GgmlType::Q6K,
+            QuantType::IQ4NL => GgmlType::Iq4Nl,
             QuantType::FP8 => GgmlType::F16, // FP8 stored as F16 in GGUF (closest supported)
             QuantType::NF4 => GgmlType::Q4_0, // NF4 approximated as Q4_0 in GGUF
             QuantType::FP4 => GgmlType::Q4_0, // FP4 approximated as Q4_0 in GGUF

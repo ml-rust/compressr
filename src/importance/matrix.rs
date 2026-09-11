@@ -19,8 +19,8 @@ use boostr::quant::{ImportanceCheck, ImportanceEntry, ImportanceMatrix};
 ///
 /// One string, so a refusal from the config check and a refusal from the
 /// quantizer cannot list two different sets.
-pub const IMPORTANCE_ACCEPTED: &str = "--format gguf with a K-quant --quantization (q2_k, q3_k, \
-     q4_k, q5_k, q6_k, q4_k_s, q4_k_m, q5_k_s, q5_k_m), or --format tcf";
+pub const IMPORTANCE_ACCEPTED: &str = "--format gguf with a K-quant or IQ4_NL --quantization \
+     (q2_k, q3_k, q4_k, q5_k, q6_k, iq4_nl, q4_k_s, q4_k_m, q5_k_s, q5_k_m), or --format tcf";
 
 /// Read an importance matrix file.
 ///

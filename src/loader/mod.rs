@@ -695,6 +695,7 @@ pub enum UnifiedDType {
     IQ3S,
     IQ2S,
     IQ4XS,
+    IQ1M,
     /// Unknown type
     Unknown,
 }
@@ -737,6 +738,15 @@ impl UnifiedDType {
             GgmlType::Q5K => Self::Q5K,
             GgmlType::Q6K => Self::Q6K,
             GgmlType::Q8K => Self::Q8K,
+            GgmlType::IQ2XXS => Self::IQ2XXS,
+            GgmlType::IQ2XS => Self::IQ2XS,
+            GgmlType::IQ3XXS => Self::IQ3XXS,
+            GgmlType::IQ1S => Self::IQ1S,
+            GgmlType::IQ4NL => Self::IQ4NL,
+            GgmlType::IQ3S => Self::IQ3S,
+            GgmlType::IQ2S => Self::IQ2S,
+            GgmlType::IQ4XS => Self::IQ4XS,
+            GgmlType::IQ1M => Self::IQ1M,
         }
     }
 
@@ -764,6 +774,7 @@ impl UnifiedDType {
                 | Self::IQ3S
                 | Self::IQ2S
                 | Self::IQ4XS
+                | Self::IQ1M
         )
     }
 
@@ -806,7 +817,7 @@ impl UnifiedDType {
             Self::Q4_0 | Self::Q4_1 | Self::Q4K => 4.5,
             Self::Q3K | Self::IQ3XXS | Self::IQ3S => 3.5,
             Self::Q2K | Self::IQ2XXS | Self::IQ2XS | Self::IQ2S => 2.5,
-            Self::IQ1S => 1.5,
+            Self::IQ1S | Self::IQ1M => 1.5,
             Self::IQ4NL | Self::IQ4XS => 4.5,
             Self::I64 => 64.0,
             Self::Unknown => 32.0, // Assume F32
@@ -848,6 +859,7 @@ impl std::fmt::Display for UnifiedDType {
             Self::IQ3S => write!(f, "IQ3_S"),
             Self::IQ2S => write!(f, "IQ2_S"),
             Self::IQ4XS => write!(f, "IQ4_XS"),
+            Self::IQ1M => write!(f, "IQ1_M"),
             Self::Unknown => write!(f, "Unknown"),
         }
     }

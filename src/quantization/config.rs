@@ -31,6 +31,8 @@ pub enum QuantizationMethod {
     Q5K,
     /// GGUF Q6_K (llama.cpp K-quant)
     Q6K,
+    /// GGUF IQ4_NL (llama.cpp I-quant, flat only — no mix rules exist here)
+    IQ4NL,
 }
 
 impl QuantizationMethod {
@@ -43,6 +45,7 @@ impl QuantizationMethod {
     pub fn bits_per_weight(&self) -> f32 {
         match self {
             Self::Gptq | Self::Awq | Self::Nf4 | Self::Q4_0 | Self::Q4_1 | Self::Q4K => 4.5,
+            Self::IQ4NL => 4.5,
             Self::Fp8 | Self::Q8_0 => 8.5,
             Self::Q2K => 2.5,
             Self::Q3K => 3.5,
@@ -54,7 +57,7 @@ impl QuantizationMethod {
     /// Whether compressr can write a tensor packed by this method.
     ///
     /// GGUF is the only container compressr writes quantized tensors into, and
-    /// only these eight have a GGML block type to write them as. The other
+    /// only these nine have a GGML block type to write them as. The other
     /// four each need an on-disk layout that does not exist yet: NF4 and FP8
     /// keep their scales OUTSIDE the packed payload, and GPTQ and AWQ split
     /// one layer into several tensors (`qweight` packed as I32, plus
@@ -72,6 +75,7 @@ impl QuantizationMethod {
                 | Self::Q4K
                 | Self::Q5K
                 | Self::Q6K
+                | Self::IQ4NL
         )
     }
 
@@ -90,6 +94,7 @@ impl QuantizationMethod {
             Self::Q4K => QuantType::Q4K,
             Self::Q5K => QuantType::Q5K,
             Self::Q6K => QuantType::Q6K,
+            Self::IQ4NL => QuantType::IQ4NL,
             Self::Nf4 => QuantType::NF4,
             Self::Fp8 => QuantType::FP8,
             Self::Gptq => QuantType::GPTQ,
@@ -102,6 +107,7 @@ impl QuantizationMethod {
         match self {
             Self::Q4_0 | Self::Q4_1 | Self::Q8_0 => 32,
             Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K => 256,
+            Self::IQ4NL => 32,
             Self::Nf4 => 64,
             Self::Gptq | Self::Awq => 128, // Typical group size
             Self::Fp8 => 1,
@@ -251,6 +257,17 @@ impl QuantizationConfig {
             calibration_samples: 0,
         }
     }
+
+    /// Create an IQ4_NL configuration (llama.cpp I-quant, flat only)
+    pub fn iq4_nl() -> Self {
+        Self {
+            method: QuantizationMethod::IQ4NL,
+            bits: 4,
+            group_size: 32,
+            calibration_dataset: None,
+            calibration_samples: 0,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -268,6 +285,7 @@ mod tests {
             QuantizationMethod::Q4K,
             QuantizationMethod::Q5K,
             QuantizationMethod::Q6K,
+            QuantizationMethod::IQ4NL,
         ] {
             assert!(method.is_writable(), "{method:?} has a GGML block type");
         }
@@ -283,5 +301,15 @@ mod tests {
                 "{method:?} has no on-disk layout in compressr"
             );
         }
+    }
+
+    /// IQ4_NL packs as `QuantType::IQ4NL`, at 4.5 bits per weight and a
+    /// 32-element block — a simple block, not a K-quant super-block.
+    #[test]
+    fn test_iq4_nl_maps_to_its_own_quant_type() {
+        let method = QuantizationMethod::IQ4NL;
+        assert_eq!(method.quant_type(), QuantType::IQ4NL);
+        assert_eq!(method.bits_per_weight(), 4.5);
+        assert_eq!(method.block_size(), 32);
     }
 }

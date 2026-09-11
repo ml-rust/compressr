@@ -108,7 +108,7 @@ enum Commands {
         #[arg(short, long, value_name = "PATH")]
         output: Option<String>,
 
-        /// Quantization level (q4_0, q4_1, q8_0, q2_k, q3_k, q4_k, q5_k, q6_k, nf4, fp8)
+        /// Quantization level (q4_0, q4_1, q8_0, q2_k, q3_k, q4_k, q5_k, q6_k, iq4_nl, nf4, fp8)
         ///
         /// Also accepts llama.cpp's mixed-precision names — q4_k_s, q4_k_m,
         /// q5_k_s, q5_k_m — which assign a different GGUF block format to
@@ -241,13 +241,13 @@ enum Commands {
         /// reconstruction error by it, which changes which values the encoder
         /// chooses and no bit layout.
         ///
-        /// Accepted with --format gguf when the quantization is a K-quant
-        /// (q2_k, q3_k, q4_k, q5_k, q6_k) or a K-quant mix (q4_k_s, q4_k_m,
-        /// q5_k_s, q5_k_m), and with --format tcf. A tensor the matrix does
-        /// not measure is quantized UNWEIGHTED, and a tensor whose assigned
-        /// block format has no weighted writer is too; both are counted and
-        /// reported. A matrix whose column counts disagree with the
-        /// checkpoint is refused before any output file is created.
+        /// Accepted with --format gguf when the quantization is a K-quant or
+        /// IQ4_NL (q2_k, q3_k, q4_k, q5_k, q6_k, iq4_nl) or a K-quant mix
+        /// (q4_k_s, q4_k_m, q5_k_s, q5_k_m), and with --format tcf. A tensor
+        /// the matrix does not measure is quantized UNWEIGHTED, and a tensor
+        /// whose assigned block format has no weighted writer is too; both
+        /// are counted and reported. A matrix whose column counts disagree
+        /// with the checkpoint is refused before any output file is created.
         #[arg(long, value_name = "FILE")]
         imatrix: Option<String>,
 
@@ -579,7 +579,8 @@ fn main() -> Result<()> {
                 | QuantizationMethod::Q3K
                 | QuantizationMethod::Q4K
                 | QuantizationMethod::Q5K
-                | QuantizationMethod::Q6K => OutputFormat::Gguf,
+                | QuantizationMethod::Q6K
+                | QuantizationMethod::IQ4NL => OutputFormat::Gguf,
             };
 
             let quant_config = QuantizationConfig {

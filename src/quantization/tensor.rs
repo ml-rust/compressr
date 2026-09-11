@@ -7,6 +7,7 @@ use half::f16;
 
 // Use boostr's quantization tables and utilities
 use boostr::quant::cpu::kernels::dequant;
+use boostr::quant::cpu::kernels::dequant_iq4;
 use boostr::quant::tables::dequantize_nf4 as nf4_codebook_dequant;
 
 /// Quantized tensor data
@@ -66,6 +67,7 @@ impl QuantizedTensor {
             QuantType::Q4K => self.dequantize_ggml(256, 144, dequant::dequant_q4k),
             QuantType::Q5K => self.dequantize_ggml(256, 176, dequant::dequant_q5k),
             QuantType::Q6K => self.dequantize_ggml(256, 210, dequant::dequant_q6k),
+            QuantType::IQ4NL => self.dequantize_ggml(32, 18, dequant_iq4::dequant_iq4_nl),
             _ => {
                 log::warn!("Dequantization not implemented for {:?}", self.quant_type);
                 vec![0.0; self.original_numel]

@@ -165,6 +165,7 @@ pub fn quant_type_label(quant_type: QuantType) -> &'static str {
         QuantType::Q4K => "Q4_K",
         QuantType::Q5K => "Q5_K",
         QuantType::Q6K => "Q6_K",
+        QuantType::IQ4NL => "IQ4_NL",
         QuantType::NF4 => "NF4",
         QuantType::FP4 => "FP4",
         QuantType::FP8 => "FP8",
