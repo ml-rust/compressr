@@ -5,6 +5,12 @@
 //! converting one would quantize twice and would need a GGML dequantizer per
 //! format. See `hats/tcf/MIGRATION.md` Section 3.
 //!
+//! Two writers share the container. [`TcfFormatWriter`] quantizes to TCF's
+//! native tile encodings (`--tcf-encoding`, `--tcf-profile`).
+//! [`TcfBlockFormatWriter`] stores the GGML block streams a `--quantization`
+//! run produces, byte for byte what the GGUF writer would store, so a TCF
+//! file is never behind the GGUF of the same model.
+//!
 //! # What this module does not own
 //!
 //! Layout and packing. Every bit position, nibble index, tile order and plane
@@ -19,6 +25,8 @@
 //! proves nothing.
 
 mod allocate;
+mod block_spill;
+mod block_writer;
 mod chunk;
 mod encoding;
 mod encoding_table;
@@ -39,6 +47,7 @@ mod search_effort;
 mod spill;
 mod writer;
 
+pub use block_writer::{block_encoding_for, TcfBlockFormatWriter};
 pub use encoding::{normalized_encoding_name, parse_tcf_encoding, tcf_encoding_name};
 pub use encoding_table::{default_objective_for, TCF_ENCODING_NAMES};
 pub use importance_form::{parse_tcf_importance, ImportanceForm, TCF_IMPORTANCE_NAMES};

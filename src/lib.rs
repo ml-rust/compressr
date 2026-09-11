@@ -127,9 +127,9 @@ pub use formats::{
     parse_tcf_importance, parse_tcf_objective, parse_tcf_profile, parse_tcf_search,
     tcf_search_name, tcf_search_report, FormatWriter, GgufBatchWriter, GgufFormatWriter,
     ImportanceForm, ObjectiveSource, PlannedTensor, SafeTensorsFormatWriter, StreamingGgufWriter,
-    TcfFormatWriter, TcfObjective, TcfOptions, TcfProfile, DEFAULT_MAX_SHARD_SIZE,
-    TCF_ENCODING_NAMES, TCF_IMPORTANCE_NAMES, TCF_OBJECTIVE_NAMES, TCF_PROFILE_NAMES,
-    TCF_SEARCH_NAMES,
+    TcfBlockFormatWriter, TcfFormatWriter, TcfObjective, TcfOptions, TcfProfile,
+    DEFAULT_MAX_SHARD_SIZE, TCF_ENCODING_NAMES, TCF_IMPORTANCE_NAMES, TCF_OBJECTIVE_NAMES,
+    TCF_PROFILE_NAMES, TCF_SEARCH_NAMES,
 };
 pub use importance::{
     check_importance_matrix, importance_columns, importance_layout_line, importance_source_line,
@@ -533,25 +533,26 @@ impl ConversionConfig {
             // A block-quantized tensor is a run of whole blocks, not a run of
             // elements of one type. SafeTensors describes a tensor only by
             // element type and shape, so it has nowhere to record the block
-            // layout, and a reader would see U8 noise.
-            if self.output_format != OutputFormat::Gguf {
+            // layout, and a reader would see U8 noise. GGUF records a
+            // `ggml_type` per tensor and TCF a block encoding per tensor.
+            if !matches!(self.output_format, OutputFormat::Gguf | OutputFormat::Tcf) {
                 bail!(
-                    "Quantization writes GGUF only, but --format is {:?}. A SafeTensors \
-                     header records an element type and a shape, which cannot describe a \
-                     block-quantized tensor. Use --format gguf, or --dtype for a cast.",
+                    "Quantization writes GGUF or TCF only, but --format is {:?}. A \
+                     SafeTensors header records an element type and a shape, which cannot \
+                     describe a block-quantized tensor. Use --format gguf, --format tcf, or \
+                     --dtype for a cast.",
                     self.output_format
                 );
             }
         }
         if let Some(mix) = self.gguf_mix {
-            // A mix is a table of per-tensor GGML block types, and GGUF's
-            // tensor directory is the only container here that records a type
-            // per tensor.
-            if self.output_format != OutputFormat::Gguf {
+            // A mix is a table of per-tensor GGML block types; GGUF's tensor
+            // directory and TCF's block encodings both record one per tensor.
+            if !matches!(self.output_format, OutputFormat::Gguf | OutputFormat::Tcf) {
                 bail!(
-                    "Mixed precision {} writes GGUF only, but --format is {:?}. A mix \
-                     assigns a different block type to different tensors, which only \
-                     GGUF's tensor directory can record.",
+                    "Mixed precision {} writes GGUF or TCF only, but --format is {:?}. A \
+                     mix assigns a different block type to different tensors, which only a \
+                     per-tensor type directory can record.",
                     mix.name(),
                     self.output_format
                 );
@@ -568,9 +569,10 @@ impl ConversionConfig {
         // quantization writes one format for every tensor, so it has no
         // promotion set and nothing to rank.
         if let Some(ref measurement) = self.gguf_sensitivity {
-            if self.output_format != OutputFormat::Gguf {
+            if !self.writes_gguf_blocks() {
                 bail!(
-                    "--sensitivity was given for a GGUF mix, but --format is {:?}.",
+                    "--sensitivity was given for a GGUF mix, but --format is {:?} with no \
+                     --quantization.",
                     self.output_format
                 );
             }
@@ -585,6 +587,37 @@ impl ConversionConfig {
             policy::check_measurement_encoding(mix, measurement)?;
         }
         if self.output_format == OutputFormat::Tcf {
+            // A --quantization run stores GGML block encodings, planned and
+            // quantized as a GGUF run is. The flags below configure TCF's
+            // native quantizer, which such a run never calls, so a run naming
+            // both asked for two different files.
+            if self.quantization.is_some() {
+                let native_flag = [
+                    (self.tcf.is_some(), "--tcf-encoding"),
+                    (self.tcf_profile.is_some(), "--tcf-profile"),
+                    (self.tcf_objective.is_some(), "--tcf-objective"),
+                    (self.tcf_importance.is_some(), "--tcf-importance"),
+                    (self.tcf_search.is_some(), "--tcf-search"),
+                    (self.tcf_sensitivity.is_some(), "--sensitivity"),
+                ]
+                .into_iter()
+                .find_map(|(set, flag)| set.then_some(flag));
+                if let Some(flag) = native_flag {
+                    bail!(
+                        "--quantization and {flag} are mutually exclusive with --format tcf: \
+                         --quantization stores GGML block encodings in TCF, exactly as a GGUF \
+                         run quantizes them, and {flag} configures TCF's native quantizer, \
+                         which that run never calls. Pick one."
+                    );
+                }
+                if self.target_dtype.is_some() {
+                    bail!(
+                        "--dtype and --format tcf are mutually exclusive: TCF records an \
+                         encoding per tensor, so a cast target has no meaning beside it."
+                    );
+                }
+                return self.validate_common();
+            }
             // A TCF module record ranks the encodings its producer prefers,
             // and TCF requires a `fallback_reason` on every tensor whose
             // encoding differs from the top-ranked one. Nothing in a
@@ -599,10 +632,11 @@ impl ConversionConfig {
             }
             if self.tcf.is_none() && self.tcf_profile.is_none() {
                 bail!(
-                    "--format tcf needs --tcf-profile, or --tcf-encoding with \
-                     --tcf-preferred-encoding. Neither has a default: the encoding fixes the \
-                     stored weights, and the preferred encoding decides which tensors record \
-                     a fallback reason. Accepted profiles: {}. Accepted encodings: {}",
+                    "--format tcf needs --quantization (GGML block encodings), \
+                     --tcf-profile, or --tcf-encoding with --tcf-preferred-encoding. None \
+                     has a default: the encoding fixes the stored weights, and the preferred \
+                     encoding decides which tensors record a fallback reason. Accepted \
+                     profiles: {}. Accepted encodings: {}",
                     TCF_PROFILE_NAMES.join(", "),
                     TCF_ENCODING_NAMES.join(", ")
                 );
@@ -682,6 +716,22 @@ impl ConversionConfig {
                 TCF_SEARCH_NAMES.join(", ")
             );
         }
+        self.validate_common()
+    }
+
+    /// Whether the output holds GGML block streams: a GGUF file, or a TCF
+    /// file written from `--quantization`.
+    fn writes_gguf_blocks(&self) -> bool {
+        match self.output_format {
+            OutputFormat::Gguf => true,
+            OutputFormat::Tcf => self.quantization.is_some(),
+            _ => false,
+        }
+    }
+
+    /// The checks every output format shares: the importance flags and the
+    /// cast target.
+    fn validate_common(&self) -> Result<()> {
         // Both forms describe what to do with an importance vector, so a run
         // that named one without a matrix selected nothing. Refused rather
         // than ignored: such a run would get the flagless bytes and no way to
@@ -700,9 +750,9 @@ impl ConversionConfig {
         // tell.
         if self.imatrix.is_some() {
             match self.output_format {
-                // Every TCF encoding takes an explicit weight source.
-                OutputFormat::Tcf => {}
-                OutputFormat::Gguf => {
+                // Every TCF native encoding takes an explicit weight source.
+                OutputFormat::Tcf if self.quantization.is_none() => {}
+                OutputFormat::Gguf | OutputFormat::Tcf => {
                     // A mix is a K-quant mix throughout; the tensors it puts
                     // in another format are quantized unweighted and counted.
                     let weighted = self.gguf_mix.is_some()
@@ -713,7 +763,7 @@ impl ConversionConfig {
                     if !weighted {
                         bail!(
                             "--imatrix needs a K-quant, IQ4_NL or IQ4_XS quantization for a \
-                             GGUF output. boostr has an importance-weighted writer for Q2_K, \
+                             block output. boostr has an importance-weighted writer for Q2_K, \
                              Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL and IQ4_XS only, so every other \
                              block format would ignore the file entirely. Accepted: {}.",
                             IMPORTANCE_ACCEPTED
@@ -951,157 +1001,24 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
     // Get model metadata
     let metadata = model.metadata();
 
-    // The mix rules read the architecture, so the value written to
-    // `general.architecture` is kept rather than resolved a second time.
-    let mut gguf_arch: Option<String> = None;
-
-    // Configure writer based on format
-    if config.output_format == OutputFormat::Gguf {
-        // For GGUF, we need to set up metadata. Every consumer keys its
-        // tensor-name mapping off `general.architecture`, so it is resolved
-        // from the checkpoint (or --arch) rather than guessed.
-        let input_path = Path::new(&config.input_path);
-        let arch = policy::resolve_architecture(
-            config.arch.as_deref(),
-            metadata.architecture.as_deref(),
-            input_path,
-        )?;
-        gguf_arch = Some(arch.clone());
-        let arch = arch.as_str();
-
-        // We need to configure the writer before initialization
-        // Since we can't easily downcast, we'll create a new GGUF-specific writer
-        let mut gguf_writer = GgufFormatWriter::new();
-        gguf_writer.set_architecture(arch);
-
-        // The name is the checkpoint's own name, not its architecture. With no
-        // checkpoint directory to take it from, no name is written.
-        if let Some(name) = policy::model_name(input_path) {
-            gguf_writer.set_name(&name);
-        }
-
-        // Add architecture-specific metadata
-        if let Some(vocab_size) = metadata.vocab_size {
-            gguf_writer.add_metadata(
-                &format!("{}.vocab_size", arch),
-                formats::GgufValue::Uint32(vocab_size as u32),
-            );
-        }
-        if let Some(hidden_size) = metadata.hidden_size {
-            gguf_writer.add_metadata(
-                &format!("{}.embedding_length", arch),
-                formats::GgufValue::Uint32(hidden_size as u32),
-            );
-        }
-        if let Some(num_layers) = metadata.num_layers {
-            gguf_writer.add_metadata(
-                &format!("{}.block_count", arch),
-                formats::GgufValue::Uint32(num_layers as u32),
-            );
-        }
-
-        // `general.file_type` names the file, and only that: a reader takes
-        // each tensor's format from the tensor directory. The values are
-        // llama.cpp's `llama_ftype` enum, which is NOT the GGML type id — a
-        // file written with GGML ids reports Q3_K_M for a Q4_K model.
-        if let Some(mix) = config.gguf_mix {
-            gguf_writer.set_file_type(mix.llama_ftype());
-        } else if let Some(qt) = quant_type {
-            let file_type = match qt {
-                QuantType::Q4_0 => 2,
-                QuantType::Q4_1 => 3,
-                QuantType::Q8_0 => 7,
-                QuantType::Q5_0 => 8,
-                QuantType::Q5_1 => 9,
-                QuantType::Q2K => 10,
-                // llama.cpp names no ftype for a flat K-quant, because its own
-                // K-quant paths are all mixes. The nearest published value is
-                // the `_S` variant of the same base format.
-                QuantType::Q3K => 11,
-                QuantType::Q4K => 14,
-                QuantType::Q5K => 16,
-                QuantType::Q6K => 18,
-                // IQ4_NL is a flat format in llama.cpp too, so it gets a real
-                // `llama_ftype` value rather than a borrowed `_S` one: see
-                // `LLAMA_FTYPE_MOSTLY_IQ4_NL` in llama.cpp's `llama.h`.
-                QuantType::IQ4NL => 25,
-                // IQ4_XS is also flat in llama.cpp, with its own real
-                // `llama_ftype` value: see `LLAMA_FTYPE_MOSTLY_IQ4_XS` in
-                // llama.cpp's `llama.h`.
-                QuantType::IQ4XS => 30,
-                _ => 1, // F16 default
-            };
-            gguf_writer.set_file_type(file_type);
-        } else if let Some(dtype) = config.target_dtype {
-            // GGUF file_type values for unquantized casts.
-            let file_type = match dtype {
-                UnifiedDType::F32 => 0,
-                UnifiedDType::BF16 => 32,
-                _ => 1, // F16
-            };
-            gguf_writer.set_file_type(file_type);
-        }
-
-        writer = Box::new(gguf_writer);
-    }
-
-    if config.output_format == OutputFormat::Tcf {
-        // TCF quantizes from the full-precision source itself, so the writer
-        // needs the input path as well as the encoding: its payload pass
-        // re-reads one tensor at a time instead of holding every payload.
-        let options = config.tcf_options()?;
-        let mut tcf_writer = TcfFormatWriter::new()
-            .with_options(options)
-            .with_source(&config.input_path);
-        if let Some(name) = policy::model_name(Path::new(&config.input_path)) {
-            tcf_writer = tcf_writer.with_module_name(&name);
-        }
-        if let Some(matrix) = config.imatrix.clone() {
-            tcf_writer = tcf_writer.with_importance(matrix);
-        }
-        if let Some(measurement) = config.tcf_sensitivity.clone() {
-            log::info!(
-                "TCF sensitivity: {} measured tensors over {} evaluation rows at {}, \
-                 calibration {:#010x}",
-                measurement.measured(),
-                measurement.baseline().eval_rows,
-                measurement.baseline().encoding,
-                measurement.calibration_id()
-            );
-            tcf_writer = tcf_writer.with_sensitivity(measurement);
-        }
-        match options.profile {
-            Some(profile) => log::info!(
-                "TCF profile {}: base {:?}, bump {:?} on the top {:.0}% of quantizable \
-                 parameters",
-                profile.name,
-                profile.base,
-                profile.bump,
-                profile.bump_fraction * 100.0
-            ),
-            None => log::info!(
-                "TCF encoding: {:?}, module preferred encoding: {:?}",
-                options.encoding,
-                options.preferred_encoding
-            ),
-        }
-        // Stated on every run, uniform included: a reader comparing two files
-        // has to be able to see which error each one minimized, and a line
-        // that appears only sometimes cannot answer that. The writer states
-        // the RESULT per encoding once the allocation has fixed them; this
-        // line states the policy those results come from.
-        log::info!("{}", formats::objective_policy(options));
-        log::info!(
-            "TCF activation contract: exact F32 activations, F32 accumulate, F32 out; a \
-             conversion that calibrated no activations tunes nothing for a \
-             quantized-activation kernel. workload_profile_id is left unset: compressr \
-             measures no workload. calibration_id is set only on a --sensitivity run, from \
-             the measurement that run read."
-        );
-        writer = Box::new(tcf_writer);
-    }
+    // The mix rules read the architecture, and GGUF writes it as
+    // `general.architecture`, so it is resolved once from the checkpoint (or
+    // --arch) rather than guessed. Every consumer keys its tensor-name
+    // mapping off it.
+    let gguf_arch: Option<String> =
+        if config.output_format == OutputFormat::Gguf || config.gguf_mix.is_some() {
+            Some(policy::resolve_architecture(
+                config.arch.as_deref(),
+                metadata.architecture.as_deref(),
+                Path::new(&config.input_path),
+            )?)
+        } else {
+            None
+        };
 
     // Collect tensor info for registration (need to collect because we iterate twice)
+    // Planned before the writer exists: the TCF block writer takes the plan
+    // list, which supplies each tensor's fallback reason.
     let tensor_info: Vec<(String, UnifiedTensorInfo)> = model.tensors().collect();
 
     // A matrix whose column counts disagree with this checkpoint was
@@ -1185,6 +1102,169 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
             .map(|(_, info)| policy::plan_tensor(&info.shape, info.dtype, quant_type))
             .collect(),
     };
+
+    // Configure writer based on format
+    if config.output_format == OutputFormat::Gguf {
+        let input_path = Path::new(&config.input_path);
+        let arch = gguf_arch
+            .as_deref()
+            .context("Internal error: a GGUF output has no resolved architecture")?;
+
+        // We need to configure the writer before initialization
+        // Since we can't easily downcast, we'll create a new GGUF-specific writer
+        let mut gguf_writer = GgufFormatWriter::new();
+        gguf_writer.set_architecture(arch);
+
+        // The name is the checkpoint's own name, not its architecture. With no
+        // checkpoint directory to take it from, no name is written.
+        if let Some(name) = policy::model_name(input_path) {
+            gguf_writer.set_name(&name);
+        }
+
+        // Add architecture-specific metadata
+        if let Some(vocab_size) = metadata.vocab_size {
+            gguf_writer.add_metadata(
+                &format!("{}.vocab_size", arch),
+                formats::GgufValue::Uint32(vocab_size as u32),
+            );
+        }
+        if let Some(hidden_size) = metadata.hidden_size {
+            gguf_writer.add_metadata(
+                &format!("{}.embedding_length", arch),
+                formats::GgufValue::Uint32(hidden_size as u32),
+            );
+        }
+        if let Some(num_layers) = metadata.num_layers {
+            gguf_writer.add_metadata(
+                &format!("{}.block_count", arch),
+                formats::GgufValue::Uint32(num_layers as u32),
+            );
+        }
+
+        // `general.file_type` names the file, and only that: a reader takes
+        // each tensor's format from the tensor directory. The values are
+        // llama.cpp's `llama_ftype` enum, which is NOT the GGML type id — a
+        // file written with GGML ids reports Q3_K_M for a Q4_K model.
+        if let Some(mix) = config.gguf_mix {
+            gguf_writer.set_file_type(mix.llama_ftype());
+        } else if let Some(qt) = quant_type {
+            let file_type = match qt {
+                QuantType::Q4_0 => 2,
+                QuantType::Q4_1 => 3,
+                QuantType::Q8_0 => 7,
+                QuantType::Q5_0 => 8,
+                QuantType::Q5_1 => 9,
+                QuantType::Q2K => 10,
+                // llama.cpp names no ftype for a flat K-quant, because its own
+                // K-quant paths are all mixes. The nearest published value is
+                // the `_S` variant of the same base format.
+                QuantType::Q3K => 11,
+                QuantType::Q4K => 14,
+                QuantType::Q5K => 16,
+                QuantType::Q6K => 18,
+                // IQ4_NL is a flat format in llama.cpp too, so it gets a real
+                // `llama_ftype` value rather than a borrowed `_S` one: see
+                // `LLAMA_FTYPE_MOSTLY_IQ4_NL` in llama.cpp's `llama.h`.
+                QuantType::IQ4NL => 25,
+                // IQ4_XS is also flat in llama.cpp, with its own real
+                // `llama_ftype` value: see `LLAMA_FTYPE_MOSTLY_IQ4_XS` in
+                // llama.cpp's `llama.h`.
+                QuantType::IQ4XS => 30,
+                _ => 1, // F16 default
+            };
+            gguf_writer.set_file_type(file_type);
+        } else if let Some(dtype) = config.target_dtype {
+            // GGUF file_type values for unquantized casts.
+            let file_type = match dtype {
+                UnifiedDType::F32 => 0,
+                UnifiedDType::BF16 => 32,
+                _ => 1, // F16
+            };
+            gguf_writer.set_file_type(file_type);
+        }
+
+        writer = Box::new(gguf_writer);
+    }
+
+    // Whether the TCF writer quantizes in a pass of its own. A `--quantization`
+    // TCF run stores the bytes this loop produces, exactly as a GGUF run does.
+    let tcf_native = config.output_format == OutputFormat::Tcf && config.quantization.is_none();
+
+    if config.output_format == OutputFormat::Tcf && !tcf_native {
+        // GGML block encodings in TCF's container: the same plan list, the
+        // same quantizer, the same bytes as the GGUF run; the writer adds the
+        // records, the 8-bit activation contract and the proof vectors.
+        let base =
+            quant_type.context("Internal error: a TCF block run has no base quantization type")?;
+        let mut block_writer = TcfBlockFormatWriter::new()
+            .with_base(base)
+            .with_plans(plans.clone());
+        if let Some(name) = policy::model_name(Path::new(&config.input_path)) {
+            block_writer = block_writer.with_module_name(&name);
+        }
+        log::info!(
+            "TCF block encodings: base {:?}; activation contract A8S32_DYNAMIC, group 32, i32 \
+             accumulate then f32 scale, as the block kernels compute",
+            base
+        );
+        writer = Box::new(block_writer);
+    }
+
+    if tcf_native {
+        // TCF quantizes from the full-precision source itself, so the writer
+        // needs the input path as well as the encoding: its payload pass
+        // re-reads one tensor at a time instead of holding every payload.
+        let options = config.tcf_options()?;
+        let mut tcf_writer = TcfFormatWriter::new()
+            .with_options(options)
+            .with_source(&config.input_path);
+        if let Some(name) = policy::model_name(Path::new(&config.input_path)) {
+            tcf_writer = tcf_writer.with_module_name(&name);
+        }
+        if let Some(matrix) = config.imatrix.clone() {
+            tcf_writer = tcf_writer.with_importance(matrix);
+        }
+        if let Some(measurement) = config.tcf_sensitivity.clone() {
+            log::info!(
+                "TCF sensitivity: {} measured tensors over {} evaluation rows at {}, \
+                 calibration {:#010x}",
+                measurement.measured(),
+                measurement.baseline().eval_rows,
+                measurement.baseline().encoding,
+                measurement.calibration_id()
+            );
+            tcf_writer = tcf_writer.with_sensitivity(measurement);
+        }
+        match options.profile {
+            Some(profile) => log::info!(
+                "TCF profile {}: base {:?}, bump {:?} on the top {:.0}% of quantizable \
+                 parameters",
+                profile.name,
+                profile.base,
+                profile.bump,
+                profile.bump_fraction * 100.0
+            ),
+            None => log::info!(
+                "TCF encoding: {:?}, module preferred encoding: {:?}",
+                options.encoding,
+                options.preferred_encoding
+            ),
+        }
+        // Stated on every run, uniform included: a reader comparing two files
+        // has to be able to see which error each one minimized, and a line
+        // that appears only sometimes cannot answer that. The writer states
+        // the RESULT per encoding once the allocation has fixed them; this
+        // line states the policy those results come from.
+        log::info!("{}", formats::objective_policy(options));
+        log::info!(
+            "TCF activation contract: exact F32 activations, F32 accumulate, F32 out; a \
+             conversion that calibrated no activations tunes nothing for a \
+             quantized-activation kernel. workload_profile_id is left unset: compressr \
+             measures no workload. calibration_id is set only on a --sensitivity run, from \
+             the measurement that run read."
+        );
+        writer = Box::new(tcf_writer);
+    }
 
     // Step 4: Initialize writer and register all tensors
     if let Some(parent) = layout.weights_path.parent() {
@@ -1287,11 +1367,11 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
             }
         };
         counts.record(*plan);
-        // The TCF writer produces its payload in a later pass of its own, so
-        // `output_data` there is the SOURCE the tensor was planned from and not
-        // the bytes the file holds. Recording it would report a bpw the file
-        // does not have, so the TCF path contributes no rows.
-        if config.output_format != OutputFormat::Tcf {
+        // The native TCF writer produces its payload in a later pass of its
+        // own, so `output_data` there is the SOURCE the tensor was planned
+        // from and not the bytes the file holds. Recording it would report a
+        // bpw the file does not have, so that path contributes no rows.
+        if !tcf_native {
             mix.record(MixEntry {
                 name: name.clone(),
                 format: policy::plan_format_label(*plan, config.stored_dtype(info.dtype)),
@@ -1318,11 +1398,17 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
     if quantizer.is_some() {
         log::info!("Quantization: {}", counts);
     }
-    // The TCF writer quantizes in a pass of its own and reports its own
-    // counts there, so this loop's counts describe a GGUF run only.
-    if config.imatrix.is_some() && config.output_format != OutputFormat::Tcf {
+    // The native TCF writer quantizes in a pass of its own and reports its
+    // own counts there, so this loop's counts describe a block run only.
+    if config.imatrix.is_some() && !tcf_native {
         log::info!("Importance: {}", importance_counts);
-        log::info!("{}", importance::importance_layout_line("GGUF v3"));
+        log::info!(
+            "{}",
+            importance::importance_layout_line(match config.output_format {
+                OutputFormat::Tcf => "TCF block encodings",
+                _ => "GGUF v3",
+            })
+        );
     }
 
     // Step 6: Finalize
@@ -1331,10 +1417,10 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
         .finalize()
         .with_context(|| "Failed to finalize output file")?;
 
-    // The loop above counted the SOURCE bytes it planned each TCF tensor
-    // from; the payload the writer produced from them is a different size, so
-    // the finished file is the only honest answer.
-    if config.output_format == OutputFormat::Tcf {
+    // The loop above counted the SOURCE bytes it planned each native TCF
+    // tensor from; the payload the writer produced from them is a different
+    // size, so the finished file is the only honest answer.
+    if tcf_native {
         output_size = std::fs::metadata(&layout.weights_path)
             .with_context(|| {
                 format!(
@@ -2042,8 +2128,36 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        assert!(err.contains("Quantization writes GGUF only"), "{err}");
+        assert!(
+            err.contains("Quantization writes GGUF or TCF only"),
+            "{err}"
+        );
         assert!(err.contains("Safetensors"), "{err}");
+    }
+
+    /// `--quantization` into TCF stores GGML block encodings; the flags that
+    /// configure TCF's native quantizer have nothing to configure there.
+    #[test]
+    fn test_tcf_accepts_quantization_alone_and_refuses_it_beside_native_flags() {
+        ConversionConfig::new("input/".into(), "out.tcf".into(), OutputFormat::Tcf)
+            .with_quantization(QuantizationConfig::q4_k())
+            .validate()
+            .expect("block encodings in TCF");
+        ConversionConfig::new("input/".into(), "out.tcf".into(), OutputFormat::Tcf)
+            .with_quantization(QuantizationConfig::q4_k())
+            .with_gguf_mix(policy::GgufMix::Q4KM)
+            .validate()
+            .expect("a mix in TCF");
+        let err = ConversionConfig::new("input/".into(), "out.tcf".into(), OutputFormat::Tcf)
+            .with_quantization(QuantizationConfig::q4_k())
+            .with_tcf_profile(parse_tcf_profile("balanced").unwrap())
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("--tcf-profile are mutually exclusive"),
+            "{err}"
+        );
     }
 
     #[test]

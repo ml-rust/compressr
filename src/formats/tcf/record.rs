@@ -27,11 +27,11 @@
 //! compressr never calibrated them for it.
 
 use tcf_core::{
-    consts::ROOT_PARENT_ID, CalibrationFlags, CalibrationRecord, ContractFlags, ContractRecord,
-    DotAccumulator, Encoding, ExecutionRole, InputRepresentation, LayoutId, MathMode, ModuleRecord,
-    ModuleRole, OutputDtype, PolicyFlags, PrimaryMetric, ProofFormat, QuantAxis, RawEncoding,
-    ResidencyClass, Role, RoundingMode, ScaleComputeDtype, StateDtype, StateFlags, StringRef,
-    TensorFlags, TensorRecord,
+    consts::ROOT_PARENT_ID, BlockEncoding, CalibrationFlags, CalibrationRecord, ContractFlags,
+    ContractRecord, DotAccumulator, Encoding, ExecutionRole, InputRepresentation, LayoutId,
+    MathMode, ModuleRecord, ModuleRole, OutputDtype, PolicyFlags, PrimaryMetric, ProofFormat,
+    QuantAxis, RawEncoding, ResidencyClass, Role, RoundingMode, ScaleComputeDtype, StateDtype,
+    StateFlags, StringRef, TensorFlags, TensorRecord,
 };
 
 use super::options::TcfOptions;
@@ -82,6 +82,61 @@ pub fn contract_record() -> ContractRecord {
         calibration_id: 0,
         flags: ContractFlags::NONE,
         contract_digest: [0u8; 16],
+    }
+}
+
+/// The id of the 8-bit dynamic activation contract a block-encoded file
+/// declares. Distinct from [`EXACT_F32_CONTRACT_ID`] so the two never share a
+/// number inside one file.
+pub const A8_DYNAMIC_CONTRACT_ID: u32 = 2;
+
+/// The activation contract of a file carrying GGML block encodings.
+///
+/// `ggml-quants.c`'s block dot products quantize the activation on the fly to
+/// signed 8-bit codes in groups of 32 with one f32 scale each, accumulate the
+/// code products in i32, and apply the scales in f32. That is what boostr's
+/// MMQ and GEMV kernels do with these bytes, so it is the contract written
+/// beside them: a consumer holding only an f32-activation kernel is refused
+/// by the contract check, as Section 9 intends. `qmin`/`qmax` are the
+/// symmetric grid those kernels round to. `calibration_id` stays zero, as in
+/// [`contract_record`]: no activations were measured.
+pub fn a8_dynamic_contract_record() -> ContractRecord {
+    ContractRecord {
+        contract_id: A8_DYNAMIC_CONTRACT_ID,
+        input_representation: InputRepresentation::A8S32Dynamic,
+        quant_group: 32,
+        quant_axis: QuantAxis::Last,
+        rounding_mode: RoundingMode::RnEven,
+        qmin: -127,
+        qmax: 127,
+        scale_compute_dtype: ScaleComputeDtype::F32,
+        dot_accumulator: DotAccumulator::I32ThenF32Scale,
+        output_dtype: OutputDtype::F32,
+        math_mode: MathMode::ReassociationAllowed,
+        calibration_id: 0,
+        flags: ContractFlags::NONE,
+        contract_digest: [0u8; 16],
+    }
+}
+
+/// The root module of a block-encoded file. Same shape as [`module_record`]:
+/// the preferred encoding is the run's base block format, the declared
+/// fallback is F32, and `min_quant_k` is the base format's block length.
+pub fn block_module_record(name: StringRef, base: BlockEncoding) -> ModuleRecord {
+    ModuleRecord {
+        module_id: 0,
+        parent_id: ROOT_PARENT_ID,
+        name,
+        module_role: ModuleRole::Other,
+        fallback_encoding: Some(Encoding::Raw(RawEncoding::F32)),
+        preferred_encoding: [Some(Encoding::Block(base)), None, None, None],
+        activation_contract_id: A8_DYNAMIC_CONTRACT_ID,
+        policy_flags: PolicyFlags::NONE,
+        min_quant_k: u32::try_from(base.block_elems()).unwrap_or(u32::MAX),
+        default_residency: ResidencyClass::Warm,
+        state_dtype: StateDtype::None,
+        state_flags: StateFlags::NONE,
+        policy_digest: [0u8; 16],
     }
 }
 

@@ -18,7 +18,11 @@
 //! # Cast an fp32 checkpoint to bf16, keeping it loadable
 //! compressr convert model/ --format safetensors --dtype bf16
 //!
-//! # Quantize a full-precision checkpoint into TCF v1
+//! # Quantize a full-precision checkpoint into TCF v1 carrying GGML block
+//! # encodings: the same bytes a GGUF q4_k_m run writes, in TCF's container
+//! compressr convert model/ --format tcf --quantization q4_k_m
+//!
+//! # Or into TCF's native encodings
 //! compressr convert model/ --format tcf --tcf-encoding q4s32t64 \
 //!     --tcf-preferred-encoding q4s32t64
 //!
@@ -112,7 +116,8 @@ enum Commands {
         ///
         /// Also accepts llama.cpp's mixed-precision names — q4_k_s, q4_k_m,
         /// q5_k_s, q5_k_m — which assign a different GGUF block format to
-        /// different tensors by role and by layer. GGUF output only.
+        /// different tensors by role and by layer. GGUF output, or TCF output
+        /// carrying the same GGML block encodings.
         ///
         /// Mutually exclusive with --dtype.
         #[arg(long, value_name = "LEVEL", conflicts_with = "dtype")]
@@ -393,6 +398,7 @@ fn main() -> Result<()> {
                 .with_max_shard_size(max_shard_size)
                 .with_verbose(verbose);
 
+            let quant_choice_set = quant_choice.is_some();
             if let Some(quant_choice) = quant_choice {
                 config = config.with_quantization(quant_choice.config);
                 if let Some(mix) = quant_choice.mix {
@@ -424,12 +430,16 @@ fn main() -> Result<()> {
                 config = config.with_importance(imatrix);
             }
             let measured = sensitivity.clone();
-            // A measurement ranks whichever promotion set the output format
-            // has: a TCF profile's bump set, or a GGUF mix's promotions.
+            // A measurement ranks whichever promotion set the run has: a GGUF
+            // mix's promotions, in GGUF or in TCF block encodings, or a TCF
+            // profile's bump set.
             if let Some(measurement) = sensitivity {
-                config = match output_format {
-                    OutputFormat::Gguf => config.with_gguf_sensitivity(measurement),
-                    _ => config.with_tcf_sensitivity(measurement),
+                let gguf_blocks = output_format == OutputFormat::Gguf
+                    || (output_format == OutputFormat::Tcf && config.quantization.is_some());
+                config = if gguf_blocks {
+                    config.with_gguf_sensitivity(measurement)
+                } else {
+                    config.with_tcf_sensitivity(measurement)
                 };
             }
 
@@ -490,7 +500,17 @@ fn main() -> Result<()> {
                     );
                 }
             }
-            if output_format == OutputFormat::Tcf {
+            if output_format == OutputFormat::Tcf && quant_choice_set {
+                // A block run has no TCF objective and no TCF search: the GGML
+                // writers decided every byte, exactly as for the GGUF.
+                println!(
+                    "TCF block encodings: each quantized tensor is the GGML block stream a \
+                     GGUF run writes, byte for byte, under TCF's activation contract \
+                     A8S32_DYNAMIC (8-bit codes in groups of 32, i32 accumulate, f32 scale, \
+                     f32 out), which is what the block kernels compute."
+                );
+            }
+            if output_format == OutputFormat::Tcf && !quant_choice_set {
                 // Printed on a flagless run too: the summary already names the
                 // encoding, and the objective is the other half of what the
                 // encoder was told to do. The line states the POLICY and every

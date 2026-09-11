@@ -128,7 +128,9 @@ pub fn tcf_fallback_reason(reason: FallbackReason) -> tcf_core::FallbackReason {
         FallbackReason::SourceDtype => tcf_core::FallbackReason::UnsupportedEncoding,
         FallbackReason::SourceNonfinite => tcf_core::FallbackReason::SourceNonfinite,
         FallbackReason::NumericRange => tcf_core::FallbackReason::NumericRange,
-        FallbackReason::MixRole => tcf_core::FallbackReason::UnsupportedEncoding,
+        // A mix keeps norms, routers and the listed small weights unrounded
+        // because of what they are, which is the role reason TCF names.
+        FallbackReason::MixRole => tcf_core::FallbackReason::RoleForbidsQuant,
     }
 }
 
