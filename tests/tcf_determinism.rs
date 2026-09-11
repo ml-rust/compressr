@@ -81,10 +81,12 @@ fn fixtures() -> Vec<Fixture> {
             shape: vec![4, 640],
             values: nonfinite,
         },
-        // `(hi - lo) / 15` is a binary16 subnormal, so `Q4AS32D_T64` carries
-        // these values, while `max_abs / 30.1` is under 2^-25, so
-        // `Q6S16D_T64` cannot. Quantizable at the base and no bump candidate
-        // — the case the bump check exists to find.
+        // Group extremes at +-4e-7. Every two-level encoding holds this: its
+        // group fit stays exact and a bfloat16 super-value has range to
+        // spare. A FLAT bump (`Q8S32_T64`, one binary16 scale per group)
+        // refuses it: `max_abs / ~128` sits under binary16's smallest
+        // subnormal. So this tensor is a bump candidate under `compact` and
+        // refused under `high` — the case the bump check exists to find.
         Fixture {
             name: "block.3.weight",
             shape: vec![4, 640],
@@ -242,13 +244,22 @@ fn two_profile_conversions_produce_the_same_bytes() {
 /// replaced — the oracle, run directly against `tcf-core`.
 #[test]
 fn the_bump_set_matches_a_full_quantize() {
+    // `compact` bumps to a two-level encoding, which refuses no finite
+    // tensor this fixture holds. `high` bumps to a flat one, which refuses
+    // the tiny tensor. Both branches of the bump check are exercised.
+    for (profile_name, expect_refusal) in [("compact", false), ("high", true)] {
+        bump_set_matches_full_quantize(profile_name, expect_refusal);
+    }
+}
+
+fn bump_set_matches_full_quantize(profile_name: &str, expect_refusal: bool) {
     let dir = tempfile::tempdir().expect("a temporary directory");
     let tensors = fixtures();
     let source = dir.path().join("model.safetensors");
     write_source(&source, &tensors);
 
-    let profile = parse_tcf_profile("compact").expect("a ladder rung");
-    let bump = profile.bump.expect("the compact rung bumps");
+    let profile = parse_tcf_profile(profile_name).expect("a ladder rung");
+    let bump = profile.bump.expect("the rung bumps");
     let out = dir.path().join("plans.tcf");
     let settled = plans(&source, &out, TcfOptions::from_profile(profile), &tensors);
     assert_eq!(settled.len(), tensors.len());
@@ -277,9 +288,13 @@ fn the_bump_set_matches_a_full_quantize() {
             refused += 1;
         }
     }
-    assert!(candidates > 0, "the fixture must hold a bump candidate");
     assert!(
+        candidates > 0,
+        "{profile_name}: the fixture must hold a bump candidate"
+    );
+    assert_eq!(
         refused > 0,
-        "the fixture must hold a tensor the bump encoding refuses"
+        expect_refusal,
+        "{profile_name}: refused {refused} tensor(s) at {bump:?}"
     );
 }
