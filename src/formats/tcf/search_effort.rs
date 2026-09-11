@@ -16,17 +16,13 @@
 //!
 //! # The guarantee is on the objective, NOT on the model
 //!
-//! The objective is a PROXY for model quality, and minimizing a proxy harder
-//! does not always improve what the proxy stands for. Measured on a text
-//! model over two disjoint evaluation splits: a wider search improved the
-//! task metric when no importance matrix was supplied, and DEGRADED it when
-//! one was — consistently, in both directions, on both splits.
+//! The objective is a proxy. Minimizing it harder can cost model quality.
+//! Measured on both evaluation splits: a wider search improved the task
+//! metric with no importance matrix, and degraded it with one.
 //!
-//! The reading: an unweighted objective is loose enough that extra candidates
-//! find genuinely better fits, while an importance-weighted objective is
-//! already sharply tuned, so searching it harder overfits it. Do not describe
-//! a wider search as free quality. It is free OBJECTIVE, which is not the
-//! same thing, and `--imatrix` is where the two come apart.
+//! An unweighted objective is loose, so extra candidates find better fits. An
+//! importance-weighted objective is already sharp, so a wider search overfits
+//! it. Never describe a wider search as free quality.
 //!
 //! # `Standard` is the byte-for-byte default
 //!
