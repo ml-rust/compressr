@@ -52,11 +52,12 @@ pub fn parse_quantization(s: &str) -> Result<QuantizationChoice> {
         "q5_k" | "q5k" => QuantizationMethod::Q5K,
         "q6_k" | "q6k" => QuantizationMethod::Q6K,
         "iq4_nl" | "iq4nl" => QuantizationMethod::IQ4NL,
+        "iq4_xs" | "iq4xs" => QuantizationMethod::IQ4XS,
         "nf4" => QuantizationMethod::Nf4,
         "fp8" => QuantizationMethod::Fp8,
         _ => anyhow::bail!(
             "Unsupported quantization: {}. Flat formats: q4_0, q4_1, q8_0, q2_k, q3_k, \
-             q4_k, q5_k, q6_k, iq4_nl, nf4, fp8. Mixed precision: {}.",
+             q4_k, q5_k, q6_k, iq4_nl, iq4_xs, nf4, fp8. Mixed precision: {}.",
             s,
             GGUF_MIX_NAMES.join(", ")
         ),
@@ -87,6 +88,7 @@ fn method_config(method: QuantizationMethod) -> QuantizationConfig {
         QuantizationMethod::Q5K => (5, 256),
         QuantizationMethod::Q6K => (6, 256),
         QuantizationMethod::IQ4NL => (4, 32),
+        QuantizationMethod::IQ4XS => (4, 256),
         QuantizationMethod::Fp8 => (8, 1),
         QuantizationMethod::Gptq | QuantizationMethod::Awq => (4, 128),
     };
@@ -145,6 +147,7 @@ mod tests {
         assert!(err.contains("q4_k_m"), "{err}");
         assert!(err.contains("q4_0"), "{err}");
         assert!(err.contains("iq4_nl"), "{err}");
+        assert!(err.contains("iq4_xs"), "{err}");
     }
 
     /// Both spellings resolve to the same method, at IQ4_NL's real bpw.
@@ -156,6 +159,19 @@ mod tests {
             assert!(choice.mix.is_none());
             assert_eq!(choice.config.bits, 4);
             assert_eq!(choice.config.group_size, 32);
+        }
+    }
+
+    /// Both spellings resolve to the same method, at IQ4_XS's super-block
+    /// geometry — 256 elements per block, unlike IQ4_NL's 32.
+    #[test]
+    fn iq4_xs_parses_under_both_spellings() {
+        for name in ["iq4_xs", "iq4xs"] {
+            let choice = parse_quantization(name).unwrap();
+            assert_eq!(choice.config.method, QuantizationMethod::IQ4XS);
+            assert!(choice.mix.is_none());
+            assert_eq!(choice.config.bits, 4);
+            assert_eq!(choice.config.group_size, 256);
         }
     }
 }

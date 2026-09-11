@@ -33,6 +33,9 @@ pub enum QuantizationMethod {
     Q6K,
     /// GGUF IQ4_NL (llama.cpp I-quant, flat only — no mix rules exist here)
     IQ4NL,
+    /// GGUF IQ4_XS (llama.cpp I-quant super-block, flat only — no mix rules
+    /// exist here)
+    IQ4XS,
 }
 
 impl QuantizationMethod {
@@ -46,6 +49,8 @@ impl QuantizationMethod {
         match self {
             Self::Gptq | Self::Awq | Self::Nf4 | Self::Q4_0 | Self::Q4_1 | Self::Q4K => 4.5,
             Self::IQ4NL => 4.5,
+            // 136 bytes per 256-element super-block: 4.25 bpw, not 4.5.
+            Self::IQ4XS => 4.25,
             Self::Fp8 | Self::Q8_0 => 8.5,
             Self::Q2K => 2.5,
             Self::Q3K => 3.5,
@@ -57,7 +62,7 @@ impl QuantizationMethod {
     /// Whether compressr can write a tensor packed by this method.
     ///
     /// GGUF is the only container compressr writes quantized tensors into, and
-    /// only these nine have a GGML block type to write them as. The other
+    /// only these ten have a GGML block type to write them as. The other
     /// four each need an on-disk layout that does not exist yet: NF4 and FP8
     /// keep their scales OUTSIDE the packed payload, and GPTQ and AWQ split
     /// one layer into several tensors (`qweight` packed as I32, plus
@@ -76,6 +81,7 @@ impl QuantizationMethod {
                 | Self::Q5K
                 | Self::Q6K
                 | Self::IQ4NL
+                | Self::IQ4XS
         )
     }
 
@@ -95,6 +101,7 @@ impl QuantizationMethod {
             Self::Q5K => QuantType::Q5K,
             Self::Q6K => QuantType::Q6K,
             Self::IQ4NL => QuantType::IQ4NL,
+            Self::IQ4XS => QuantType::IQ4XS,
             Self::Nf4 => QuantType::NF4,
             Self::Fp8 => QuantType::FP8,
             Self::Gptq => QuantType::GPTQ,
@@ -106,7 +113,7 @@ impl QuantizationMethod {
     pub fn block_size(&self) -> usize {
         match self {
             Self::Q4_0 | Self::Q4_1 | Self::Q8_0 => 32,
-            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K => 256,
+            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::IQ4XS => 256,
             Self::IQ4NL => 32,
             Self::Nf4 => 64,
             Self::Gptq | Self::Awq => 128, // Typical group size
@@ -268,6 +275,17 @@ impl QuantizationConfig {
             calibration_samples: 0,
         }
     }
+
+    /// Create an IQ4_XS configuration (llama.cpp I-quant super-block, flat only)
+    pub fn iq4_xs() -> Self {
+        Self {
+            method: QuantizationMethod::IQ4XS,
+            bits: 4,
+            group_size: 256,
+            calibration_dataset: None,
+            calibration_samples: 0,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -286,6 +304,7 @@ mod tests {
             QuantizationMethod::Q5K,
             QuantizationMethod::Q6K,
             QuantizationMethod::IQ4NL,
+            QuantizationMethod::IQ4XS,
         ] {
             assert!(method.is_writable(), "{method:?} has a GGML block type");
         }
@@ -311,5 +330,16 @@ mod tests {
         assert_eq!(method.quant_type(), QuantType::IQ4NL);
         assert_eq!(method.bits_per_weight(), 4.5);
         assert_eq!(method.block_size(), 32);
+    }
+
+    /// IQ4_XS packs as `QuantType::IQ4XS`, at 4.25 bits per weight (136
+    /// bytes per 256-element super-block) — a super-block, not IQ4_NL's
+    /// simple block, and lighter than IQ4_NL's 4.5 bpw.
+    #[test]
+    fn test_iq4_xs_maps_to_its_own_quant_type() {
+        let method = QuantizationMethod::IQ4XS;
+        assert_eq!(method.quant_type(), QuantType::IQ4XS);
+        assert_eq!(method.bits_per_weight(), 4.25);
+        assert_eq!(method.block_size(), 256);
     }
 }

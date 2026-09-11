@@ -11,7 +11,8 @@
 //!
 //! An OPTIONAL importance matrix reaches those writers through
 //! [`Quantizer::quantize_tensor_weighted`]. It is off unless a run names one,
-//! and it selects a different writer for the five K-quants and IQ4_NL only.
+//! and it selects a different writer for the five K-quants, IQ4_NL and
+//! IQ4_XS only.
 //!
 //! NF4 and FP8 stay here: neither is a GGUF block format, and boostr has no
 //! writer for either.
@@ -119,7 +120,7 @@ impl Quantizer {
             bail!(
                 "{quant_type:?} has no importance-weighted quantize kernel in boostr, so an \
                  importance matrix cannot change a byte of it. Weighted: Q2_K, Q3_K, Q4_K, \
-                 Q5_K, Q6_K, IQ4_NL."
+                 Q5_K, Q6_K, IQ4_NL, IQ4_XS."
             );
         }
         log::debug!(
@@ -197,12 +198,19 @@ impl Quantizer {
                 QuantType::IQ4NL,
                 importance,
             ),
+            QuantType::IQ4XS => quantize_gguf(
+                &f32_data,
+                shape,
+                QuantFormat::IQ4XS,
+                QuantType::IQ4XS,
+                importance,
+            ),
             // Q5_0, Q5_1, Q8_1 and FP4 have a GGML block layout and no writer
             // in boostr, so a mix never assigns one and a direct caller is
             // told rather than handed a nearby format.
             other => anyhow::bail!(
                 "{other:?} has no quantize kernel in boostr, so compressr cannot pack it. \
-                 Writable: Q4_0, Q4_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL."
+                 Writable: Q4_0, Q4_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS."
             ),
         }
     }

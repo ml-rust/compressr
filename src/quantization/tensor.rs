@@ -68,6 +68,7 @@ impl QuantizedTensor {
             QuantType::Q5K => self.dequantize_ggml(256, 176, dequant::dequant_q5k),
             QuantType::Q6K => self.dequantize_ggml(256, 210, dequant::dequant_q6k),
             QuantType::IQ4NL => self.dequantize_ggml(32, 18, dequant_iq4::dequant_iq4_nl),
+            QuantType::IQ4XS => self.dequantize_ggml(256, 136, dequant_iq4::dequant_iq4_xs),
             _ => {
                 log::warn!("Dequantization not implemented for {:?}", self.quant_type);
                 vec![0.0; self.original_numel]

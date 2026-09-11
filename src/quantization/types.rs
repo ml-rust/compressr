@@ -23,6 +23,9 @@ pub enum QuantType {
     Q6K,
     // I-quant, grid-based (32 elements per block, flat format only)
     IQ4NL,
+    // I-quant, grid-based super-block (256 elements per block, flat format
+    // only, 4.25 bits per weight — NOT the 4.5 of IQ4_NL)
+    IQ4XS,
     // Advanced formats
     NF4,
     FP4,
@@ -34,15 +37,15 @@ pub enum QuantType {
 impl QuantType {
     /// Whether boostr has an IMPORTANCE-WEIGHTED writer for this format.
     ///
-    /// `ggml-quants.c` carries a second writer per K-quant, plus one for
-    /// IQ4_NL, taken the moment an importance matrix is supplied, and boostr
-    /// reproduces all six. Every other block format has one writer, which
-    /// reads no importance, so a matrix cannot change a single byte it
-    /// produces.
+    /// `ggml-quants.c` carries a second writer per K-quant, plus one each for
+    /// IQ4_NL and IQ4_XS, taken the moment an importance matrix is supplied,
+    /// and boostr reproduces all seven. Every other block format has one
+    /// writer, which reads no importance, so a matrix cannot change a single
+    /// byte it produces.
     pub fn has_importance_writer(&self) -> bool {
         matches!(
             self,
-            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::IQ4NL
+            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::IQ4NL | Self::IQ4XS
         )
     }
 
@@ -50,7 +53,7 @@ impl QuantType {
     pub fn block_size(&self) -> usize {
         match self {
             Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::Q8_1 => 32,
-            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K => 256,
+            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::IQ4XS => 256,
             Self::IQ4NL => 32,
             Self::NF4 | Self::FP4 => 64,
             Self::FP8 => 1,

@@ -14,7 +14,7 @@
 //! - GGUF v3 out, one self-contained file
 //! - Element-type casts between F32, F16 and BF16, round-to-nearest-even
 //! - GGUF block quantization: Q4_0, Q4_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K,
-//!   IQ4_NL
+//!   IQ4_NL, IQ4_XS
 //! - GGUF mixed precision: Q4_K_S, Q4_K_M, Q5_K_S and Q5_K_M, which assign a
 //!   different block format per tensor by role and by layer, reproducing
 //!   llama.cpp's `llama_tensor_get_type`. The Q2_K/Q3_K mixes and the I-quant
@@ -36,9 +36,9 @@
 //! - Importance matrix: `--imatrix FILE` weights the quantizer's choices by a
 //!   per-column mean square activation a calibration run accumulated
 //!   elsewhere. OPTIONAL and OFF by default — a run that names no file writes
-//!   the bytes it always wrote, for every format. Accepted with a K-quant or
-//!   IQ4_NL GGUF quantization, flat or a mix, and with TCF. A tensor the
-//!   matrix does not measure is quantized UNWEIGHTED. Inside TCF a measured
+//!   the bytes it always wrote, for every format. Accepted with a K-quant,
+//!   IQ4_NL or IQ4_XS GGUF quantization, flat or a mix, and with TCF. A
+//!   tensor the matrix does not measure is quantized UNWEIGHTED. Inside TCF a measured
 //!   tensor takes the importance ALONE, which is ggml's Q6_K form and which a measurement
 //!   put ahead of the alternative, unless `--tcf-importance combined` selects
 //!   the importance TIMES `sqrt(sigma2 + x^2)`, the product ggml's K-quant
@@ -316,10 +316,10 @@ pub struct ConversionConfig {
     /// square activation; a tensor the calibration run never exercised is
     /// quantized UNWEIGHTED, never against a synthesized zero vector.
     ///
-    /// Accepted with a K-quant or IQ4_NL GGUF quantization, flat or a mix,
-    /// and with [`OutputFormat::Tcf`]. It changes which values the encoder
-    /// chooses and no bit layout, so the output stays a normal conforming
-    /// file either way. See [`importance`].
+    /// Accepted with a K-quant, IQ4_NL or IQ4_XS GGUF quantization, flat or
+    /// a mix, and with [`OutputFormat::Tcf`]. It changes which values the
+    /// encoder chooses and no bit layout, so the output stays a normal
+    /// conforming file either way. See [`importance`].
     pub imatrix: Option<ImportanceMatrix>,
     /// Verbose logging
     pub verbose: bool,
@@ -526,7 +526,7 @@ impl ConversionConfig {
                     "Quantization method {:?} is not implemented: compressr has no on-disk \
                      layout for its scales, so the output would carry packed weights that \
                      nothing can dequantize. Implemented: q4_0, q4_1, q8_0, q2_k, q3_k, \
-                     q4_k, q5_k, q6_k, iq4_nl.",
+                     q4_k, q5_k, q6_k, iq4_nl, iq4_xs.",
                     quant.method
                 );
             }
@@ -712,10 +712,10 @@ impl ConversionConfig {
                             .is_some_and(|quant| quant.method.quant_type().has_importance_writer());
                     if !weighted {
                         bail!(
-                            "--imatrix needs a K-quant or IQ4_NL quantization for a GGUF \
-                             output. boostr has an importance-weighted writer for Q2_K, Q3_K, \
-                             Q4_K, Q5_K, Q6_K and IQ4_NL only, so every other block format \
-                             would ignore the file entirely. Accepted: {}.",
+                            "--imatrix needs a K-quant, IQ4_NL or IQ4_XS quantization for a \
+                             GGUF output. boostr has an importance-weighted writer for Q2_K, \
+                             Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL and IQ4_XS only, so every other \
+                             block format would ignore the file entirely. Accepted: {}.",
                             IMPORTANCE_ACCEPTED
                         );
                     }
@@ -1025,6 +1025,10 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
                 // `llama_ftype` value rather than a borrowed `_S` one: see
                 // `LLAMA_FTYPE_MOSTLY_IQ4_NL` in llama.cpp's `llama.h`.
                 QuantType::IQ4NL => 25,
+                // IQ4_XS is also flat in llama.cpp, with its own real
+                // `llama_ftype` value: see `LLAMA_FTYPE_MOSTLY_IQ4_XS` in
+                // llama.cpp's `llama.h`.
+                QuantType::IQ4XS => 30,
                 _ => 1, // F16 default
             };
             gguf_writer.set_file_type(file_type);

@@ -818,7 +818,9 @@ impl UnifiedDType {
             Self::Q3K | Self::IQ3XXS | Self::IQ3S => 3.5,
             Self::Q2K | Self::IQ2XXS | Self::IQ2XS | Self::IQ2S => 2.5,
             Self::IQ1S | Self::IQ1M => 1.5,
-            Self::IQ4NL | Self::IQ4XS => 4.5,
+            Self::IQ4NL => 4.5,
+            // 136 bytes per 256-element super-block: 4.25 bpw, not IQ4_NL's 4.5.
+            Self::IQ4XS => 4.25,
             Self::I64 => 64.0,
             Self::Unknown => 32.0, // Assume F32
         }
