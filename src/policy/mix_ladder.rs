@@ -10,24 +10,16 @@
 //!
 //! # Which formats a measured encoding can become
 //!
-//! A sensitivity file names TCF encodings, and GGUF writes GGML blocks. What
-//! carries between them is the bit width, which is the same property
-//! [`super::mix_measured_encoding`] already checks a file's baseline against.
-//! So a measured encoding becomes the block format compressr writes at that
-//! width, and an encoding at a width compressr has no writer for is not an
-//! option at all.
-//!
-//! Several encodings can share a width — TCF defines three 4-bit ones. They
-//! collapse to one rung, and the rung takes the LARGEST of their deltas: the
-//! damage a format does is being estimated from a proxy, and an estimate that
-//! understates it would buy a demotion the measurement never supported.
+//! A sensitivity file names the block formats it measured at, so a measured
+//! encoding IS the rung. A name compressr has no writer for is not an option
+//! at all. A format measured twice for one tensor collapses to one rung
+//! holding the LARGER delta: an estimate that understates the damage would
+//! buy a demotion the measurement never supported.
 //!
 //! # When the ladder does not run
 //!
-//! A mix whose base width no encoding in the file measures has no rung to
-//! stand on — a `q5_k_*` mix read against a file with no 5-bit encoding is
-//! exactly that case, and TCF defines none. The two-way allocation runs
-//! instead, unchanged, and says so.
+//! A mix whose base format no record in the file measures has no rung to
+//! stand on. The two-way allocation runs instead, unchanged, and says so.
 
 use anyhow::{bail, Result};
 
@@ -214,7 +206,7 @@ mod tests {
     /// A file measuring one encoding per (tensor, encoding) pair.
     fn measurement(records: &[(&str, &str, f64)]) -> SensitivityMeasurement {
         let mut lines = vec![
-            r#"{"record":"baseline","ckpt":"cache/models/example/abcdef","manifest":"manifests/eval.tsv","encoding":"Q4AS32D_T64","eval_rows":12,"eval_seed":7,"baseline_total":1.17}"#
+            r#"{"record":"baseline","ckpt":"cache/models/example/abcdef","manifest":"manifests/eval.tsv","encoding":"Q4_K","eval_rows":12,"eval_seed":7,"baseline_total":1.17}"#
                 .to_string(),
         ];
         for (name, encoding, delta) in records {
@@ -229,15 +221,12 @@ mod tests {
     /// bits; a five-bit mix has no rung to stand on.
     #[test]
     fn a_ladder_needs_the_base_width_measured() {
-        let measured = measurement(&[
-            ("a.weight", "Q4AS32D_T64", 0.5),
-            ("a.weight", "Q6S16D_T64", 0.1),
-        ]);
+        let measured = measurement(&[("a.weight", "Q4_K", 0.5), ("a.weight", "Q6_K", 0.1)]);
         assert!(can_ladder(GgufMix::Q4KM, &measured));
         assert!(!can_ladder(GgufMix::Q5KM, &measured));
 
         // One encoding is a two-way file, whatever its width.
-        let two_way = measurement(&[("a.weight", "Q4AS32D_T64", 0.5)]);
+        let two_way = measurement(&[("a.weight", "Q4_K", 0.5)]);
         assert!(!can_ladder(GgufMix::Q4KM, &two_way));
     }
 
@@ -251,10 +240,10 @@ mod tests {
             ("b.weight", &shape[..], UnifiedDType::F32),
         ];
         let measured = measurement(&[
-            ("a.weight", "Q4AS32D_T64", 0.9),
-            ("a.weight", "Q6S16D_T64", 0.1),
-            ("b.weight", "Q4AS32D_T64", 0.2),
-            ("b.weight", "Q6S16D_T64", 0.1),
+            ("a.weight", "Q4_K", 0.9),
+            ("a.weight", "Q6_K", 0.1),
+            ("b.weight", "Q4_K", 0.2),
+            ("b.weight", "Q6_K", 0.1),
         ]);
         let mut assigned = vec![Some(QuantType::Q4K), Some(QuantType::Q4K)];
         let elements = element_count(&shape);
@@ -292,10 +281,7 @@ mod tests {
                 UnifiedDType::F32,
             ),
         ];
-        let measured = measurement(&[
-            ("a.weight", "Q4AS32D_T64", 0.9),
-            ("a.weight", "Q6S16D_T64", 0.1),
-        ]);
+        let measured = measurement(&[("a.weight", "Q4_K", 0.9), ("a.weight", "Q6_K", 0.1)]);
         let mut assigned = vec![Some(QuantType::Q4K), Some(QuantType::Q4K)];
         let error = allocate_mix_ladder(
             GgufMix::Q4KM,
@@ -321,10 +307,7 @@ mod tests {
     fn a_candidate_with_no_base_option_is_refused() {
         let shape = [512usize, 512];
         let tensors: Vec<MeasuredTensor<'_>> = vec![("a.weight", &shape[..], UnifiedDType::F32)];
-        let measured = measurement(&[
-            ("a.weight", "Q6S16D_T64", 0.1),
-            ("b.weight", "Q4AS32D_T64", 0.4),
-        ]);
+        let measured = measurement(&[("a.weight", "Q6_K", 0.1), ("b.weight", "Q4_K", 0.4)]);
         let mut assigned = vec![Some(QuantType::Q4K)];
         let error = allocate_mix_ladder(GgufMix::Q4KM, &tensors, &[0], &mut assigned, 0, &measured)
             .expect_err("no base option")
@@ -349,10 +332,10 @@ mod tests {
         // The narrow tensor is measured at both widths and can hold neither
         // K-quant, but its row is a whole number of Q8_0's 32-element blocks.
         let measured = measurement(&[
-            ("a.weight", "Q4AS32D_T64", 0.9),
-            ("a.weight", "Q6S16D_T64", 0.1),
-            ("narrow.weight", "Q4AS32D_T64", 0.9),
-            ("narrow.weight", "Q6S16D_T64", 0.1),
+            ("a.weight", "Q4_K", 0.9),
+            ("a.weight", "Q6_K", 0.1),
+            ("narrow.weight", "Q4_K", 0.9),
+            ("narrow.weight", "Q6_K", 0.1),
         ]);
         let mut assigned = vec![Some(QuantType::Q4K), Some(QuantType::Q4K)];
         let error = allocate_mix_ladder(

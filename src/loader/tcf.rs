@@ -36,7 +36,7 @@ use super::{UnifiedDType, UnifiedTensorInfo};
 /// GGUF shape, so it is carried whole.
 #[derive(Debug, Clone)]
 pub struct TcfTensorFacts {
-    /// Spec name of the on-disk encoding, e.g. `Q8S32_T64`. Section 12.
+    /// Name of the on-disk encoding, e.g. `Q8_0`. Section 12.
     pub encoding: String,
     /// Honest bits per weight, scales and minima included. `None` for a raw
     /// encoding, whose width is fixed by its element size. Section 12.2.

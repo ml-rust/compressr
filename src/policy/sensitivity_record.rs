@@ -170,21 +170,21 @@ mod tests {
             panic!("a sensitivity record");
         };
         assert_eq!(name, "a.weight");
-        let resolved = option.resolve("Q4AS32D_T64");
-        assert_eq!(resolved.encoding, "Q4AS32D_T64");
+        let resolved = option.resolve("Q4_K");
+        assert_eq!(resolved.encoding, "Q4_K");
         assert_eq!(resolved.delta, 0.5);
         assert_eq!(resolved.bytes, None);
         assert!(resolved.is_measured());
 
         let named = json(
-            r#"{"record":"sensitivity","name":"a.weight","encoding":"Q6S16D_T64","delta":0.1,"bytes":210}"#,
+            r#"{"record":"sensitivity","name":"a.weight","encoding":"Q6_K","delta":0.1,"bytes":210}"#,
         );
         let SensitivityRecord::Measured { option, .. } = read_record(&named, 3).expect("reads")
         else {
             panic!("a sensitivity record");
         };
-        let resolved = option.resolve("Q4AS32D_T64");
-        assert_eq!(resolved.encoding, "Q6S16D_T64");
+        let resolved = option.resolve("Q4_K");
+        assert_eq!(resolved.encoding, "Q6_K");
         assert_eq!(resolved.bytes, Some(210));
     }
 
@@ -192,16 +192,16 @@ mod tests {
     #[test]
     fn a_skipped_record_carries_no_delta() {
         let value = json(
-            r#"{"record":"skipped","name":"c.weight","encoding":"Q6S16D_T64","reason":"row not a whole number of tiles"}"#,
+            r#"{"record":"skipped","name":"c.weight","encoding":"Q6_K","reason":"row not a whole number of tiles"}"#,
         );
         let SensitivityRecord::Measured { option, .. } = read_record(&value, 4).expect("reads")
         else {
             panic!("a skipped record");
         };
-        let resolved = option.resolve("Q4AS32D_T64");
+        let resolved = option.resolve("Q4_K");
         assert!(resolved.skipped);
         assert!(!resolved.is_measured());
-        assert_eq!(resolved.encoding, "Q6S16D_T64");
+        assert_eq!(resolved.encoding, "Q6_K");
     }
 
     #[test]

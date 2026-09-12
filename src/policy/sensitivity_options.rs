@@ -25,7 +25,16 @@ use std::collections::BTreeMap;
 
 use anyhow::{bail, Result};
 
-use crate::formats::normalized_encoding_name;
+/// One encoding name with its case, underscores and hyphens removed.
+///
+/// Two spellings of one format are one format: a file spelling `Q4_K` and
+/// one spelling `q4k` name the same rung rather than two.
+pub fn normalized_encoding_name(s: &str) -> String {
+    s.chars()
+        .filter(|c| *c != '_' && *c != '-')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
 
 /// One measured (tensor, encoding) pair.
 #[derive(Debug, Clone, PartialEq)]
@@ -185,15 +194,15 @@ mod tests {
     fn one_tensor_holds_a_menu() {
         let mut options = MeasuredOptions::default();
         options
-            .insert("a.weight", option("Q4AS32D_T64", 0.5))
+            .insert("a.weight", option("Q4_K", 0.5))
             .expect("first");
         options
-            .insert("a.weight", option("Q6S16D_T64", 0.1))
+            .insert("a.weight", option("Q6_K", 0.1))
             .expect("second");
         assert_eq!(options.options_for("a.weight").len(), 2);
         assert_eq!(options.measured_tensors(), 1);
-        assert_eq!(options.encodings(), vec!["Q4AS32D_T64", "Q6S16D_T64"]);
-        assert_eq!(options.delta_at("a.weight", "q4as32dt64"), Some(0.5));
+        assert_eq!(options.encodings(), vec!["Q4_K", "Q6_K"]);
+        assert_eq!(options.delta_at("a.weight", "q4k"), Some(0.5));
     }
 
     /// The same pair twice is what nothing can name a delta for.
@@ -201,10 +210,10 @@ mod tests {
     fn one_pair_twice_is_refused() {
         let mut options = MeasuredOptions::default();
         options
-            .insert("a.weight", option("Q4AS32D_T64", 0.5))
+            .insert("a.weight", option("Q4_K", 0.5))
             .expect("first");
         let error = options
-            .insert("a.weight", option("q4as32d_t64", 0.7))
+            .insert("a.weight", option("q4_k", 0.7))
             .expect_err("the same pair")
             .to_string();
         assert!(error.contains("'a.weight'"), "{error}");
@@ -217,11 +226,11 @@ mod tests {
     fn a_skipped_pair_is_no_measurement() {
         let mut options = MeasuredOptions::default();
         options
-            .insert("c.weight", skipped("Q6S16D_T64"))
+            .insert("c.weight", skipped("Q6_K"))
             .expect("skipped");
         assert_eq!(options.measured_tensors(), 0);
         assert!(options.measured_names().is_empty());
-        assert_eq!(options.delta_at("c.weight", "Q6S16D_T64"), None);
+        assert_eq!(options.delta_at("c.weight", "Q6_K"), None);
         assert_eq!(options.options_for("c.weight").len(), 1);
     }
 
@@ -231,11 +240,11 @@ mod tests {
     fn a_single_option_answers_the_two_way_read() {
         let mut options = MeasuredOptions::default();
         options
-            .insert("a.weight", option("Q4AS32D_T64", 0.5))
+            .insert("a.weight", option("Q4_K", 0.5))
             .expect("only");
-        assert_eq!(options.baseline_delta("a.weight", "Q4AS32D_T64"), Some(0.5));
-        assert_eq!(options.baseline_delta("a.weight", "Q8S32_T64"), Some(0.5));
-        assert_eq!(options.baseline_delta("b.weight", "Q4AS32D_T64"), None);
+        assert_eq!(options.baseline_delta("a.weight", "Q4_K"), Some(0.5));
+        assert_eq!(options.baseline_delta("a.weight", "Q8_0"), Some(0.5));
+        assert_eq!(options.baseline_delta("b.weight", "Q4_K"), None);
     }
 
     /// With a menu the two-way read is the baseline encoding's delta.
@@ -243,12 +252,12 @@ mod tests {
     fn a_menu_answers_the_two_way_read_at_the_baseline() {
         let mut options = MeasuredOptions::default();
         options
-            .insert("a.weight", option("Q4AS32D_T64", 0.5))
+            .insert("a.weight", option("Q4_K", 0.5))
             .expect("first");
         options
-            .insert("a.weight", option("Q6S16D_T64", 0.1))
+            .insert("a.weight", option("Q6_K", 0.1))
             .expect("second");
-        assert_eq!(options.baseline_delta("a.weight", "Q4AS32D_T64"), Some(0.5));
-        assert_eq!(options.baseline_delta("a.weight", "Q8S32_T64"), None);
+        assert_eq!(options.baseline_delta("a.weight", "Q4_K"), Some(0.5));
+        assert_eq!(options.baseline_delta("a.weight", "Q8_0"), None);
     }
 }

@@ -10,7 +10,6 @@
 numr = { path = "../numr" }
 splintr = { path = "../splintr" }
 regexr = { path = "../regexr" }
-tcf-core = { path = "../hats/tcf/tcf-core" }
 nexar = { path = "../nexar/nexar" }
 
 # Model fixtures live outside the repo; tests skip when this is unset.

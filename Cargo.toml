@@ -36,11 +36,6 @@ python = ["dep:pyo3"]
 # Both CPU and GPU implementations live in boostr
 boostr = { path = "../boostr" }
 
-# tcf-core: TCF v1 layout schema, quantizer and file writer.
-# compressr produces TCF; every bit position, tile order and plane order stays
-# in tcf-core, exactly as the GGUF block layouts stay in boostr.
-tcf-core = { path = "../hats/tcf/tcf-core" }
-
 # JSON: config.json sidecars and the SafeTensors shard index
 serde_json = "1.0"
 
@@ -57,16 +52,9 @@ clap = { version = "4.5", features = ["derive"] }
 # Half-precision float types, for dtype casts and side-band scales
 half = "2.7"
 
-# Data parallelism, for quantizing one tensor's tile chunks concurrently.
-# The threading lives here, never in tcf-core: that crate's only permitted
-# dependency is blake3, and CONFORMANCE.md makes its scalar implementation the
-# definition of codec semantics.
-rayon = "1.10"
-
-# Temporary files, for the TCF payload spill. Pass 1 computes the payload every
-# tensor is written from and pass 2 would otherwise quantize it a second time;
-# holding those payloads in memory would make peak RAM the whole quantized
-# model, so they go to an unlinked temporary file instead.
+# Temporary files, for the TCF payload spill: the container writes its
+# directory before any payload, so each finished payload waits in an unlinked
+# temporary file instead of memory, and peak RAM stays one tensor.
 tempfile = "3.23"
 
 # Python bindings (optional)
@@ -78,7 +66,6 @@ pyo3 = { version = "0.23", features = ["extension-module"], optional = true }
 boostr = { path = "../boostr" }
 half = "2.7"
 tempfile = "3.23"
-tcf-core = { path = "../hats/tcf/tcf-core" }
 
 [profile.release]
 opt-level = 3

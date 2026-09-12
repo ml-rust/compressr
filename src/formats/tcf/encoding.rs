@@ -1,60 +1,9 @@
-//! Which TCF encoding a conversion writes, and how a tensor's bytes and shape
-//! reach `tcf-core`.
+//! How a tensor's bytes and shape reach `boostr::tcf`.
 
 use anyhow::{bail, Context, Result};
-use tcf_core::{NativeEncoding, RawEncoding};
+use boostr::tcf::RawEncoding;
 
-use super::encoding_table::{definition, definition_by_name, TCF_ENCODING_NAMES};
 use crate::loader::UnifiedDType;
-
-/// One encoding name with its case, underscores and hyphens removed.
-///
-/// Two spellings of one encoding are one encoding. Every place that compares
-/// encoding names — the parser below, and the sensitivity file's per-encoding
-/// records — compares this form, so a file spelling `Q4AS32D_T64` and one
-/// spelling `q4as32dt64` name the same rung rather than two.
-pub fn normalized_encoding_name(s: &str) -> String {
-    s.chars()
-        .filter(|c| *c != '_' && *c != '-')
-        .flat_map(char::to_lowercase)
-        .collect()
-}
-
-/// The spelling `PROFILES.md` and a sensitivity file use for one encoding.
-///
-/// A report names encodings, and a ladder breaks a tie between two of them by
-/// name, so the name has to be one fixed string rather than whatever a caller
-/// happened to read out of a file.
-pub fn tcf_encoding_name(encoding: NativeEncoding) -> &'static str {
-    match definition(encoding) {
-        Some(def) => def.display_name,
-        // `NativeEncoding` is `#[non_exhaustive]`: a rung tcf-core adds and
-        // compressr has no row for is reported by its identifier rather than
-        // by a name invented here.
-        None => "unnamed TCF encoding",
-    }
-}
-
-/// Parse a `NativeEncoding` name.
-///
-/// Bit width alone does not name a TCF encoding: symmetry and group size are
-/// part of the identifier, and the two 4-bit encodings differ in both. Case,
-/// underscores and hyphens are ignored, so `Q4AS64_T64` and `q4as64t64` are
-/// the same value.
-///
-/// # Errors
-/// The name is not one of [`TCF_ENCODING_NAMES`].
-pub fn parse_tcf_encoding(s: &str) -> Result<NativeEncoding> {
-    let normalized = normalized_encoding_name(s);
-    match definition_by_name(&normalized) {
-        Some(def) => Ok(def.encoding),
-        None => bail!(
-            "Unsupported TCF encoding: {}. Supported: {}",
-            s,
-            TCF_ENCODING_NAMES.join(", ")
-        ),
-    }
-}
 
 /// The raw encoding a tensor stored unquantized keeps.
 ///
@@ -79,36 +28,6 @@ pub fn raw_encoding_for(dtype: UnifiedDType, name: &str) -> Result<RawEncoding> 
              Accepted: F32, F16, BF16, I8, I16, I32, U8, U32."
         ),
     }
-}
-
-/// Read a float tensor's bytes as f32 values.
-///
-/// Already-F32 source bytes are read directly rather than run through
-/// [`crate::cast::cast_bytes`], which for a same-type cast would only copy
-/// `data` before this function copies it again into the `Vec<f32>` it
-/// returns.
-///
-/// # Errors
-/// The element type is not a float, or the byte count is not a whole number
-/// of elements.
-pub fn values_f32(data: &[u8], dtype: UnifiedDType, name: &str) -> Result<Vec<f32>> {
-    let owned;
-    let bytes: &[u8] = if dtype == UnifiedDType::F32 {
-        // `cast_bytes` returns `data.to_vec()` unchanged for a same-type
-        // cast, with no length check either side of it; reading `data`
-        // directly here matches that behavior exactly, minus the copy.
-        data
-    } else {
-        owned = crate::cast::cast_bytes(data, dtype, UnifiedDType::F32)
-            .with_context(|| format!("Failed to read tensor '{name}' as f32"))?;
-        &owned
-    };
-    Ok(bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|b| f32::from_le_bytes(*b))
-        .collect())
 }
 
 /// A shape as TCF's eight dimensions, trailing entries zero.
@@ -164,20 +83,6 @@ impl TensorShape {
         self.rank
     }
 
-    /// The row length: the LAST dimension.
-    ///
-    /// This is the axis a tile runs along, and the axis an importance vector
-    /// carries one entry per, so it is what `tcf_core::column_weights` takes
-    /// as its `row_width`. A dimension that does not fit `usize` answers `0`,
-    /// which that function refuses rather than reading at a wrong stride.
-    pub fn row_width(&self) -> usize {
-        self.extent()
-            .last()
-            .copied()
-            .and_then(|width| usize::try_from(width).ok())
-            .unwrap_or(0)
-    }
-
     /// EXACTLY `rank` dimensions, which is what the codec accepts. Handing it
     /// the padded eight is `E_INVALID_RANK`.
     pub fn extent(&self) -> &[u64] {
@@ -190,79 +95,6 @@ impl TensorShape {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Every encoding names itself, and that name parses back to it.
-    #[test]
-    fn a_name_round_trips_through_the_parser() {
-        for encoding in [
-            NativeEncoding::Q4S32T64,
-            NativeEncoding::Q4AS32T64,
-            NativeEncoding::Q4AS32DT64,
-            NativeEncoding::Q4AS64T64,
-            NativeEncoding::Q6S32T64,
-            NativeEncoding::Q6S16DT64,
-            NativeEncoding::Q8S32T64,
-        ] {
-            let name = tcf_encoding_name(encoding);
-            assert_eq!(
-                parse_tcf_encoding(name).expect("parses"),
-                encoding,
-                "{name}"
-            );
-        }
-    }
-
-    /// Case, underscores and hyphens never separate two spellings of one
-    /// encoding.
-    #[test]
-    fn one_encoding_has_one_normalized_name() {
-        assert_eq!(
-            normalized_encoding_name("Q4AS32D_T64"),
-            normalized_encoding_name("q4as32d-t64")
-        );
-        assert_ne!(
-            normalized_encoding_name("Q4AS32D_T64"),
-            normalized_encoding_name("Q4AS32_T64")
-        );
-    }
-
-    #[test]
-    fn parses_every_encoding_name() {
-        assert_eq!(
-            parse_tcf_encoding("q4s32t64").unwrap(),
-            NativeEncoding::Q4S32T64
-        );
-        assert_eq!(
-            parse_tcf_encoding("q4as32t64").unwrap(),
-            NativeEncoding::Q4AS32T64
-        );
-        assert_eq!(
-            parse_tcf_encoding("Q4AS64_T64").unwrap(),
-            NativeEncoding::Q4AS64T64
-        );
-        assert_eq!(
-            parse_tcf_encoding("q6s32t64").unwrap(),
-            NativeEncoding::Q6S32T64
-        );
-        assert_eq!(
-            parse_tcf_encoding("Q6S16D_T64").unwrap(),
-            NativeEncoding::Q6S16DT64
-        );
-        assert_eq!(
-            parse_tcf_encoding("Q8S32T64").unwrap(),
-            NativeEncoding::Q8S32T64
-        );
-    }
-
-    /// Bit width alone is not an encoding: "q4" names neither a symmetry nor
-    /// a group size, so it is refused rather than resolved to one of the two
-    /// 4-bit encodings.
-    #[test]
-    fn rejects_an_unknown_encoding_name() {
-        let err = parse_tcf_encoding("q4").unwrap_err().to_string();
-        assert!(err.contains("Unsupported TCF encoding: q4"), "{err}");
-        assert!(err.contains("q4as64t64"), "{err}");
-    }
 
     #[test]
     fn keeps_the_source_element_type_for_a_raw_tensor() {
@@ -291,17 +123,5 @@ mod tests {
         assert!(dims_of(&[1, 1, 1, 1, 1, 1, 1, 1, 1], "w").is_err());
         assert!(TensorShape::of(&[], "w").is_err());
         assert!(TensorShape::of(&[1, 1, 1, 1, 1, 1, 1, 1, 1], "w").is_err());
-    }
-
-    #[test]
-    fn values_come_back_as_f32() {
-        let bytes: Vec<u8> = [1.0f32, -2.5]
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
-        assert_eq!(
-            values_f32(&bytes, UnifiedDType::F32, "w").unwrap(),
-            vec![1.0, -2.5]
-        );
     }
 }

@@ -25,18 +25,14 @@ This section is the SINGLE source of truth on what works. Everything below assum
 | PyTorch input      | One `.pt` / `.pth` / `.bin` state dict, F32 and F64 tensors |
 | SafeTensors output | Sharded at `--max-shard-size`, with a matching index       |
 | GGUF output        | GGUF v3, one self-contained file                           |
-| TCF output         | TCF v1, one self-contained file, written through tcf-core  |
-| TCF quantization   | Q4S32_T64, Q4AS32_T64, Q4AS64_T64, Q6S32_T64, Q6S16D_T64, Q4AS32D_T64, Q8S32_T64. The two-level encodings (`Q6S16D_T64`, `Q4AS32D_T64`) hold their group fit EXACT; only a flat encoding rounds it to binary16, because only a flat encoding stores one. A two-level file written before that change does not reproduce byte for byte, and a tiny-scale tensor a two-level encoding once refused as out of binary16 range is now accepted — its bfloat16 super-value holds it. Symmetric encodings use the FULL two's-complement code range (`-8..=7`, `-32..=31`, `-128..=127`); the most-negative code is no longer reserved, so a symmetric file written before that change does not reproduce byte for byte either |
-| TCF threading      | One tensor's tile chunks quantize across rayon's pool, bytes unchanged |
-| TCF error objective | The default is PER ENCODING, from one table beside the encoding definitions: 4-bit and Q8S32_T64 take `uniform` (`w = 1`), the 6-bit encodings take `rms-plus-abs` (`w = sqrt(mean(x^2)) + \|x\|`), each chosen by measurement. It is resolved per TENSOR from that tensor's encoding, so a mixed profile minimizes each half of the file under its own objective. `--tcf-objective uniform\|squared\|rms-plus-abs` OVERRIDES that default on every tensor. Changes which values the encoder chooses, never a bit layout, so the file stays a conforming TCF v1 file. A 6-bit file written before this default does not reproduce byte for byte; `--tcf-objective uniform` writes the earlier bytes |
-| TCF search width   | `--tcf-search standard\|wide\|exhaustive` sets how many candidate scales each scale search, refit and sub-level refinement tries. `standard` is the DEFAULT and reproduces the bytes written before the flag existed. A wider level is a strict SUPERSET of a narrower one, so it can only match or improve the fit UNDER THE ENCODER'S ERROR OBJECTIVE. That is a bound on the objective, NEVER a promise about the model: a wider search was measured improving the task metric with no `--imatrix` and DEGRADING it with one, because a sharply weighted objective is the one extra candidates overfit. NEVER pair a wider search with `--imatrix` without measuring both evaluation splits first. Costs conversion time only; no bit layout, tile order, plane order, offset or digest moves |
+| TCF output         | TCF v1, one self-contained file, written through `boostr::tcf`. `--format tcf` takes every `--quantization` method and mix and stores the GGML block streams a GGUF run writes, byte for byte, plus the container's records: the `GGML_REFERENCE` activation contract, a proof vector per tensor, a `fallback_reason` per tensor, and on a `--sensitivity` run the calibration record and per-tensor task delta. NEVER add a TCF-only quantizer or encoding: TCF's payload IS the GGUF payload |
 | dtype cast         | F32, F16, BF16, round-to-nearest-even                      |
 | GGUF quantization  | Q4_0, Q4_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS |
 | Sidecar copying    | Tokenizer and config files follow the weights              |
 | GGUF mixed precision | Q4_K_S, Q4_K_M, Q5_K_S, Q5_K_M — llama.cpp's per-tensor allocation, reproduced from `llama_tensor_get_type` |
 | GGUF measured allocation | `--sensitivity` ranks a mix's promotions by measured task damage per element, spending the byte budget llama.cpp's positional rules would have spent on the same checkpoint |
-| Measured ladder allocation | A `--sensitivity` file carrying one record per (tensor, encoding) pair is a MENU: each tensor's encoding is chosen from its measured options under the same byte budget, so a tensor measured as undamaged at a cheaper encoding is demoted instead of paying the base price. Both TCF profiles and GGUF mixes take this path; a file measuring one encoding still allocates two ways, byte for byte |
-| Importance matrix  | `--imatrix FILE` weights the quantizer's choices by the per-column mean square activation a calibration run accumulated, through boostr's `ImportanceMatrix` reader. OPTIONAL and OFF by default: a run that names no file writes exactly the bytes it always wrote, for every format, and a file written without one is a normal conforming file. Accepted with `--format gguf` when the quantization is a K-quant, IQ4_NL or IQ4_XS (`q2_k`, `q3_k`, `q4_k`, `q5_k`, `q6_k`, `iq4_nl`, `iq4_xs`) or a K-quant mix, and with `--format tcf`; refused for anything else. GGUF takes boostr's `quantize_with_importance`; TCF DEFAULTS to `tcf_core::WeightSource::Explicit`, the raw importance ggml's Q6_K path passes, which REPLACES the per-encoding default objective; `--tcf-importance combined` selects `w = q * sqrt(sigma2 + x^2)` with `sigma2 = 2 * mean(x^2)`, the product ggml's Q3_K/Q4_K/Q5_K imatrix path minimizes. The default is the MEASURED winner, not the closer analogy to ggml: reproducing ggml's product does not reproduce ggml's result, because the encoding underneath is not a K-quant. Both forms apply to a MEASURED tensor only and leave a tensor with no entry on its encoding's objective; `--tcf-importance` without `--imatrix` is refused. A tensor the run never exercised is quantized UNWEIGHTED, never against a synthesized zero vector, and a matrix whose column counts disagree with the checkpoint is refused before any output file is created. Changes which values the encoder chooses, never a bit layout |
+| Measured ladder allocation | A `--sensitivity` file carrying one record per (tensor, format) pair is a MENU: each tensor's format is chosen from its measured options under the same byte budget, so a tensor measured as undamaged at a cheaper format is demoted instead of paying the base price. A file names the GGML formats boostr's sweep measured at (`Q4_K`, `Q6_K`, ...); a file measuring one format still allocates two ways, byte for byte. GGUF and TCF outputs take the same path; only TCF records the measurement |
+| Importance matrix  | `--imatrix FILE` weights the quantizer's choices by the per-column mean square activation a calibration run accumulated, through boostr's `ImportanceMatrix` reader. OPTIONAL and OFF by default: a run that names no file writes exactly the bytes it always wrote, for every format, and a file written without one is a normal conforming file. Accepted with `--format gguf` or `--format tcf` when the quantization is a K-quant, IQ4_NL or IQ4_XS (`q2_k`, `q3_k`, `q4_k`, `q5_k`, `q6_k`, `iq4_nl`, `iq4_xs`) or a K-quant mix; refused for anything else. Both formats take boostr's `quantize_with_importance`. A tensor the run never exercised is quantized UNWEIGHTED, never against a synthesized zero vector, and a matrix whose column counts disagree with the checkpoint is refused before any output file is created. Changes which values the encoder chooses, never a bit layout |
 | Conversion report  | The format every tensor was written in, and the measured bits per weight |
 
 **Roadmap. Each has an enum variant and each is REFUSED before any output file is created:**
@@ -51,12 +47,12 @@ This section is the SINGLE source of truth on what works. Everything below assum
 | PyTorch F16, BF16   | boostr's `.pt` reader decodes F32 and F64 only                          |
 | Python API          | The PyO3 module exports `__version__` only                              |
 | Triple-buffered I/O | A prefetch/compute/write pipeline; reads and writes are serial today    |
-| Parallel shard I/O  | Reads are sequential; rayon parallelizes TCF quantization, never I/O    |
+| Parallel shard I/O  | Reads and writes are sequential                                         |
 | Q2_K/Q3_K mixes, IQ mixes, other I-quants | Mix rules for Q2_K/Q3_K and for IQ mixes, and boostr WRITERS for IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S and IQ1_M. IQ4_NL and IQ4_XS are written flat; `q2_k`, `q2_k_s`, `q3_k_s`, `q3_k_m` and `q3_k_l` are refused by name |
 
 The `optimize` subcommand parses its flags but every method it accepts is a roadmap item, so it always errors.
 
-SafeTensors output is NEVER quantized: its header records an element type and a shape, which cannot describe a block-quantized tensor. GGUF block quantization writes GGUF; `--tcf-encoding` writes TCF.
+SafeTensors output is NEVER quantized: its header records an element type and a shape, which cannot describe a block-quantized tensor. Block quantization writes GGUF, or TCF with `--format tcf`.
 
 TCF is produced from a full-precision source ONLY. NEVER add a GGUF-to-TCF or TCF-to-TCF path: either would quantize already-quantized weights a second time, from values the first pass had already rounded. A TCF input is read for `info` and for conversion to another format; it is never a TCF source.
 
@@ -72,7 +68,7 @@ cargo test --features cuda                       # CUDA tests
 # CLI usage
 compressr convert ./llama-3-8b --format gguf --quantization q4_k_m
 compressr convert ./llama-3-8b --format safetensors --dtype bf16
-compressr convert ./llama-3-8b --format tcf --tcf-encoding q4s32t64 --tcf-preferred-encoding q4s32t64
+compressr convert ./llama-3-8b --format tcf --quantization q4_k_m --sensitivity llama.sens.jsonl
 compressr info ./llama-3-8b --verbose
 ```
 
@@ -97,7 +93,7 @@ compressr info ./llama-3-8b --verbose
 - `ConversionConfig::validate` rejects every unwritable configuration BEFORE a file is opened. A mismatch caught by the writer instead aborts mid-loop and leaves a truncated file.
 - SafeTensors headers are padded with spaces to a multiple of 8 bytes, so the data block starts 8-byte aligned and a reader can map an F32 tensor in place.
 - The loader COPIES tensor bytes out of the file. NEVER describe it as zero-copy or memory-mapped.
-- A TCF read VERIFIES before it decodes: `payload_digest`, the recomputed logical stream against `semantic_digest`, then the proof vector (Section 15). boostr's reader does this and compressr never bypasses it.
+- A TCF read VERIFIES before it decodes: `payload_digest`, `semantic_digest`, then the proof vector with boostr's own block decoder (Section 15). boostr's reader does this and compressr never bypasses it.
 - A `torch.nn.utils.weight_norm` pair is folded on read, through `boostr::nn::fuse_weight_norm` and nothing else. compressr NEVER holds a second copy of that arithmetic, exactly as it holds no block layout.
 - A `.pth` whose keys ALL start with `state_dict.` has that root stripped. The pickle flattener carries the top-level key into every name, and no consumer of the output expects it.
 
@@ -121,7 +117,7 @@ If you're implementing a quantization feature, ask:
 - "Is this a kernel/algorithm?" → **boostr**
 - "Is this file I/O or CLI?" → **compressr**
 
-NEVER add a second copy of a block layout to compressr — GGUF blocks live in boostr, and TCF bit positions, tile order and plane order live in tcf-core. A writer checked against a reader that sits beside it proves nothing: Q6_K once shipped with the wrong field order and compressr's own reader agreed with it while every real reader produced NaN. `tests/gguf_roundtrip.rs` decodes with boostr's reader kernels for exactly this reason, and the TCF tests read back through `tcf-core`'s own reader.
+NEVER add a second copy of a block layout to compressr — GGUF blocks live in boostr, and the TCF container's offsets, digests and proofs live in `boostr::tcf`. A writer checked against a reader that sits beside it proves nothing: Q6_K once shipped with the wrong field order and compressr's own reader agreed with it while every real reader produced NaN. `tests/gguf_roundtrip.rs` decodes with boostr's reader kernels for exactly this reason, and the TCF tests read back through boostr's reader.
 
 ### Why This Matters
 

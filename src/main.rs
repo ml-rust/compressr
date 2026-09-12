@@ -80,10 +80,8 @@ mod quant_arg;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use compressr::{
-    parse_sensitivity, parse_tcf_encoding, parse_tcf_importance, parse_tcf_objective,
-    parse_tcf_profile, parse_tcf_search, ConversionConfig, ImportanceMatrix, OutputFormat,
-    QuantizationConfig, QuantizationMethod, SearchEffort, SensitivityMeasurement, TcfObjective,
-    TcfOptions, TcfProfile,
+    parse_sensitivity, ConversionConfig, ImportanceMatrix, OutputFormat, QuantizationConfig,
+    QuantizationMethod, SensitivityMeasurement,
 };
 use quant_arg::parse_quantization;
 
@@ -139,77 +137,6 @@ enum Commands {
         #[arg(long, value_name = "SIZE", default_value = "5GB")]
         max_shard_size: String,
 
-        /// TCF encoding (q4s32t64, q4as32t64, q4as32dt64, q4as64t64, q6s32t64, q6s16dt64, q8s32t64)
-        ///
-        /// Required by --format tcf. Bit width alone does not name an
-        /// encoding: symmetry and group size are part of it, so this is a
-        /// separate flag from --quantization, which names GGUF block formats.
-        #[arg(long, value_name = "ENCODING")]
-        tcf_encoding: Option<String>,
-
-        /// Encoding the TCF module records as preferred
-        ///
-        /// Required by --format tcf. TCF records a fallback reason on every
-        /// tensor whose encoding differs from this one, and no checkpoint
-        /// carries the preference, so compressr never defaults it.
-        #[arg(long, value_name = "ENCODING")]
-        tcf_preferred_encoding: Option<String>,
-
-        /// TCF allocation profile (ref, high, balanced, compact)
-        ///
-        /// The alternative to --tcf-encoding, and mutually exclusive with it.
-        /// A profile is mixed precision: a base encoding for every quantizable
-        /// tensor, and a bump encoding on the worst-reconstructed share of the
-        /// parameters. That share is ranked by a weight-error screen unless
-        /// --sensitivity supplies a measured task-metric delta.
-        #[arg(long, value_name = "PROFILE")]
-        tcf_profile: Option<String>,
-
-        /// TCF error objective (uniform, squared, rms-plus-abs)
-        ///
-        /// --format tcf only. Names WHICH error the quantizer minimizes:
-        /// uniform is w = 1, the plain squared reconstruction error; squared
-        /// is w = x^2; rms-plus-abs is w = sqrt(mean(x^2)) + |x| over each
-        /// group. Unset, each tensor takes the default its own ENCODING
-        /// carries, so a mixed-precision profile minimizes each half of the
-        /// file under the objective measured for it. Set, this objective
-        /// OVERRIDES that default on every tensor. Either way it changes
-        /// which values the encoder chooses and no bit layout, so the file it
-        /// writes is a normal conforming TCF file.
-        #[arg(long, value_name = "OBJECTIVE")]
-        tcf_objective: Option<String>,
-
-        /// How a TCF --imatrix importance is applied (combined, replace)
-        ///
-        /// --format tcf with --imatrix only. combined is the default:
-        /// w = q * sqrt(sigma2 + x^2), the importance TIMES the data-derived
-        /// term ggml's K-quant imatrix path minimizes, with
-        /// sigma2 = 2 * mean(x^2). replace is w = q, the importance ALONE,
-        /// which is what ggml's Q6_K imatrix path passes and which replaces
-        /// the objective the tensor's encoding carries. Both apply to a
-        /// MEASURED tensor only: one the calibration run never exercised
-        /// keeps its encoding's objective either way, so a conversion with no
-        /// --imatrix is untouched by this flag and is refused for naming it.
-        #[arg(long, value_name = "FORM")]
-        tcf_importance: Option<String>,
-
-        /// How wide the TCF quantizer's candidate-scale search runs (standard, wide, exhaustive)
-        ///
-        /// --format tcf only. standard is the DEFAULT and today's search:
-        /// unset, a conversion writes exactly the bytes it always wrote.
-        /// wide and exhaustive try every candidate standard tries, plus
-        /// more, so each is a STRICT SUPERSET of a narrower search — it can
-        /// only match or improve the fit UNDER THE ENCODER'S ERROR
-        /// OBJECTIVE. That objective is a proxy for model quality, not model
-        /// quality: a wider search has been measured to improve the task
-        /// metric with no importance matrix and to DEGRADE it with one, so
-        /// pair a wider search with --imatrix only after measuring. The cost
-        /// is conversion time only: no bit layout, tile order, plane order,
-        /// offset or digest moves, so the file stays a normal conforming TCF
-        /// v1 file under any effort.
-        #[arg(long, value_name = "EFFORT")]
-        tcf_search: Option<String>,
-
         /// Measured task-metric sensitivity, as JSON lines
         ///
         /// One "baseline" record naming the model, the evaluation set and the
@@ -218,19 +145,18 @@ enum Commands {
         /// ranked by measured damage per element instead of by a rule that
         /// measured nothing.
         ///
-        /// With --format tcf: requires --tcf-profile with a bump encoding.
-        /// The profile's bump set is ranked by the measurement, and
-        /// sensitivity_delta, sensitivity_samples and calibration_id are
-        /// written from it. Without the flag the ranking is a weight-error
-        /// screen and those fields stay unset.
+        /// Requires a mixed-precision --quantization (q4_k_s, q4_k_m,
+        /// q5_k_s, q5_k_m), with --format gguf or --format tcf. The mix's
+        /// promotions are ranked by the measurement, spending exactly the
+        /// bytes llama.cpp's positional rules would have spent on the same
+        /// checkpoint, so the two artifacts are size matched. Tensors whose
+        /// row is not a whole number of 256-element super-blocks cannot be
+        /// promoted at all, and are counted and reported rather than skipped.
         ///
-        /// With --format gguf: requires a mixed-precision --quantization
-        /// (q4_k_s, q4_k_m, q5_k_s, q5_k_m). The mix's promotions are then
-        /// ranked by the measurement, spending exactly the bytes llama.cpp's
-        /// positional rules would have spent on the same checkpoint, so the
-        /// two artifacts are size matched. Tensors whose row is not a whole
-        /// number of 256-element super-blocks cannot be promoted at all, and
-        /// are counted and reported rather than skipped.
+        /// A TCF output also records the measurement: one calibration record
+        /// for the file, and on every measured tensor its task delta with
+        /// calibration_id pointing at it. A GGUF output has no field for
+        /// either.
         #[arg(long, value_name = "FILE")]
         sensitivity: Option<String>,
 
@@ -344,12 +270,6 @@ fn main() -> Result<()> {
             quantization,
             dtype,
             max_shard_size,
-            tcf_encoding,
-            tcf_preferred_encoding,
-            tcf_profile,
-            tcf_objective,
-            tcf_importance,
-            tcf_search,
             sensitivity,
             imatrix,
             arch,
@@ -368,18 +288,6 @@ fn main() -> Result<()> {
                 .as_deref()
                 .map(parse_quantization)
                 .transpose()?;
-            let tcf_options =
-                parse_tcf_options(tcf_encoding.as_deref(), tcf_preferred_encoding.as_deref())?;
-            let tcf_profile = tcf_profile.as_deref().map(parse_tcf_profile).transpose()?;
-            let tcf_objective = tcf_objective
-                .as_deref()
-                .map(parse_tcf_objective)
-                .transpose()?;
-            let tcf_importance = tcf_importance
-                .as_deref()
-                .map(parse_tcf_importance)
-                .transpose()?;
-            let tcf_search = tcf_search.as_deref().map(parse_tcf_search).transpose()?;
             let sensitivity = sensitivity.as_deref().map(read_sensitivity).transpose()?;
             // Read before the output path is defaulted, so a file that is not
             // an importance matrix fails before any directory is created.
@@ -398,7 +306,6 @@ fn main() -> Result<()> {
                 .with_max_shard_size(max_shard_size)
                 .with_verbose(verbose);
 
-            let quant_choice_set = quant_choice.is_some();
             if let Some(quant_choice) = quant_choice {
                 config = config.with_quantization(quant_choice.config);
                 if let Some(mix) = quant_choice.mix {
@@ -411,36 +318,14 @@ fn main() -> Result<()> {
             if let Some(arch) = arch {
                 config = config.with_arch(arch);
             }
-            if let Some(tcf_options) = tcf_options {
-                config = config.with_tcf(tcf_options);
-            }
-            if let Some(tcf_profile) = tcf_profile {
-                config = config.with_tcf_profile(tcf_profile);
-            }
-            if let Some(tcf_objective) = tcf_objective {
-                config = config.with_tcf_objective(tcf_objective);
-            }
-            if let Some(tcf_importance) = tcf_importance {
-                config = config.with_tcf_importance(tcf_importance);
-            }
-            if let Some(tcf_search) = tcf_search {
-                config = config.with_tcf_search(tcf_search);
-            }
             if let Some(imatrix) = imatrix {
                 config = config.with_importance(imatrix);
             }
             let measured = sensitivity.clone();
-            // A measurement ranks whichever promotion set the run has: a GGUF
-            // mix's promotions, in GGUF or in TCF block encodings, or a TCF
-            // profile's bump set.
+            // A measurement ranks the mix's promotions, in GGUF or in TCF
+            // block encodings.
             if let Some(measurement) = sensitivity {
-                let gguf_blocks = output_format == OutputFormat::Gguf
-                    || (output_format == OutputFormat::Tcf && config.quantization.is_some());
-                config = if gguf_blocks {
-                    config.with_gguf_sensitivity(measurement)
-                } else {
-                    config.with_tcf_sensitivity(measurement)
-                };
+                config = config.with_gguf_sensitivity(measurement);
             }
 
             let stats = compressr::convert(config)?;
@@ -448,8 +333,6 @@ fn main() -> Result<()> {
             // A comparison has to state what it compared, so the formats the
             // conversion actually wrote are printed, not the ones the name
             // implies. `--verbose` adds the per-tensor listing behind them.
-            // A TCF run records no rows: its payload is written in a later
-            // pass, so its byte counts are not the file's.
             if !stats.mix.entries().is_empty() {
                 println!("{}", stats.mix);
             }
@@ -500,51 +383,16 @@ fn main() -> Result<()> {
                     );
                 }
             }
-            if output_format == OutputFormat::Tcf && quant_choice_set {
-                // A block run has no TCF objective and no TCF search: the GGML
-                // writers decided every byte, exactly as for the GGUF.
+            if output_format == OutputFormat::Tcf {
                 println!(
                     "TCF block encodings: each quantized tensor is the GGML block stream a \
-                     GGUF run writes, byte for byte, under TCF's activation contract \
-                     A8S32_DYNAMIC (8-bit codes in groups of 32, i32 accumulate, f32 scale, \
-                     f32 out), which is what the block kernels compute."
-                );
-            }
-            if output_format == OutputFormat::Tcf && !quant_choice_set {
-                // Printed on a flagless run too: the summary already names the
-                // encoding, and the objective is the other half of what the
-                // encoder was told to do. The line states the POLICY and every
-                // encoding it covers, never one objective for a mixed file;
-                // the conversion log states what each encoding resolved to.
-                match tcf_objective_policy(tcf_options, tcf_profile, tcf_objective) {
-                    Ok(policy) => println!("{policy}"),
-                    Err(error) => println!("TCF objective: {error}"),
-                }
-                // Stated only when the search widened: a default run's log is
-                // unchanged from before this flag existed.
-                if let Some(effort) = tcf_search {
-                    if effort != SearchEffort::Standard {
-                        println!("{}", compressr::tcf_search_report(effort));
-                    }
-                }
-                println!(
-                    "TCF activation contract: exact F32 activations, F32 accumulate, F32 out. \
-                     workload_profile_id is unset: compressr measures no workload. No \
-                     activation calibration was run either, which is what that contract says."
-                );
-            }
-            if let Some(profile) = tcf_profile {
-                println!(
-                    "TCF profile {}: base {:?}, bump {:?} over the top {:.0}% of quantizable \
-                     parameters, counted in elements.",
-                    profile.name,
-                    profile.base,
-                    profile.bump,
-                    profile.bump_fraction * 100.0
+                     GGUF run writes, byte for byte, under the GGML_REFERENCE activation \
+                     contract: the kernel family ggml defines for each block type. \
+                     workload_profile_id is unset: compressr measures no workload."
                 );
                 match measured {
                     Some(ref measurement) => println!(
-                        "That share was ranked by a MEASURED task-metric delta per element: {} \
+                        "The mix was ranked by a MEASURED task-metric delta per element: {} \
                          tensors measured over {} evaluation rows at {}. sensitivity_delta, \
                          sensitivity_samples and calibration_id are written from that \
                          measurement, which this file declares as calibration {:#010x}. \
@@ -557,20 +405,10 @@ fn main() -> Result<()> {
                         measurement.calibration_id()
                     ),
                     None => println!(
-                        "That share was ranked by a WEIGHT-ERROR screen: each tensor was \
-                         quantized at the base encoding, dequantized again, and scored by the \
-                         relative RMS of the error. No task-metric calibration was run, so \
-                         sensitivity_delta, sensitivity_ci95, sensitivity_samples and \
-                         calibration_id are unset and this file is NOT profile-solved per \
-                         PROFILES.md Section 4."
+                        "No task-metric measurement was given, so calibration_id and every \
+                         sensitivity field are unset: the allocation is positional."
                     ),
                 }
-                println!(
-                    "The ladder's {:.2} bpw for {} assumes that allocation. The bpw this file \
-                     achieved is measured from the bytes written and is logged as \
-                     \"bpw achieved\".",
-                    profile.ladder_bpw, profile.name
-                );
             }
         }
 
@@ -771,59 +609,6 @@ fn parse_format(s: &str) -> Result<OutputFormat> {
     }
 }
 
-/// Parse the two TCF encoding flags, which are set together or not at all.
-///
-/// Returning `None` for neither leaves `ConversionConfig::validate` to refuse
-/// `--format tcf` by name, so one message covers the CLI and the library API.
-fn parse_tcf_options(
-    encoding: Option<&str>,
-    preferred: Option<&str>,
-) -> Result<Option<TcfOptions>> {
-    match (encoding, preferred) {
-        (None, None) => Ok(None),
-        (Some(encoding), Some(preferred)) => Ok(Some(TcfOptions::uniform(
-            parse_tcf_encoding(encoding)?,
-            parse_tcf_encoding(preferred)?,
-        ))),
-        (Some(_), None) => anyhow::bail!(
-            "--tcf-encoding was given without --tcf-preferred-encoding. TCF records a \
-             fallback reason on every tensor whose encoding differs from its module's \
-             preferred one, so both are required."
-        ),
-        (None, Some(_)) => anyhow::bail!(
-            "--tcf-preferred-encoding was given without --tcf-encoding, so nothing names \
-             the encoding the weights are written in."
-        ),
-    }
-}
-
-/// What the summary says about the objective this TCF run quantized under.
-///
-/// Built from the same two flags the conversion is, so the summary cannot
-/// name a policy the conversion did not run. It states whether the objective
-/// came from the per-encoding defaults or from an explicit
-/// `--tcf-objective`, and for a mixed-precision profile it names every
-/// encoding rather than implying one objective covered the file.
-///
-/// # Errors
-/// Neither TCF flag was given, which the conversion refuses first.
-fn tcf_objective_policy(
-    options: Option<TcfOptions>,
-    profile: Option<TcfProfile>,
-    objective: Option<TcfObjective>,
-) -> Result<String> {
-    let options = match (options, profile) {
-        (Some(options), _) => options,
-        (None, Some(profile)) => TcfOptions::from_profile(profile),
-        (None, None) => anyhow::bail!(
-            "--format tcf needs --tcf-encoding or --tcf-profile, and neither was given"
-        ),
-    };
-    Ok(compressr::objective_policy(
-        options.with_objective_override(objective),
-    ))
-}
-
 /// Read and parse a `--sensitivity` file.
 ///
 /// Parsed here rather than in the writer so a malformed or empty file fails
@@ -861,7 +646,6 @@ fn parse_method(s: &str) -> Result<QuantizationMethod> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
-    use compressr::ImportanceForm;
 
     #[test]
     fn test_cli_definition_is_valid() {
@@ -933,270 +717,6 @@ mod tests {
             Commands::Convert { arch, .. } => assert_eq!(arch.as_deref(), Some("voxcpm2")),
             _ => panic!("expected the convert subcommand"),
         }
-    }
-
-    #[test]
-    fn test_convert_parses_the_tcf_encoding_flags() {
-        let cli = Cli::try_parse_from([
-            "compressr",
-            "convert",
-            "model/",
-            "--format",
-            "tcf",
-            "--tcf-encoding",
-            "q4as64t64",
-            "--tcf-preferred-encoding",
-            "q6s32t64",
-        ])
-        .unwrap();
-
-        match cli.command {
-            Commands::Convert {
-                tcf_encoding,
-                tcf_preferred_encoding,
-                ..
-            } => {
-                let options =
-                    parse_tcf_options(tcf_encoding.as_deref(), tcf_preferred_encoding.as_deref())
-                        .unwrap()
-                        .expect("both flags given");
-                assert_eq!(options.encoding, parse_tcf_encoding("q4as64t64").unwrap());
-                assert_eq!(
-                    options.preferred_encoding,
-                    parse_tcf_encoding("q6s32t64").unwrap()
-                );
-            }
-            _ => panic!("expected the convert subcommand"),
-        }
-    }
-
-    #[test]
-    fn test_convert_parses_the_tcf_profile_flag() {
-        let cli = Cli::try_parse_from([
-            "compressr",
-            "convert",
-            "model/",
-            "--format",
-            "tcf",
-            "--tcf-profile",
-            "balanced",
-        ])
-        .unwrap();
-
-        match cli.command {
-            Commands::Convert { tcf_profile, .. } => {
-                let profile = parse_tcf_profile(tcf_profile.as_deref().expect("the flag")).unwrap();
-                assert_eq!(profile.name, "TCF-BALANCED");
-                assert_eq!(profile.bump_fraction, 0.15);
-            }
-            _ => panic!("expected the convert subcommand"),
-        }
-    }
-
-    /// The importance-form flag parses, and a run that does not name it
-    /// names no form at all: the combined product is then the default the
-    /// conversion applies, and the replacement form is unreachable.
-    #[test]
-    fn test_convert_parses_the_tcf_importance_flag() {
-        let cli = Cli::try_parse_from([
-            "compressr",
-            "convert",
-            "model/",
-            "--format",
-            "tcf",
-            "--tcf-profile",
-            "balanced",
-            "--imatrix",
-            "model.imatrix",
-            "--tcf-importance",
-            "replace",
-        ])
-        .unwrap();
-
-        match cli.command {
-            Commands::Convert { tcf_importance, .. } => {
-                let form =
-                    parse_tcf_importance(tcf_importance.as_deref().expect("the flag")).unwrap();
-                assert_eq!(form, ImportanceForm::Replace);
-            }
-            _ => panic!("expected the convert subcommand"),
-        }
-
-        let flagless = Cli::try_parse_from([
-            "compressr",
-            "convert",
-            "model/",
-            "--format",
-            "tcf",
-            "--tcf-profile",
-            "balanced",
-        ])
-        .unwrap();
-        match flagless.command {
-            Commands::Convert { tcf_importance, .. } => assert!(tcf_importance.is_none()),
-            _ => panic!("expected the convert subcommand"),
-        }
-    }
-
-    /// The flag parses, and a flagless run names no objective at all — every
-    /// tensor then takes the default its own encoding carries.
-    #[test]
-    fn test_convert_parses_the_tcf_objective_flag() {
-        let cli = Cli::try_parse_from([
-            "compressr",
-            "convert",
-            "model/",
-            "--format",
-            "tcf",
-            "--tcf-profile",
-            "balanced",
-            "--tcf-objective",
-            "rms-plus-abs",
-        ])
-        .unwrap();
-
-        match cli.command {
-            Commands::Convert { tcf_objective, .. } => {
-                let objective =
-                    parse_tcf_objective(tcf_objective.as_deref().expect("the flag")).unwrap();
-                assert_eq!(objective, compressr::TcfObjective::RmsPlusAbs);
-            }
-            _ => panic!("expected the convert subcommand"),
-        }
-
-        let flagless = Cli::try_parse_from([
-            "compressr",
-            "convert",
-            "model/",
-            "--format",
-            "tcf",
-            "--tcf-profile",
-            "balanced",
-        ])
-        .unwrap();
-        match flagless.command {
-            Commands::Convert { tcf_objective, .. } => {
-                assert!(tcf_objective.is_none());
-                assert_eq!(
-                    tcf_objective
-                        .as_deref()
-                        .map(parse_tcf_objective)
-                        .transpose()
-                        .unwrap(),
-                    None
-                );
-            }
-            _ => panic!("expected the convert subcommand"),
-        }
-    }
-
-    /// The search-effort flag parses, and a flagless run names no effort at
-    /// all: the standard search is then the default the conversion applies.
-    #[test]
-    fn test_convert_parses_the_tcf_search_flag() {
-        let cli = Cli::try_parse_from([
-            "compressr",
-            "convert",
-            "model/",
-            "--format",
-            "tcf",
-            "--tcf-profile",
-            "balanced",
-            "--tcf-search",
-            "exhaustive",
-        ])
-        .unwrap();
-
-        match cli.command {
-            Commands::Convert { tcf_search, .. } => {
-                let effort = parse_tcf_search(tcf_search.as_deref().expect("the flag")).unwrap();
-                assert_eq!(effort, SearchEffort::Exhaustive);
-            }
-            _ => panic!("expected the convert subcommand"),
-        }
-
-        let flagless = Cli::try_parse_from([
-            "compressr",
-            "convert",
-            "model/",
-            "--format",
-            "tcf",
-            "--tcf-profile",
-            "balanced",
-        ])
-        .unwrap();
-        match flagless.command {
-            Commands::Convert { tcf_search, .. } => assert!(tcf_search.is_none()),
-            _ => panic!("expected the convert subcommand"),
-        }
-    }
-
-    /// The summary states where the objective came from, and a mixed profile
-    /// is never reported as though one objective covered the whole file.
-    #[test]
-    fn test_the_summary_states_the_objective_policy() {
-        let compact = parse_tcf_profile("compact").unwrap();
-        let defaults = tcf_objective_policy(None, Some(compact), None).unwrap();
-        assert!(defaults.contains("none named"), "{defaults}");
-        assert!(defaults.contains("MIXED precision"), "{defaults}");
-        assert!(
-            defaults.contains("Q6S16D_T64 quantizes under rms-plus-abs"),
-            "{defaults}"
-        );
-        assert!(
-            defaults.contains("does NOT reproduce byte for byte"),
-            "{defaults}"
-        );
-
-        let explicit =
-            tcf_objective_policy(None, Some(compact), Some(compressr::TcfObjective::Squared))
-                .unwrap();
-        assert!(explicit.contains("explicit --tcf-objective"), "{explicit}");
-        assert!(
-            explicit.contains("overrides the per-encoding default"),
-            "{explicit}"
-        );
-
-        assert!(tcf_objective_policy(None, None, None).is_err());
-    }
-
-    #[test]
-    fn test_unknown_tcf_objective_is_refused() {
-        let err = parse_tcf_objective("imatrix").unwrap_err().to_string();
-        assert!(err.contains("Unsupported TCF objective: imatrix"), "{err}");
-        assert!(err.contains("rms-plus-abs"), "{err}");
-    }
-
-    /// A profile name is a rung of the ladder, so an unknown one is refused
-    /// with the accepted names.
-    #[test]
-    fn test_unknown_tcf_profile_is_refused() {
-        let err = parse_tcf_profile("tiny").unwrap_err().to_string();
-        assert!(err.contains("Unsupported TCF profile: tiny"), "{err}");
-        assert!(err.contains("balanced"), "{err}");
-    }
-
-    /// Bit width alone names no TCF encoding, so an unknown value is refused
-    /// with the accepted names rather than resolved to a near match.
-    #[test]
-    fn test_unknown_tcf_encoding_is_refused() {
-        let err = parse_tcf_options(Some("q4"), Some("q4s32t64"))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("Unsupported TCF encoding: q4"), "{err}");
-    }
-
-    #[test]
-    fn test_the_two_tcf_flags_are_set_together() {
-        assert!(parse_tcf_options(None, None).unwrap().is_none());
-        let err = parse_tcf_options(Some("q4s32t64"), None)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("--tcf-preferred-encoding"), "{err}");
-        let err = parse_tcf_options(None, Some("q4s32t64"))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("--tcf-encoding"), "{err}");
     }
 
     #[test]

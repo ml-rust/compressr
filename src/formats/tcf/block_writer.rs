@@ -4,10 +4,20 @@
 //! quantizes exactly as a GGUF run does: the same per-tensor plan, the same
 //! `ggml-quants.c` writers in boostr, the same bytes. This writer stores
 //! those bytes in TCF's container instead of GGUF's — a `TensorRecord` per
-//! tensor whose encoding is `Encoding::Block(ggml_type)`, the 8-bit dynamic
-//! activation contract every block kernel implements, a proof vector checked
+//! tensor whose encoding is `Encoding::Block(ggml_type)`, the ggml-family
+//! activation contract every block kernel satisfies, a proof vector checked
 //! with boostr's own decoder, and header-only placement. A reader loads each
 //! tensor as the `QuantTensor` it would have loaded from the GGUF.
+//!
+//! # Measured allocation
+//!
+//! On a `--sensitivity` run the file also carries the measurement the mix was
+//! ranked by: one `CalibrationRecord` for the measurement, and on every
+//! measured tensor the task-metric delta at the format it was written in
+//! (or, when the file did not measure that format, the delta the allocation
+//! ranked on), with `SENSITIVITY_VALID` set. That is what makes a measured
+//! TCF identifiable where a measured GGUF is indistinguishable from a
+//! positional one.
 //!
 //! # One tensor in flight
 //!
@@ -30,23 +40,24 @@ use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
 use boostr::format::tcf::BoostrBlockDecoder;
-use tcf_core::{block_proof_values, BlockEncoding, Encoding, Payload, TcfError, TcfWriter};
+use boostr::tcf::{block_proof_values, BlockEncoding, Encoding, Payload, TcfError, TcfWriter};
 
 use super::block_spill::BlockSpill;
 use super::encoding::{raw_encoding_for, TensorShape};
 use super::record::{
-    a8_dynamic_contract_record, block_module_record, tensor_record, A8_DYNAMIC_CONTRACT_ID,
+    block_module_record, calibration_record, ggml_reference_contract_record, tensor_record,
+    TensorSensitivity, SENSITIVITY_SEED_COUNT,
 };
 use crate::formats::gguf::GgmlType;
 use crate::formats::FormatWriter;
 use crate::loader::UnifiedDType;
-use crate::policy::{tcf_fallback_reason, TensorPlan};
+use crate::policy::{quant_type_label, tcf_fallback_reason, SensitivityMeasurement, TensorPlan};
 use crate::quantization::QuantType;
 
 /// The TCF block encoding a GGUF quantization type is stored as.
 ///
 /// The identifier is `ggml_type` itself, so the mapping is the one the GGUF
-/// writer uses, looked up in tcf-core's table.
+/// writer uses, looked up in the container's table.
 ///
 /// # Errors
 /// The type is not a GGML block format (NF4, FP8, GPTQ, AWQ have no block
@@ -76,7 +87,7 @@ pub fn block_encoding_for(quant_type: QuantType) -> Result<BlockEncoding> {
         .and_then(|id| id.checked_add(0x0200))
         .ok_or_else(|| anyhow!("ggml_type {ggml} is outside TCF's block encoding range"))?;
     BlockEncoding::try_from(raw)
-        .map_err(|e| anyhow!("{quant_type:?}: tcf-core has no block encoding for it: {e}"))
+        .map_err(|e| anyhow!("{quant_type:?}: TCF has no block encoding for it: {e}"))
 }
 
 /// One tensor as the trait registered it.
@@ -94,6 +105,15 @@ enum Pending {
     Raw,
 }
 
+/// What every measured `TensorRecord` copies from the declared calibration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CalibrationFacts {
+    /// The `CalibrationRecord` this file declares
+    id: u32,
+    /// Evaluation rows every delta was measured over
+    samples: u32,
+}
+
 /// TCF writer for GGML block encodings.
 pub struct TcfBlockFormatWriter {
     /// The run's base quantization type: the module's preferred encoding
@@ -101,6 +121,10 @@ pub struct TcfBlockFormatWriter {
     module_name: String,
     /// The conversion loop's plan per tensor, in registration order
     plans: Vec<TensorPlan>,
+    /// The measurement a `--sensitivity` run ranked its mix by
+    sensitivity: Option<SensitivityMeasurement>,
+    /// The calibration this file declares, on a measured run only
+    calibration: Option<CalibrationFacts>,
     path: Option<PathBuf>,
     writer: Option<TcfWriter>,
     registrations: Vec<Registration>,
@@ -116,6 +140,8 @@ impl TcfBlockFormatWriter {
             base: None,
             module_name: "model".to_string(),
             plans: Vec::new(),
+            sensitivity: None,
+            calibration: None,
             path: None,
             writer: None,
             registrations: Vec::new(),
@@ -144,6 +170,64 @@ impl TcfBlockFormatWriter {
         self
     }
 
+    /// The measurement the mix was ranked by. Declares a calibration record
+    /// and writes each measured tensor's delta; see the module docs.
+    pub fn with_sensitivity(mut self, measurement: SensitivityMeasurement) -> Self {
+        self.sensitivity = Some(measurement);
+        self
+    }
+
+    /// Declare the calibration a measured run read, and remember what every
+    /// measured tensor copies from it. Does nothing without `--sensitivity`.
+    fn declare_calibration(&mut self) -> Result<()> {
+        let Some(measurement) = self.sensitivity.clone() else {
+            return Ok(());
+        };
+        let dataset = measurement.baseline().dataset.clone();
+        let evaluator = measurement.evaluator_name().to_string();
+        let writer = self.writer_mut()?;
+        let dataset_name = writer
+            .intern(&dataset)
+            .map_err(|e| anyhow!(e))
+            .context("Failed to intern the sensitivity file's dataset name")?;
+        let evaluator_name = writer
+            .intern(&evaluator)
+            .map_err(|e| anyhow!(e))
+            .context("Failed to intern the sensitivity file's evaluator name")?;
+        let record = calibration_record(&measurement, dataset_name, evaluator_name);
+        let facts = CalibrationFacts {
+            id: record.calibration_id,
+            samples: record.sample_count,
+        };
+        writer
+            .add_calibration(record)
+            .map_err(|e| anyhow!(e))
+            .context("Failed to declare the sensitivity file's calibration")?;
+        self.calibration = Some(facts);
+        Ok(())
+    }
+
+    /// The sensitivity one tensor's record carries: the measured delta at
+    /// the format it was written in, else the delta the allocation ranked
+    /// on, else nothing. A delta with no calibration behind it is a number
+    /// with no authority (Section 10.5.1), so the two come together or not
+    /// at all.
+    fn sensitivity_for(&self, registration: &Registration) -> Option<TensorSensitivity> {
+        let measurement = self.sensitivity.as_ref()?;
+        let calibration = self.calibration?;
+        let name = registration.name.as_str();
+        let delta = registration
+            .quant_type
+            .and_then(|written| measurement.delta_at(name, quant_type_label(written)))
+            .or_else(|| measurement.delta_for(name))?;
+        Some(TensorSensitivity {
+            calibration_id: calibration.id,
+            delta,
+            samples: calibration.samples,
+            seed_count: SENSITIVITY_SEED_COUNT,
+        })
+    }
+
     fn writer_mut(&mut self) -> Result<&mut TcfWriter> {
         self.writer
             .as_mut()
@@ -152,14 +236,19 @@ impl TcfBlockFormatWriter {
 
     /// The reason tensor `index` is not at the preferred encoding, or `None`
     /// when it is.
-    fn reason_for(&self, index: usize, registration: &Registration) -> tcf_core::FallbackReason {
+    fn reason_for(&self, index: usize, registration: &Registration) -> boostr::tcf::FallbackReason {
         if registration.quant_type == self.base {
-            return tcf_core::FallbackReason::None;
+            return boostr::tcf::FallbackReason::None;
         }
         match self.plans.get(index) {
             Some(TensorPlan::StoreF32(reason)) => tcf_fallback_reason(*reason),
-            Some(TensorPlan::Quantize(_)) => tcf_core::FallbackReason::ProducerPolicy,
-            Some(TensorPlan::StoreAsIs) | None => tcf_core::FallbackReason::UnsupportedEncoding,
+            // A mix put this tensor at another format. When a measurement
+            // drove that, the record says so and carries the delta.
+            Some(TensorPlan::Quantize(_)) if self.sensitivity.is_some() => {
+                boostr::tcf::FallbackReason::TaskSensitivity
+            }
+            Some(TensorPlan::Quantize(_)) => boostr::tcf::FallbackReason::ProducerPolicy,
+            Some(TensorPlan::StoreAsIs) | None => boostr::tcf::FallbackReason::UnsupportedEncoding,
         }
     }
 
@@ -169,6 +258,7 @@ impl TcfBlockFormatWriter {
         let shape = TensorShape::of(&registration.shape, name)?;
         let tensor_id = u32::try_from(index).context("TCF stores at most u32::MAX tensors")?;
         let reason = self.reason_for(index, registration);
+        let measured = self.sensitivity_for(registration);
         let writer = self.writer_mut()?;
         let interned = writer
             .intern(name)
@@ -196,16 +286,15 @@ impl TcfBlockFormatWriter {
             ),
         };
 
-        let mut record = tensor_record(
+        let record = tensor_record(
             tensor_id,
             interned,
             encoding,
             reason,
             shape.dims(),
             shape.rank(),
-            None,
+            measured,
         );
-        record.activation_contract_id = A8_DYNAMIC_CONTRACT_ID;
         let registered = match encoding {
             Encoding::Block(_) => writer.register_block_tensor(record),
             _ => writer.register_raw_tensor(record),
@@ -233,9 +322,9 @@ fn spill_error(error: anyhow::Error) -> TcfError {
 }
 
 impl FormatWriter for TcfBlockFormatWriter {
-    /// Open the `tcf-core` writer with the block contract and the root
-    /// module, and the spill beside the output. Nothing is created at the
-    /// output path until `finalize`.
+    /// Open the container writer with the block contract, the root module
+    /// and, on a measured run, the calibration record, and the spill beside
+    /// the output. Nothing is created at the output path until `finalize`.
     fn initialize(&mut self, path: &Path) -> Result<()> {
         let base = self.base.ok_or_else(|| {
             anyhow!("TCF block output needs a base quantization type before initialize()")
@@ -244,7 +333,7 @@ impl FormatWriter for TcfBlockFormatWriter {
         let mut writer = TcfWriter::new();
         let name = writer.intern(&self.module_name).map_err(|e| anyhow!(e))?;
         writer
-            .add_contract(a8_dynamic_contract_record())
+            .add_contract(ggml_reference_contract_record())
             .map_err(|e| anyhow!(e))?;
         writer
             .add_module(block_module_record(name, base))
@@ -252,7 +341,7 @@ impl FormatWriter for TcfBlockFormatWriter {
         self.spill = Some(BlockSpill::create(path)?);
         self.path = Some(path.to_path_buf());
         self.writer = Some(writer);
-        Ok(())
+        self.declare_calibration()
     }
 
     /// Remember one tensor. Its record is registered when its bytes arrive,
@@ -353,7 +442,8 @@ impl FormatWriter for TcfBlockFormatWriter {
 mod tests {
     use super::*;
     use boostr::format::tcf::TcfLoader;
-    use boostr::quant::{QuantFormat, QuantScheme};
+    use boostr::quant::QuantFormat;
+    use boostr::tcf::TensorFlags;
     use boostr::CpuRuntime;
 
     /// Two rows of 64 as Q8_0: `f16 d` then 32 `i8` codes per block.
@@ -386,7 +476,7 @@ mod tests {
 
     /// The file a GGUF-style run produces: a block weight, a raw bias, and a
     /// pass-through integer tensor. boostr reads it back as the `QuantTensor`
-    /// the GGUF would have given, under the 8-bit activation contract.
+    /// the GGUF would have given, under the ggml-family contract.
     #[test]
     fn a_block_file_round_trips_through_boostr() {
         let dir = tempfile::tempdir().expect("a temporary directory");
@@ -421,10 +511,7 @@ mod tests {
 
         let loader = TcfLoader::open(&path).expect("boostr opens");
         loader.verify_all().expect("digests and proofs check");
-        assert_eq!(
-            loader.quant_scheme("w").expect("scheme"),
-            QuantScheme::Gguf(QuantFormat::Q8_0)
-        );
+        assert_eq!(loader.quant_format("w").expect("format"), QuantFormat::Q8_0);
         let device = boostr::CpuDevice::new();
         let qt = loader
             .load_quant_tensor::<CpuRuntime>("w", &device)
@@ -433,8 +520,13 @@ mod tests {
         let contract = qt.activation_contract().expect("carries the contract");
         assert_eq!(
             contract.input_representation,
-            tcf_core::InputRepresentation::A8S32Dynamic
+            boostr::tcf::InputRepresentation::GgmlReference
         );
+        // The family contract admits the block kernel: the weight runs.
+        let client = boostr::CpuClient::new(device.clone());
+        let act = boostr::Tensor::<CpuRuntime>::from_slice(&[1.0f32; 64], &[1, 64], &device)
+            .expect("activation");
+        boostr::QuantMatmulOps::quant_matmul(&client, &act, &qt).expect("runs");
         let b = loader.load_tensor_f32("b").expect("loads dense");
         assert_eq!(b, vec![1.0, -2.5, 0.0, 3.25]);
         let ids = loader.load_tensor_f32("ids").expect("loads dense");
@@ -447,11 +539,66 @@ mod tests {
         assert_eq!(
             infos,
             vec![
-                tcf_core::FallbackReason::None,
-                tcf_core::FallbackReason::RankLt2,
-                tcf_core::FallbackReason::UnsupportedEncoding,
+                boostr::tcf::FallbackReason::None,
+                boostr::tcf::FallbackReason::RankLt2,
+                boostr::tcf::FallbackReason::UnsupportedEncoding,
             ]
         );
+        let w = loader.tensor_info("w").expect("info").record;
+        assert!(!w.flags.contains(TensorFlags::SENSITIVITY_VALID));
+        assert_eq!(w.calibration_id, 0);
+    }
+
+    /// A measured run declares its calibration and writes each measured
+    /// tensor's delta against it; an unmeasured tensor stays unmarked.
+    #[test]
+    fn a_measured_run_records_the_calibration_and_each_delta() {
+        let measurement = crate::policy::parse_sensitivity(
+            &[
+                r#"{"record":"baseline","ckpt":"cache/models/example/abcdef","manifest":"manifests/eval.tsv","encoding":"Q8_0","eval_rows":12,"eval_seed":7,"baseline_total":1.17}"#,
+                r#"{"record":"sensitivity","name":"w","delta":0.25}"#,
+            ]
+            .join("\n"),
+        )
+        .expect("parses");
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("model.tcf");
+        let mut writer = TcfBlockFormatWriter::new()
+            .with_base(QuantType::Q8_0)
+            .with_plans(vec![
+                TensorPlan::Quantize(QuantType::Q8_0),
+                TensorPlan::StoreF32(crate::policy::FallbackReason::Rank),
+            ])
+            .with_sensitivity(measurement.clone());
+        writer.initialize(&path).expect("initializes");
+        writer
+            .register_tensor("w", &[2, 64], UnifiedDType::F32, Some(QuantType::Q8_0))
+            .expect("registers");
+        writer
+            .register_tensor("b", &[4], UnifiedDType::F32, None)
+            .expect("registers");
+        writer.write_tensor_data(&q8_0_stream()).expect("writes");
+        let bias: Vec<u8> = [1.0f32, -2.5, 0.0, 3.25]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        writer.write_tensor_data(&bias).expect("writes");
+        writer.finalize().expect("finalizes");
+
+        let loader = TcfLoader::open(&path).expect("boostr opens");
+        loader.verify_all().expect("digests and proofs check");
+        let w = loader.tensor_info("w").expect("info").record;
+        assert!(w.flags.contains(TensorFlags::SENSITIVITY_VALID));
+        assert_eq!(w.sensitivity_delta, 0.25);
+        assert_eq!(w.sensitivity_samples, 12);
+        assert_eq!(w.calibration_id, measurement.calibration_id());
+        let b = loader.tensor_info("b").expect("info").record;
+        assert!(!b.flags.contains(TensorFlags::SENSITIVITY_VALID));
+        assert_eq!(b.calibration_id, 0);
+        let calibrations = loader.calibrations();
+        assert_eq!(calibrations.len(), 1);
+        assert_eq!(calibrations[0].calibration_id, measurement.calibration_id());
+        assert_eq!(calibrations[0].sample_count, 12);
     }
 
     /// A payload whose length disagrees with its registration is refused

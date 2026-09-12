@@ -66,7 +66,7 @@ impl ModelLoader {
 
         if path.is_file() {
             let magic = read_magic(path)?;
-            if magic == Some(tcf_core::MAGIC) {
+            if magic == Some(boostr::tcf::MAGIC) {
                 return Ok(crate::InputFormat::Tcf);
             }
             // A SafeTensors file opens with a header length, so any eight

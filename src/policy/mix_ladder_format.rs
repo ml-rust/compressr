@@ -1,31 +1,61 @@
-//! What a measured encoding becomes in GGUF, and what a mix says when a
+//! Which block format a measured encoding names, and what a mix says when a
 //! candidate resolves to nothing.
 //!
-//! A sensitivity file names TCF encodings and GGUF writes GGML blocks, so
-//! something has to carry between them. That something is the bit width — the
-//! same property [`super::mix_measured_encoding`] checks a file's baseline
-//! against — and this module is where the map and the refusal live.
+//! A sensitivity file names the GGML block formats boostr's sweep measured
+//! at, spelled as [`quant_type_label`] spells them, so a measured encoding IS
+//! the format the mix writes. A name outside the writable block formats is
+//! not an option at all.
 
-use crate::formats::parse_tcf_encoding;
 use crate::quantization::QuantType;
 
 use super::mix_report::quant_type_label;
 use super::name_examples::examples;
 use super::sensitivity::SensitivityMeasurement;
+use super::sensitivity_options::normalized_encoding_name;
 
-/// The block format compressr writes at one measured encoding's bit width.
-///
-/// `None` when the encoding is not one compressr recognizes, or when nothing
-/// it can write sits at that width. A roadmap format is not an option: a rung
-/// no writer exists for cannot be allocated to.
+/// The block formats a measurement can name: every one compressr has a
+/// writer for. A roadmap format is not an option: a rung no writer exists
+/// for cannot be allocated to.
+const MEASURABLE: [QuantType; 10] = [
+    QuantType::Q4_0,
+    QuantType::Q4_1,
+    QuantType::Q8_0,
+    QuantType::Q2K,
+    QuantType::Q3K,
+    QuantType::Q4K,
+    QuantType::Q5K,
+    QuantType::Q6K,
+    QuantType::IQ4NL,
+    QuantType::IQ4XS,
+];
+
+/// The block format one measured encoding names, or `None` when the name is
+/// not a format compressr writes. Case, underscores and hyphens are ignored,
+/// so `Q4_K` and `q4k` are the same rung.
 pub(super) fn ladder_format(encoding: &str) -> Option<QuantType> {
-    let bits = parse_tcf_encoding(encoding).ok()?.geometry().bits;
-    match bits {
-        4 => Some(QuantType::Q4K),
-        5 => Some(QuantType::Q5K),
-        6 => Some(QuantType::Q6K),
-        8 => Some(QuantType::Q8_0),
-        _ => None,
+    let key = normalized_encoding_name(encoding);
+    MEASURABLE
+        .into_iter()
+        .find(|format| normalized_encoding_name(quant_type_label(*format)) == key)
+}
+
+/// Nominal bits per weight of a block format's codes, the width a
+/// measurement is compared against a mix's base at.
+pub(super) fn nominal_bits(format: QuantType) -> u8 {
+    match format {
+        QuantType::Q2K => 2,
+        QuantType::Q3K => 3,
+        QuantType::Q4_0
+        | QuantType::Q4_1
+        | QuantType::Q4K
+        | QuantType::IQ4NL
+        | QuantType::IQ4XS => 4,
+        QuantType::Q5_0 | QuantType::Q5_1 | QuantType::Q5K => 5,
+        QuantType::Q6K => 6,
+        QuantType::Q8_0 | QuantType::Q8_1 => 8,
+        QuantType::NF4 | QuantType::FP4 => 4,
+        QuantType::FP8 => 8,
+        QuantType::GPTQ | QuantType::AWQ => 4,
     }
 }
 
@@ -60,14 +90,24 @@ pub(super) fn unresolved_error(
 mod tests {
     use super::*;
 
-    /// Each measured width becomes the block format compressr writes at it,
-    /// and a name compressr does not know becomes nothing.
+    /// A measured name is the block format written at it, in any spelling,
+    /// and a name compressr does not write becomes nothing.
     #[test]
-    fn a_width_becomes_the_format_written_at_it() {
-        assert_eq!(ladder_format("Q4AS32D_T64"), Some(QuantType::Q4K));
-        assert_eq!(ladder_format("Q4S32_T64"), Some(QuantType::Q4K));
-        assert_eq!(ladder_format("Q6S16D_T64"), Some(QuantType::Q6K));
-        assert_eq!(ladder_format("Q8S32_T64"), Some(QuantType::Q8_0));
-        assert_eq!(ladder_format("Q3S16_T32"), None);
+    fn a_measured_name_is_the_format_written_at_it() {
+        assert_eq!(ladder_format("Q4_K"), Some(QuantType::Q4K));
+        assert_eq!(ladder_format("q4k"), Some(QuantType::Q4K));
+        assert_eq!(ladder_format("Q6_K"), Some(QuantType::Q6K));
+        assert_eq!(ladder_format("Q8_0"), Some(QuantType::Q8_0));
+        assert_eq!(ladder_format("Q2_K"), Some(QuantType::Q2K));
+        assert_eq!(ladder_format("Q5_0"), None);
+        assert_eq!(ladder_format("NF4"), None);
+    }
+
+    #[test]
+    fn nominal_bits_follow_the_code_width() {
+        assert_eq!(nominal_bits(QuantType::Q4K), 4);
+        assert_eq!(nominal_bits(QuantType::Q5K), 5);
+        assert_eq!(nominal_bits(QuantType::Q6K), 6);
+        assert_eq!(nominal_bits(QuantType::Q8_0), 8);
     }
 }

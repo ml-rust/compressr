@@ -32,14 +32,7 @@ pub use safetensors::{
     TensorEntry,
 };
 
-pub use tcf::{
-    default_objective_for, normalized_encoding_name, objective_policy, parse_tcf_encoding,
-    parse_tcf_importance, parse_tcf_objective, parse_tcf_profile, parse_tcf_search,
-    tcf_encoding_name, tcf_search_name, tcf_search_report, ImportanceForm, ObjectiveSource,
-    PlannedTensor, ResolvedWeights, TcfBlockFormatWriter, TcfFormatWriter, TcfObjective,
-    TcfOptions, TcfProfile, TCF_ENCODING_NAMES, TCF_IMPORTANCE_NAMES, TCF_OBJECTIVE_NAMES,
-    TCF_PROFILE_NAMES, TCF_SEARCH_NAMES,
-};
+pub use tcf::TcfBlockFormatWriter;
 
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -585,10 +578,10 @@ pub fn create_writer(
             SafeTensorsFormatWriter::new().with_max_shard_size(max_shard_size),
         )),
         // Unconfigured, exactly as the GGUF arm is: `convert` replaces it with
-        // a writer carrying the encoding and the input path, and an
+        // a writer carrying the base format and the plan list, and an
         // unconfigured one errors in `initialize` rather than writing a file
         // with an invented encoding.
-        crate::OutputFormat::Tcf => Ok(Box::new(TcfFormatWriter::new())),
+        crate::OutputFormat::Tcf => Ok(Box::new(TcfBlockFormatWriter::new())),
         other => anyhow::bail!(
             "Output format {other:?} is not implemented. compressr writes gguf, safetensors \
              and tcf; {other:?} needs its own on-disk layout (separate qweight / \

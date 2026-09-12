@@ -12,8 +12,8 @@
 //!    `torch.save` produces.
 
 use compressr::{
-    parse_tcf_encoding, ConversionConfig, FormatWriter, InputFormat, ModelLoader, OutputFormat,
-    SafeTensorsFormatWriter, TcfOptions, UnifiedDType,
+    ConversionConfig, FormatWriter, InputFormat, ModelLoader, OutputFormat, QuantizationConfig,
+    SafeTensorsFormatWriter, UnifiedDType,
 };
 use std::path::{Path, PathBuf};
 
@@ -85,15 +85,15 @@ fn write_source(path: &Path, tensors: &[Source]) {
     writer.finalize().expect("finalizes the fixture");
 }
 
-/// Convert the fixture to a TCF file at `out`, uniformly at `encoding`.
-fn convert_to_tcf(source: &Path, out: &Path, encoding: &str) {
-    let encoding = parse_tcf_encoding(encoding).expect("a known encoding");
+/// Convert the fixture to a TCF file at `out`, every quantizable tensor at
+/// Q8_0.
+fn convert_to_tcf(source: &Path, out: &Path) {
     let config = ConversionConfig::new(
         source.to_string_lossy().to_string(),
         out.to_string_lossy().to_string(),
         OutputFormat::Tcf,
     )
-    .with_tcf(TcfOptions::uniform(encoding, encoding));
+    .with_quantization(QuantizationConfig::q8_0());
     compressr::convert(config).expect("converts the fixture to TCF");
 }
 
@@ -107,7 +107,7 @@ fn a_tcf_file_reads_back_with_the_inventory_it_was_written_from() {
     write_source(&source, &tensors);
 
     let out = dir.path().join("model.tcf");
-    convert_to_tcf(&source, &out, "q8s32t64");
+    convert_to_tcf(&source, &out);
 
     let info = compressr::get_model_info(out.to_str().expect("a utf8 path"))
         .expect("reads the TCF file back");
@@ -131,16 +131,16 @@ fn a_tcf_file_reads_back_with_the_inventory_it_was_written_from() {
             .as_ref()
             .unwrap_or_else(|| panic!("{} carries no TCF facts", expected.name));
         if expected.shape.len() == 1 {
-            // Rank 1 cannot be tiled, so it is stored raw and the record says
-            // so. A reader that lost the reason could not tell this tensor
-            // from one the producer chose to keep at full precision.
+            // Rank 1 holds no block row, so it is stored raw and the record
+            // says so. A reader that lost the reason could not tell this
+            // tensor from one the producer chose to keep at full precision.
             assert!(
                 facts.fallback_reason.is_some(),
                 "{} is raw and must record a reason",
                 expected.name
             );
         } else {
-            assert_eq!(facts.encoding, "Q8S32_T64", "{}", expected.name);
+            assert_eq!(facts.encoding, "Q8_0", "{}", expected.name);
             assert_eq!(facts.fallback_reason, None, "{}", expected.name);
             assert!(facts.bits_per_weight.is_some(), "{}", expected.name);
         }
@@ -155,7 +155,7 @@ fn a_tcf_file_reads_back_with_the_inventory_it_was_written_from() {
     assert_eq!(module.tensor_count, tensors.len());
     assert_eq!(
         module.preferred_encodings.first().map(String::as_str),
-        Some("Q8S32_T64")
+        Some("Q8_0")
     );
     assert_eq!(facts.fallback_tensors, 1);
     assert_eq!(
@@ -175,7 +175,7 @@ fn a_tcf_file_decodes_to_the_weights_it_was_quantized_from() {
     write_source(&source, &tensors);
 
     let tcf = dir.path().join("model.tcf");
-    convert_to_tcf(&source, &tcf, "q8s32t64");
+    convert_to_tcf(&source, &tcf);
 
     let mut model = ModelLoader::new(&tcf).load().expect("opens the TCF file");
     assert_eq!(model.format(), InputFormat::Tcf);
@@ -197,8 +197,8 @@ fn a_tcf_file_decodes_to_the_weights_it_was_quantized_from() {
             .zip(expected.values.iter())
             .map(|(got, want)| (got - want).abs())
             .fold(0.0f32, f32::max);
-        // Q8S32_T64 carries 8 bits over a group of 32; the fixture's values
-        // span roughly [-0.5, 0.5], so a correct decode lands well inside a
+        // Q8_0 carries 8 bits over a block of 32; the fixture's values span
+        // roughly [-0.5, 0.5], so a correct decode lands well inside a
         // hundredth. A raw-stored tensor is exact.
         assert!(worst < 0.01, "{} decoded {worst} away", expected.name);
     }
@@ -214,17 +214,16 @@ fn tcf_output_from_a_tcf_input_is_refused() {
     write_source(&source, &tensors);
 
     let tcf = dir.path().join("model.tcf");
-    convert_to_tcf(&source, &tcf, "q8s32t64");
+    convert_to_tcf(&source, &tcf);
 
     let out = dir.path().join("again.tcf");
-    let encoding = parse_tcf_encoding("q8s32t64").expect("a known encoding");
     let err = compressr::convert(
         ConversionConfig::new(
             tcf.to_string_lossy().to_string(),
             out.to_string_lossy().to_string(),
             OutputFormat::Tcf,
         )
-        .with_tcf(TcfOptions::uniform(encoding, encoding)),
+        .with_quantization(QuantizationConfig::q8_0()),
     )
     .expect_err("a TCF input cannot produce a TCF file")
     .to_string();
@@ -243,7 +242,7 @@ fn tcf_is_detected_by_its_magic_under_any_extension() {
     write_source(&source, &tensors);
 
     let tcf = dir.path().join("model.tcf");
-    convert_to_tcf(&source, &tcf, "q8s32t64");
+    convert_to_tcf(&source, &tcf);
 
     let renamed = dir.path().join("model.weights");
     std::fs::copy(&tcf, &renamed).expect("copies the output");

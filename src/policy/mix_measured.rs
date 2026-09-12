@@ -208,7 +208,7 @@ mod tests {
     /// A file measured at the encoding a `q4_k_*` base is ranked from.
     fn file(deltas: &[(&str, f64)]) -> String {
         let mut lines = vec![
-            r#"{"record":"baseline","ckpt":"cache/models/example/abcdef","manifest":"manifests/eval.tsv","encoding":"Q4AS32D_T64","eval_rows":12,"eval_seed":7,"baseline_total":1.17}"#
+            r#"{"record":"baseline","ckpt":"cache/models/example/abcdef","manifest":"manifests/eval.tsv","encoding":"Q4_K","eval_rows":12,"eval_seed":7,"baseline_total":1.17}"#
                 .to_string(),
         ];
         for (name, delta) in deltas {
@@ -291,7 +291,7 @@ mod tests {
         let mut text = file(&deltas);
         for (name, delta) in &deltas {
             text.push_str(&format!(
-                "\n{{\"record\":\"sensitivity\",\"name\":\"{name}\",\"encoding\":\"Q6S16D_T64\",\"delta\":{}}}",
+                "\n{{\"record\":\"sensitivity\",\"name\":\"{name}\",\"encoding\":\"Q6_K\",\"delta\":{}}}",
                 delta / 8.0
             ));
         }

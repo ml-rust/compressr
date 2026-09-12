@@ -166,7 +166,7 @@ mod tests {
             mix_name: "Q4_K_M".into(),
             base_format: "Q4_K".into(),
             promoted_format: "Q6_K".into(),
-            baseline_encoding: "Q4AS32D_T64".into(),
+            baseline_encoding: "Q4_K".into(),
             candidates: 4,
             excluded_nonpositive: 1,
             heuristic_promoted: 2,

@@ -4,19 +4,18 @@
 //! That byte identity is the whole claim of the block encodings: TCF is never
 //! behind the GGUF of the same model, because it IS the GGUF's block streams
 //! in TCF's container. Both files are read back by the crates that own their
-//! readers — boostr for GGUF, tcf-core and boostr for TCF — never by anything
-//! compressr owns.
+//! readers — boostr for both — never by anything compressr owns.
 
 use boostr::format::tcf::TcfLoader;
 use boostr::format::Gguf;
-use boostr::quant::{DequantOps, QuantFormat, QuantScheme};
+use boostr::quant::{DequantOps, QuantFormat};
+use boostr::tcf::{
+    BlockEncoding, DotAccumulator, Encoding, FallbackReason, InputRepresentation, TcfFile,
+};
 use boostr::{CpuClient, CpuDevice, CpuRuntime, DType};
 use compressr::formats::safetensors::{SafeTensorsDType, SafeTensorsWriter};
 use compressr::{ConversionConfig, OutputFormat, QuantizationConfig};
 use std::path::{Path, PathBuf};
-use tcf_core::{
-    BlockEncoding, DotAccumulator, Encoding, FallbackReason, InputRepresentation, TcfFile,
-};
 
 fn values(count: usize, spread: f32) -> Vec<f32> {
     let mut state: u64 = 0x2545_F491_4F6C_DD1D;
@@ -127,10 +126,10 @@ fn tcf_payloads_match_gguf(quant: QuantizationConfig, block: BlockEncoding, form
         let contract = file.contract(tensor).expect("contract resolves");
         assert_eq!(
             contract.input_representation,
-            InputRepresentation::A8S32Dynamic
+            InputRepresentation::GgmlReference
         );
-        assert_eq!(contract.dot_accumulator, DotAccumulator::I32ThenF32Scale);
-        assert_eq!(contract.quant_group, 32);
+        assert_eq!(contract.dot_accumulator, DotAccumulator::GgmlReference);
+        assert_eq!(contract.quant_group, 0);
         let expected_reason = match name {
             "block.0.weight" => {
                 assert_eq!(tensor.encoding, Encoding::Block(block));
@@ -151,13 +150,13 @@ fn tcf_payloads_match_gguf(quant: QuantizationConfig, block: BlockEncoding, form
     }
     assert_eq!(seen, 4);
 
-    // boostr reads it back as the GGUF-scheme tensor, proofs included, and
+    // boostr reads it back as the GGUF-format tensor, proofs included, and
     // dequantizes to what the GGUF dequantizes to.
     let loader = TcfLoader::open(&tcf_path).expect("boostr opens the tcf");
     loader.verify_all().expect("digests and proofs hold");
     assert_eq!(
-        loader.quant_scheme("block.0.weight").expect("scheme"),
-        QuantScheme::Gguf(format)
+        loader.quant_format("block.0.weight").expect("format"),
+        format
     );
     let device = CpuDevice::new();
     let client = CpuClient::new(device.clone());

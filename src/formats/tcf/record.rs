@@ -1,7 +1,7 @@
 //! The TCF records compressr fills in, and the fields it deliberately leaves
 //! unset.
 //!
-//! Every writer-owned field stays zero: `tcf-core` computes `data_offset`,
+//! Every writer-owned field stays zero: `boostr::tcf` computes `data_offset`,
 //! `logical_payload_bytes`, `physical_span_bytes`, `resident_bytes`,
 //! `transfer_bytes`, both digests and the proof fields, and rejects a
 //! caller-supplied value by name rather than overwriting it.
@@ -9,24 +9,18 @@
 //! `workload_profile_id` stays zero. compressr measures no workload, and a
 //! fabricated id names a record no consumer can resolve.
 //!
-//! `calibration_id` stays zero for the same reason on every run that measures
-//! nothing, which is every run without `--sensitivity`. With that flag a
-//! measurement exists, so [`calibration_record`] declares it and every
-//! measured tensor points at it. Section 10.5.1 is why that pairing is not
-//! optional: `sensitivity_delta` without `calibration_id` is a number with no
-//! authority, and a scheduler MUST NOT rank on it.
+//! `calibration_id` stays zero on every run that measures nothing, which is
+//! every run without `--sensitivity`. With that flag a measurement exists, so
+//! [`calibration_record`] declares it and every measured tensor points at it.
+//! Section 10.5.1 is why that pairing is not optional: `sensitivity_delta`
+//! without `calibration_id` is a number with no authority, and a scheduler
+//! MUST NOT rank on it.
 //!
-//! `activation_contract_id` is different: Section 3 requires every tensor to
-//! name a `ContractRecord` in the same file, and Section 9 defines no "no
-//! contract" value. So this module declares the contract an uncalibrated
-//! conversion actually produces — exact F32 activations, F32 accumulation,
-//! F32 output — and points every record at it. That is a truthful statement,
-//! not a placeholder: these weights were prepared for an f32-activation
-//! kernel, and a consumer that dispatches them through an 8-bit-activation
-//! kernel is the mismatch the contract rule exists to refuse, because
-//! compressr never calibrated them for it.
+//! `activation_contract_id` names the ggml-family contract (Section 9.3): a
+//! GGML block type fixes its weight bytes and not its activation path, and
+//! every block kernel in boostr satisfies that family.
 
-use tcf_core::{
+use boostr::tcf::{
     consts::ROOT_PARENT_ID, BlockEncoding, CalibrationFlags, CalibrationRecord, ContractFlags,
     ContractRecord, DotAccumulator, Encoding, ExecutionRole, InputRepresentation, LayoutId,
     MathMode, ModuleRecord, ModuleRole, OutputDtype, PolicyFlags, PrimaryMetric, ProofFormat,
@@ -34,7 +28,6 @@ use tcf_core::{
     StateFlags, StringRef, TensorFlags, TensorRecord,
 };
 
-use super::options::TcfOptions;
 use crate::policy::SensitivityMeasurement;
 
 /// The id every `ModuleRecord` and `TensorRecord` compressr writes points at.
@@ -42,41 +35,37 @@ use crate::policy::SensitivityMeasurement;
 /// Section 9 gives `contract_id` no reserved "unset" value, so `0` would be an
 /// ordinary id that happens to read like an omission. `1` says the reference
 /// is deliberate.
-pub const EXACT_F32_CONTRACT_ID: u32 = 1;
+pub const GGML_REFERENCE_CONTRACT_ID: u32 = 1;
 
-/// The single activation contract every compressr-written TCF file declares.
+/// The activation contract of every block tensor compressr writes.
 ///
-/// compressr quantizes weights with no calibration and no activation-side
-/// measurement, and tunes nothing for a quantized-activation kernel. The
-/// contract that describes that output exactly is the full-precision one:
-/// F32 activations in, F32 dot accumulation, F32 out. `quant_group`, `qmin`
-/// and `qmax` describe an activation quantization grid that `F32` does not
-/// have, so they stay zero; Section 9.2 defines them for `A8S32_DYNAMIC`
-/// alone. `quant_axis`, `rounding_mode` and `scale_compute_dtype` carry the
-/// one value v1 defines for each. `calibration_id` stays zero: compressr
-/// runs no calibration.
+/// `GGML_REFERENCE` names the kernel family `ggml-quants.c` defines for the
+/// block type on the executing backend — Q8_K activations for K-quants on the
+/// CPU, Q8_1 on CUDA, f32 where a backend dequantizes first. compressr
+/// quantizes weights with no activation-side measurement, so it cannot pin one
+/// of those without refusing the others; the family is the truthful claim.
+/// `quant_group`, `qmin` and `qmax` are nominal because the family shares no
+/// single grid. `quant_axis`, `rounding_mode` and `scale_compute_dtype` carry
+/// the one value v1 defines for each.
 ///
-/// `math_mode` is `REASSOCIATION_ALLOWED`. compressr places no constraint on
-/// the order a consumer's kernel accumulates in — it never measured an error
-/// budget that a fixed reduction order would protect. `REASSOCIATION_FORBIDDEN`
-/// would read as safer while asserting a requirement compressr never
-/// established, and would refuse backends for a reason this producer cannot
-/// justify.
+/// `math_mode` is `REASSOCIATION_ALLOWED`. compressr never measured an error
+/// budget that a fixed reduction order would protect, and every block kernel
+/// reassociates.
 ///
-/// `contract_digest` stays zero for `tcf-core` to compute, as every other
+/// `contract_digest` stays zero for `boostr::tcf` to compute, as every other
 /// writer-owned field does. Every value here is a constant, so two runs
 /// produce byte-identical contract records.
-pub fn contract_record() -> ContractRecord {
+pub fn ggml_reference_contract_record() -> ContractRecord {
     ContractRecord {
-        contract_id: EXACT_F32_CONTRACT_ID,
-        input_representation: InputRepresentation::F32,
+        contract_id: GGML_REFERENCE_CONTRACT_ID,
+        input_representation: InputRepresentation::GgmlReference,
         quant_group: 0,
         quant_axis: QuantAxis::Last,
         rounding_mode: RoundingMode::RnEven,
         qmin: 0,
         qmax: 0,
         scale_compute_dtype: ScaleComputeDtype::F32,
-        dot_accumulator: DotAccumulator::F32,
+        dot_accumulator: DotAccumulator::GgmlReference,
         output_dtype: OutputDtype::F32,
         math_mode: MathMode::ReassociationAllowed,
         calibration_id: 0,
@@ -85,43 +74,13 @@ pub fn contract_record() -> ContractRecord {
     }
 }
 
-/// The id of the 8-bit dynamic activation contract a block-encoded file
-/// declares. Distinct from [`EXACT_F32_CONTRACT_ID`] so the two never share a
-/// number inside one file.
-pub const A8_DYNAMIC_CONTRACT_ID: u32 = 2;
-
-/// The activation contract of a file carrying GGML block encodings.
+/// The single root module every tensor belongs to.
 ///
-/// `ggml-quants.c`'s block dot products quantize the activation on the fly to
-/// signed 8-bit codes in groups of 32 with one f32 scale each, accumulate the
-/// code products in i32, and apply the scales in f32. That is what boostr's
-/// MMQ and GEMV kernels do with these bytes, so it is the contract written
-/// beside them: a consumer holding only an f32-activation kernel is refused
-/// by the contract check, as Section 9 intends. `qmin`/`qmax` are the
-/// symmetric grid those kernels round to. `calibration_id` stays zero, as in
-/// [`contract_record`]: no activations were measured.
-pub fn a8_dynamic_contract_record() -> ContractRecord {
-    ContractRecord {
-        contract_id: A8_DYNAMIC_CONTRACT_ID,
-        input_representation: InputRepresentation::A8S32Dynamic,
-        quant_group: 32,
-        quant_axis: QuantAxis::Last,
-        rounding_mode: RoundingMode::RnEven,
-        qmin: -127,
-        qmax: 127,
-        scale_compute_dtype: ScaleComputeDtype::F32,
-        dot_accumulator: DotAccumulator::I32ThenF32Scale,
-        output_dtype: OutputDtype::F32,
-        math_mode: MathMode::ReassociationAllowed,
-        calibration_id: 0,
-        flags: ContractFlags::NONE,
-        contract_digest: [0u8; 16],
-    }
-}
-
-/// The root module of a block-encoded file. Same shape as [`module_record`]:
-/// the preferred encoding is the run's base block format, the declared
-/// fallback is F32, and `min_quant_k` is the base format's block length.
+/// compressr reads a checkpoint's bytes, not its architecture, so the module
+/// role stays `Other` rather than guessing at attention or FFN. The preferred
+/// encoding is the run's base block format, the declared fallback is F32,
+/// which is what a tensor the plan rejects lands in, and `min_quant_k` is the
+/// base format's block length.
 pub fn block_module_record(name: StringRef, base: BlockEncoding) -> ModuleRecord {
     ModuleRecord {
         module_id: 0,
@@ -130,37 +89,9 @@ pub fn block_module_record(name: StringRef, base: BlockEncoding) -> ModuleRecord
         module_role: ModuleRole::Other,
         fallback_encoding: Some(Encoding::Raw(RawEncoding::F32)),
         preferred_encoding: [Some(Encoding::Block(base)), None, None, None],
-        activation_contract_id: A8_DYNAMIC_CONTRACT_ID,
+        activation_contract_id: GGML_REFERENCE_CONTRACT_ID,
         policy_flags: PolicyFlags::NONE,
         min_quant_k: u32::try_from(base.block_elems()).unwrap_or(u32::MAX),
-        default_residency: ResidencyClass::Warm,
-        state_dtype: StateDtype::None,
-        state_flags: StateFlags::NONE,
-        policy_digest: [0u8; 16],
-    }
-}
-
-/// The single root module every tensor belongs to.
-///
-/// compressr reads a checkpoint's bytes, not its architecture, so the module
-/// role stays `Other` rather than guessing at attention or FFN. The declared
-/// fallback is F32, which is what a tensor the quantizer rejects lands in.
-pub fn module_record(name: StringRef, options: TcfOptions) -> ModuleRecord {
-    ModuleRecord {
-        module_id: 0,
-        parent_id: ROOT_PARENT_ID,
-        name,
-        module_role: ModuleRole::Other,
-        fallback_encoding: Some(Encoding::Raw(RawEncoding::F32)),
-        preferred_encoding: [
-            Some(Encoding::Native(options.preferred_encoding)),
-            None,
-            None,
-            None,
-        ],
-        activation_contract_id: EXACT_F32_CONTRACT_ID,
-        policy_flags: PolicyFlags::NONE,
-        min_quant_k: u32::from(options.encoding.geometry().tile),
         default_residency: ResidencyClass::Warm,
         state_dtype: StateDtype::None,
         state_flags: StateFlags::NONE,
@@ -199,13 +130,13 @@ pub struct TensorSensitivity {
 /// fabricated interval would be read as measured.
 ///
 /// `TASK_CRITICAL` is never set. Section 8.2 names the bit and defines no
-/// threshold for it, so a producer setting it from its own bump decision would
-/// be asserting a claim the format does not define.
+/// threshold for it, so a producer setting it from its own promotion decision
+/// would be asserting a claim the format does not define.
 pub fn tensor_record(
     tensor_id: u32,
     name: StringRef,
     encoding: Encoding,
-    fallback_reason: tcf_core::FallbackReason,
+    fallback_reason: boostr::tcf::FallbackReason,
     dims: [u64; 8],
     rank: u32,
     sensitivity: Option<TensorSensitivity>,
@@ -225,7 +156,7 @@ pub fn tensor_record(
         rank,
         calibration_id: sensitivity.map_or(0, |measured| measured.calibration_id),
         dims,
-        activation_contract_id: EXACT_F32_CONTRACT_ID,
+        activation_contract_id: GGML_REFERENCE_CONTRACT_ID,
         layout_id: LayoutId::RowMajorDense,
         data_offset: 0,
         logical_payload_bytes: 0,
@@ -261,15 +192,13 @@ pub const SENSITIVITY_SEED_COUNT: u32 = 1;
 
 /// The calibration a `--sensitivity` run's tensors point at. Section 10.
 ///
-/// Section 4 step 5 requires `calibration_id` in every measured
-/// `TensorRecord`, and Section 10.5.1 makes the pairing load-bearing: a
-/// `sensitivity_delta` with no calibration behind it is a number with no
-/// authority. So a measured run declares the calibration it actually read.
+/// Section 10.5.1 makes the pairing load-bearing: a `sensitivity_delta` with
+/// no calibration behind it is a number with no authority. So a measured run
+/// declares the calibration it actually read.
 ///
 /// `primary_metric` is `TASK_SPECIFIC`. The measurement is a task loss, not a
 /// word or character error rate and not a perplexity, and Section 10 forbids
-/// naming a tensor RMS here — which is exactly why the weight-error screen
-/// writes no calibration record at all.
+/// naming a tensor RMS here.
 ///
 /// Three fields stay zero because compressr cannot fill them honestly, and
 /// each is a real gap rather than a formality:
@@ -308,15 +237,10 @@ pub fn calibration_record(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tcf_core::NativeEncoding;
-
-    fn options() -> TcfOptions {
-        TcfOptions::uniform(NativeEncoding::Q4S32T64, NativeEncoding::Q6S32T64)
-    }
 
     fn measurement() -> SensitivityMeasurement {
         crate::policy::parse_sensitivity(&[
-            r#"{"record":"baseline","ckpt":"cache/models/example/abcdef","manifest":"manifests/eval.tsv","encoding":"Q4S32_T64","eval_rows":12,"eval_seed":7,"baseline_total":1.17}"#,
+            r#"{"record":"baseline","ckpt":"cache/models/example/abcdef","manifest":"manifests/eval.tsv","encoding":"Q4_K","eval_rows":12,"eval_seed":7,"baseline_total":1.17}"#,
             r#"{"record":"sensitivity","name":"a.weight","delta":0.5}"#,
         ]
         .join("\n"))
@@ -324,24 +248,28 @@ mod tests {
     }
 
     #[test]
-    fn the_module_ranks_the_preferred_encoding_first() {
-        let module = module_record(StringRef::new(0, 5), options());
+    fn the_module_ranks_the_base_block_format_first() {
+        let module = block_module_record(StringRef::new(0, 5), BlockEncoding::Q4K);
         assert_eq!(
             module.top_preferred_encoding(),
-            Some(Encoding::Native(NativeEncoding::Q6S32T64))
+            Some(Encoding::Block(BlockEncoding::Q4K))
         );
         assert!(module.is_root());
-        assert_eq!(module.min_quant_k, 64);
+        assert_eq!(module.min_quant_k, 256);
+        assert_eq!(module.activation_contract_id, GGML_REFERENCE_CONTRACT_ID);
     }
 
-    /// The declared contract is the exact f32-activation one, with no
-    /// activation quantization grid and no kernel or calibration named.
+    /// The declared contract names the ggml family, with no activation grid
+    /// and no calibration named.
     #[test]
-    fn the_declared_contract_is_exact_f32() {
-        let contract = contract_record();
-        assert_eq!(contract.contract_id, EXACT_F32_CONTRACT_ID);
-        assert_eq!(contract.input_representation, InputRepresentation::F32);
-        assert_eq!(contract.dot_accumulator, DotAccumulator::F32);
+    fn the_declared_contract_is_the_ggml_family() {
+        let contract = ggml_reference_contract_record();
+        assert_eq!(contract.contract_id, GGML_REFERENCE_CONTRACT_ID);
+        assert_eq!(
+            contract.input_representation,
+            InputRepresentation::GgmlReference
+        );
+        assert_eq!(contract.dot_accumulator, DotAccumulator::GgmlReference);
         assert_eq!(contract.output_dtype, OutputDtype::F32);
         assert_eq!(contract.math_mode, MathMode::ReassociationAllowed);
         assert_eq!(contract.quant_group, 0);
@@ -355,32 +283,28 @@ mod tests {
     /// the clock, a hash map, or the source checkpoint.
     #[test]
     fn the_contract_is_the_same_on_every_call() {
-        assert_eq!(contract_record(), contract_record());
+        assert_eq!(
+            ggml_reference_contract_record(),
+            ggml_reference_contract_record()
+        );
     }
 
-    /// The module and every tensor name the contract this file carries.
-    #[test]
-    fn every_record_points_at_the_declared_contract() {
-        let module = module_record(StringRef::new(0, 5), options());
-        assert_eq!(module.activation_contract_id, contract_record().contract_id);
-    }
-
-    /// Every id compressr cannot honestly fill stays zero, every field
-    /// tcf-core owns stays zero for it to compute, and the contract id
+    /// Every id compressr cannot honestly fill stays zero, every field the
+    /// container owns stays zero for it to compute, and the contract id
     /// resolves to the record this module writes.
     #[test]
     fn ids_and_writer_owned_fields_stay_unset() {
         let record = tensor_record(
             3,
             StringRef::new(0, 1),
-            Encoding::Native(NativeEncoding::Q4S32T64),
-            tcf_core::FallbackReason::None,
-            [1, 64, 0, 0, 0, 0, 0, 0],
+            Encoding::Block(BlockEncoding::Q4K),
+            boostr::tcf::FallbackReason::None,
+            [1, 256, 0, 0, 0, 0, 0, 0],
             2,
             None,
         );
         assert_eq!(record.calibration_id, 0);
-        assert_eq!(record.activation_contract_id, EXACT_F32_CONTRACT_ID);
+        assert_eq!(record.activation_contract_id, GGML_REFERENCE_CONTRACT_ID);
         assert_eq!(record.workload_profile_id, 0);
         assert_eq!(record.data_offset, 0);
         assert_eq!(record.logical_payload_bytes, 0);
@@ -388,6 +312,7 @@ mod tests {
         assert_eq!(record.semantic_digest, [0u8; 16]);
         assert_eq!(record.payload_digest, [0u8; 16]);
         assert_eq!(record.execution_role, ExecutionRole::Matmul);
+        assert!(!record.flags.contains(TensorFlags::SENSITIVITY_VALID));
     }
 
     /// A measured tensor carries the delta, the sample count and the
@@ -399,9 +324,9 @@ mod tests {
         let record = tensor_record(
             0,
             StringRef::new(0, 1),
-            Encoding::Native(NativeEncoding::Q4S32T64),
-            tcf_core::FallbackReason::TaskSensitivity,
-            [1, 64, 0, 0, 0, 0, 0, 0],
+            Encoding::Block(BlockEncoding::Q6K),
+            boostr::tcf::FallbackReason::TaskSensitivity,
+            [1, 256, 0, 0, 0, 0, 0, 0],
             2,
             Some(TensorSensitivity {
                 calibration_id: measurement.calibration_id(),
@@ -444,7 +369,7 @@ mod tests {
             0,
             StringRef::new(0, 1),
             Encoding::Raw(RawEncoding::F32),
-            tcf_core::FallbackReason::RankLt2,
+            boostr::tcf::FallbackReason::RankLt2,
             [64, 0, 0, 0, 0, 0, 0, 0],
             1,
             None,

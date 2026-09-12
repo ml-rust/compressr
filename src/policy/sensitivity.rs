@@ -1,16 +1,14 @@
 //! A measured task-metric sensitivity file: what it holds, and what it names.
 //!
-//! `PROFILES.md` Section 4 step 2 measures a task-metric delta per bump
-//! candidate on a calibration set. compressr does not run models, so it never
-//! produces that measurement itself. It reads one: a JSON-lines file holding a
-//! single `baseline` record and one `sensitivity` record per tensor, written by
-//! whatever harness ran the model. `--sensitivity` supplies it.
+//! A measured mix ranks its promotions by a task-metric delta per candidate
+//! on a calibration set. compressr does not run models, so it never produces
+//! that measurement itself. It reads one: a JSON-lines file holding a single
+//! `baseline` record and one `sensitivity` record per tensor, written by
+//! boostr's sensitivity sweep. `--sensitivity` supplies it.
 //!
-//! This module parses that file, checks it was measured at the encoding the
-//! profile bumps from, and derives the calibration identity the TCF records
-//! point at. [`super::sensitivity_rank`] turns it into a bump set. Without the
-//! flag neither runs, and the weight-error screen in [`super::allocation`] is
-//! unchanged.
+//! This module parses that file and derives the calibration identity the TCF
+//! records point at. [`super::mix_measured`] turns it into an allocation.
+//! Without the flag neither runs, and the positional rules are unchanged.
 //!
 //! # One record per tensor, or one per (tensor, encoding) pair
 //!
@@ -30,10 +28,8 @@
 //! measured elsewhere is refused rather than reused.
 
 use anyhow::{anyhow, bail, Context, Result};
+use boostr::tcf::hash_128;
 use serde_json::Value;
-use tcf_core::{hash_128, NativeEncoding};
-
-use crate::formats::parse_tcf_encoding;
 
 use super::sensitivity_options::{MeasuredOption, MeasuredOptions};
 use super::sensitivity_record::{read_record, PendingOption, SensitivityRecord};
@@ -170,6 +166,12 @@ impl SensitivityMeasurement {
         self.options.options_for(name)
     }
 
+    /// One tensor's measured delta at one encoding, `None` when the file
+    /// has no measured record for that pair.
+    pub fn delta_at(&self, name: &str, encoding: &str) -> Option<f64> {
+        self.options.delta_at(name, encoding)
+    }
+
     /// Distinct encodings the file measures, ascending.
     ///
     /// One encoding is a two-way file. More than one is a ladder, and
@@ -182,30 +184,6 @@ impl SensitivityMeasurement {
     /// ladder allocation needs and a two-way file does not carry.
     pub fn is_ladder(&self) -> bool {
         self.options.encodings().len() > 1
-    }
-
-    /// Check the measurement was taken at the encoding the profile bumps from.
-    ///
-    /// # Errors
-    /// The baseline names an encoding compressr does not recognize, or one
-    /// that is not `expected`.
-    pub fn check_encoding(&self, expected: NativeEncoding) -> Result<()> {
-        let measured = parse_tcf_encoding(&self.baseline.encoding).with_context(|| {
-            format!(
-                "Sensitivity file's baseline names encoding '{}', which compressr does not \
-                 recognize",
-                self.baseline.encoding
-            )
-        })?;
-        if measured != expected {
-            bail!(
-                "Sensitivity file was measured at {measured:?} but the profile's base encoding \
-                 is {expected:?}. A ranking measured at one encoding does not transfer to \
-                 another: the delta is that encoding's damage on that tensor. Re-run the \
-                 measurement at {expected:?}, or pick the profile whose base is {measured:?}."
-            );
-        }
-        Ok(())
     }
 
     /// The string two files built from different calibrations differ in.
@@ -270,7 +248,7 @@ mod tests {
     /// share as their base.
     fn file() -> String {
         [
-            r#"{"record":"baseline","ckpt":"cache/models/example/abcdef","manifest":"manifests/eval.tsv","encoding":"Q4AS32D_T64","eval_rows":12,"eval_seed":7,"baseline_total":1.17}"#,
+            r#"{"record":"baseline","ckpt":"cache/models/example/abcdef","manifest":"manifests/eval.tsv","encoding":"Q4_K","eval_rows":12,"eval_seed":7,"baseline_total":1.17}"#,
             r#"{"record":"sensitivity","name":"a.weight","elements":1024,"delta":0.5}"#,
             r#"{"record":"sensitivity","name":"b.weight","elements":1024,"delta":-0.25}"#,
             r#"{"record":"skipped","name":"c.weight","reason":"rank below 2"}"#,
@@ -338,11 +316,11 @@ mod tests {
         let laddered = format!(
             "{}\n{}",
             file(),
-            r#"{"record":"sensitivity","name":"a.weight","encoding":"Q6S16D_T64","delta":0.05,"bytes":210}"#
+            r#"{"record":"sensitivity","name":"a.weight","encoding":"Q6_K","delta":0.05,"bytes":210}"#
         );
         let measurement = parse_sensitivity(&laddered).expect("parses");
         assert!(measurement.is_ladder());
-        assert_eq!(measurement.encodings(), vec!["Q4AS32D_T64", "Q6S16D_T64"]);
+        assert_eq!(measurement.encodings(), vec!["Q4_K", "Q6_K"]);
         assert_eq!(measurement.options_for("a.weight").len(), 2);
         // The two-way read still answers at the baseline encoding.
         assert_eq!(measurement.delta_for("a.weight"), Some(0.5));
@@ -356,28 +334,12 @@ mod tests {
     fn a_two_way_file_is_not_a_ladder() {
         let measurement = parse_sensitivity(&file()).expect("parses");
         assert!(!measurement.is_ladder());
-        assert_eq!(measurement.encodings(), vec!["Q4AS32D_T64"]);
+        assert_eq!(measurement.encodings(), vec!["Q4_K"]);
         // The skipped pair is kept, at the baseline encoding.
         let skipped = measurement.options_for("c.weight");
         assert_eq!(skipped.len(), 1);
         assert!(skipped[0].skipped);
-        assert_eq!(skipped[0].encoding, "Q4AS32D_T64");
-    }
-
-    /// The measurement is only a ranking of the encoding it was taken at.
-    #[test]
-    fn a_different_base_encoding_is_refused() {
-        let measurement = parse_sensitivity(&file()).expect("parses");
-        assert!(measurement
-            .check_encoding(NativeEncoding::Q4AS32DT64)
-            .is_ok());
-        let error = measurement
-            .check_encoding(NativeEncoding::Q8S32T64)
-            .expect_err("a different encoding")
-            .to_string();
-        assert!(error.contains("Q4AS32DT64"), "{error}");
-        assert!(error.contains("Q8S32T64"), "{error}");
-        assert!(error.contains("does not transfer"), "{error}");
+        assert_eq!(skipped[0].encoding, "Q4_K");
     }
 
     /// Two calibrations must be distinguishable, and one must reproduce.

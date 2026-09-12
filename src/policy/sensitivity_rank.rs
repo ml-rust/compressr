@@ -14,15 +14,13 @@
 //!
 //! # Why the rank is delta per element
 //!
-//! `PROFILES.md` Section 4 step 3 ranks by delta per unit of effective cost —
-//! bytes plus weighted decode instructions. compressr has no
-//! decode-instruction model for a consumer's backend, so the instruction term
-//! is not approximated; it is left out, and the ranking says so. The remaining
-//! cost is the budget compressr actually spends, which is elements, for the
-//! reason [`super::allocation`] gives: the ladder's rungs are bpw numbers and
-//! only elements track bytes. So the order is `delta / elements`, descending,
-//! ties broken by plan index as [`super::allocation::select_bumped`] breaks
-//! them.
+//! The ideal rank is delta per unit of effective cost — bytes plus weighted
+//! decode instructions. compressr has no decode-instruction model for a
+//! consumer's backend, so the instruction term is not approximated; it is
+//! left out, and the ranking says so. The remaining cost is the budget
+//! compressr actually spends, which is elements: a mix's rungs are bpw
+//! numbers and only elements track bytes. So the order is `delta / elements`,
+//! descending, ties broken by plan index.
 //!
 //! A tensor whose delta is not positive was not damaged by the base encoding —
 //! quantizing it changed nothing measurable, or the metric improved. Bumping
@@ -203,7 +201,7 @@ mod tests {
     /// not damage.
     fn measurement() -> SensitivityMeasurement {
         let mut lines = vec![
-            r#"{"record":"baseline","ckpt":"cache/models/example/abcdef","manifest":"manifests/eval.tsv","encoding":"Q4AS32D_T64","eval_rows":12,"eval_seed":7,"baseline_total":1.17}"#
+            r#"{"record":"baseline","ckpt":"cache/models/example/abcdef","manifest":"manifests/eval.tsv","encoding":"Q4_K","eval_rows":12,"eval_seed":7,"baseline_total":1.17}"#
                 .to_string(),
         ];
         for (name, delta) in [
