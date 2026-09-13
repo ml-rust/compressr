@@ -1,5 +1,6 @@
 //! The VoxCPM2 companion: which output tensors the embedded AudioVAE owns,
-//! why they stay dense, and the `config.json` metadata written beside them.
+//! why they stay dense, and the `config.json` and `tokenizer.json` metadata
+//! written beside them.
 //!
 //! A VoxCPM2 checkpoint directory holds its `AudioVAE` codec beside the
 //! transformer stack as `audiovae.pth`. A conversion folds that companion
@@ -40,6 +41,12 @@ const VOXCPM2_ARCHITECTURE: &str = "voxcpm2";
 /// it loads with no `config.json` path beside it.
 pub const VOXCPM2_CONFIG_JSON_KEY: &str = "voxcpm2.config_json";
 
+/// GGUF metadata key holding a checkpoint's `tokenizer.json`, byte for
+/// byte: gguf-py's `Keys.Tokenizer.HF_JSON`. boostr's VoxCPM2 weights
+/// selector reads it, so a GGUF carrying it needs no `tokenizer.json`
+/// beside it.
+pub const HF_TOKENIZER_JSON_KEY: &str = "tokenizer.huggingface.json";
+
 /// Is `arch` VoxCPM2, whatever its case?
 pub fn is_voxcpm2(arch: &str) -> bool {
     arch.trim().eq_ignore_ascii_case(VOXCPM2_ARCHITECTURE)
@@ -51,10 +58,25 @@ pub fn is_voxcpm2(arch: &str) -> bool {
 /// # Errors
 /// The file exists and cannot be read.
 pub fn voxcpm2_config_json(input_path: &Path) -> Result<Option<String>> {
+    checkpoint_text(input_path, "config.json")
+}
+
+/// The `tokenizer.json` beside an input, verbatim, or `None` when there is
+/// none.
+///
+/// # Errors
+/// The file exists and cannot be read.
+pub fn hf_tokenizer_json(input_path: &Path) -> Result<Option<String>> {
+    checkpoint_text(input_path, "tokenizer.json")
+}
+
+/// `file_name` in the input's checkpoint directory, verbatim, or `None`
+/// when the input has no directory or the file is absent.
+fn checkpoint_text(input_path: &Path, file_name: &str) -> Result<Option<String>> {
     let Some(dir) = checkpoint_dir(input_path) else {
         return Ok(None);
     };
-    let path = dir.join("config.json");
+    let path = dir.join(file_name);
     if !path.is_file() {
         return Ok(None);
     }
@@ -210,6 +232,18 @@ mod tests {
         std::fs::write(dir.path().join("config.json"), text).unwrap();
         assert_eq!(
             voxcpm2_config_json(dir.path()).unwrap().as_deref(),
+            Some(text)
+        );
+    }
+
+    #[test]
+    fn the_tokenizer_json_is_read_verbatim_or_not_at_all() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert_eq!(hf_tokenizer_json(dir.path()).unwrap(), None);
+        let text = "{\n  \"version\": \"1.0\",\n  \"model\": {\"type\": \"BPE\"}\n}\n";
+        std::fs::write(dir.path().join("tokenizer.json"), text).unwrap();
+        assert_eq!(
+            hf_tokenizer_json(dir.path()).unwrap().as_deref(),
             Some(text)
         );
     }

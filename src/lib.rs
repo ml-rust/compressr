@@ -126,7 +126,7 @@ pub use policy::{
     LayerCountSource, MeasuredBump, MeasuredMixAllocation, MeasuredOption, MeasuredTensor,
     MixAllocation, MixEntry, MixModel, MixReport, PlanCounts, SensitivityBaseline,
     SensitivityMeasurement, TensorPlan, TensorRole, AUDIO_VAE_PREFIX, GGUF_MIX_NAMES,
-    UNLAYERED_COMPONENT, VOXCPM2_CONFIG_JSON_KEY,
+    HF_TOKENIZER_JSON_KEY, UNLAYERED_COMPONENT, VOXCPM2_CONFIG_JSON_KEY,
 };
 pub use quantization::{
     QuantType, QuantizationConfig, QuantizationMethod, QuantizedTensor, Quantizer,
@@ -844,13 +844,20 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
             gguf_writer.set_name(&name);
         }
 
-        // A VoxCPM2 GGUF carries its `config.json` verbatim, under the key
-        // boostr's loader reads first, so the file loads with no path beside
-        // it. Only this architecture: no other loader reads the key.
+        // A VoxCPM2 GGUF carries its `config.json` and `tokenizer.json`
+        // verbatim, under the keys boostr reads first, so the file loads
+        // with nothing beside it. Only this architecture: no other loader
+        // reads the keys.
         if policy::is_voxcpm2(arch) {
             if let Some(text) = policy::voxcpm2_config_json(input_path)? {
                 gguf_writer.add_metadata(
                     policy::VOXCPM2_CONFIG_JSON_KEY,
+                    formats::GgufValue::String(text),
+                );
+            }
+            if let Some(text) = policy::hf_tokenizer_json(input_path)? {
+                gguf_writer.add_metadata(
+                    policy::HF_TOKENIZER_JSON_KEY,
                     formats::GgufValue::String(text),
                 );
             }

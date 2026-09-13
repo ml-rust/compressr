@@ -1,7 +1,7 @@
 //! The VoxCPM2 companion: a conversion of a checkpoint directory that holds
 //! `audiovae.pth` beside `model.safetensors` writes ONE file carrying the
 //! transformer stack, the AudioVAE under `vae.`, and (for GGUF) the
-//! `config.json` as metadata.
+//! `config.json` and `tokenizer.json` as metadata.
 //!
 //! Read back through boostr's own GGUF and TCF readers, never through
 //! compressr's: a writer checked against a reader beside it proves nothing.
@@ -15,7 +15,8 @@ use boostr::tcf::Encoding;
 use boostr::{CpuClient, CpuDevice, CpuRuntime, Tensor};
 use compressr::{
     ConversionConfig, FormatWriter, GgufMix, OutputFormat, QuantizationConfig,
-    SafeTensorsFormatWriter, UnifiedDType, AUDIO_VAE_PREFIX, VOXCPM2_CONFIG_JSON_KEY,
+    SafeTensorsFormatWriter, UnifiedDType, AUDIO_VAE_PREFIX, HF_TOKENIZER_JSON_KEY,
+    VOXCPM2_CONFIG_JSON_KEY,
 };
 use std::path::{Path, PathBuf};
 
@@ -30,6 +31,11 @@ fn audiovae_fixture() -> PathBuf {
 /// The `config.json` a VoxCPM2 checkpoint ships, trimmed to what the test
 /// needs. The bytes are what must round-trip, so they are kept verbatim.
 const CONFIG_JSON: &str = "{\n  \"architecture\": \"voxcpm2\",\n  \"patch_size\": 4\n}\n";
+
+/// A `tokenizer.json` trimmed the same way. Nothing parses it here: the
+/// bytes round-trip, and boostr's tokenizer loader owns their meaning.
+const TOKENIZER_JSON: &str =
+    "{\n  \"version\": \"1.0\",\n  \"model\": {\"type\": \"BPE\", \"vocab\": {\"a\": 0}}\n}\n";
 
 /// Reproducible values with enough spread for a quantizer to work on.
 fn values(count: usize, seed: u64) -> Vec<f32> {
@@ -62,9 +68,13 @@ fn stack_tensors() -> Vec<(&'static str, Vec<usize>, Vec<f32>)> {
 }
 
 /// Build a VoxCPM2-shaped checkpoint directory: `config.json`,
-/// `model.safetensors`, and the AudioVAE fixture as `audiovae.pth`.
-fn write_checkpoint(dir: &Path, config_json: &str) {
+/// `model.safetensors`, the AudioVAE fixture as `audiovae.pth`, and
+/// `tokenizer.json` when `tokenizer_json` is given.
+fn write_checkpoint(dir: &Path, config_json: &str, tokenizer_json: Option<&str>) {
     std::fs::write(dir.join("config.json"), config_json).expect("writes config.json");
+    if let Some(text) = tokenizer_json {
+        std::fs::write(dir.join("tokenizer.json"), text).expect("writes tokenizer.json");
+    }
     std::fs::copy(audiovae_fixture(), dir.join("audiovae.pth")).expect("copies the AudioVAE");
     let mut writer = SafeTensorsFormatWriter::new();
     let tensors = stack_tensors();
@@ -131,9 +141,9 @@ fn assert_close(name: &str, got: &[f32], want: &[f32]) {
 }
 
 #[test]
-fn a_voxcpm2_gguf_carries_the_folded_vae_dense_and_its_config() {
+fn a_voxcpm2_gguf_carries_the_folded_vae_dense_its_config_and_its_tokenizer() {
     let dir = tempfile::tempdir().expect("a temporary directory");
-    write_checkpoint(dir.path(), CONFIG_JSON);
+    write_checkpoint(dir.path(), CONFIG_JSON, Some(TOKENIZER_JSON));
     let out = dir.path().join("model.gguf");
     convert(dir.path(), &out, OutputFormat::Gguf);
 
@@ -192,10 +202,14 @@ fn a_voxcpm2_gguf_carries_the_folded_vae_dense_and_its_config() {
         .collect();
     assert_eq!(boundaries, vec![16000, 24000, 44100]);
 
-    // `config.json` round-trips byte for byte.
+    // `config.json` and `tokenizer.json` round-trip byte for byte.
     assert_eq!(
         gguf.metadata().get_string(VOXCPM2_CONFIG_JSON_KEY),
         Some(CONFIG_JSON)
+    );
+    assert_eq!(
+        gguf.metadata().get_string(HF_TOKENIZER_JSON_KEY),
+        Some(TOKENIZER_JSON)
     );
     assert_eq!(gguf.metadata().architecture(), Some("voxcpm2"));
 
@@ -221,10 +235,27 @@ fn a_voxcpm2_gguf_carries_the_folded_vae_dense_and_its_config() {
     assert_eq!(gguf.len(), stack_tensors().len() + VAE_NAMES.len());
 }
 
+/// No `tokenizer.json` in the directory: the key is not written, rather
+/// than written empty.
+#[test]
+fn a_voxcpm2_gguf_without_a_tokenizer_file_carries_no_tokenizer_key() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    write_checkpoint(dir.path(), CONFIG_JSON, None);
+    let out = dir.path().join("model.gguf");
+    convert(dir.path(), &out, OutputFormat::Gguf);
+
+    let gguf = Gguf::open(&out).expect("boostr opens the GGUF");
+    assert_eq!(gguf.metadata().get_string(HF_TOKENIZER_JSON_KEY), None);
+    assert_eq!(
+        gguf.metadata().get_string(VOXCPM2_CONFIG_JSON_KEY),
+        Some(CONFIG_JSON)
+    );
+}
+
 #[test]
 fn a_voxcpm2_tcf_carries_the_folded_vae_dense() {
     let dir = tempfile::tempdir().expect("a temporary directory");
-    write_checkpoint(dir.path(), CONFIG_JSON);
+    write_checkpoint(dir.path(), CONFIG_JSON, Some(TOKENIZER_JSON));
     let out = dir.path().join("model.tcf");
     convert(dir.path(), &out, OutputFormat::Tcf);
 
@@ -280,7 +311,7 @@ fn a_voxcpm2_tcf_carries_the_folded_vae_dense() {
 #[test]
 fn a_mix_keeps_the_vae_f32_and_out_of_its_report() {
     let dir = tempfile::tempdir().expect("a temporary directory");
-    write_checkpoint(dir.path(), CONFIG_JSON);
+    write_checkpoint(dir.path(), CONFIG_JSON, None);
     let out = dir.path().join("model.gguf");
     let config = ConversionConfig::new(
         dir.path().to_string_lossy().to_string(),
@@ -326,7 +357,11 @@ fn a_mix_keeps_the_vae_f32_and_out_of_its_report() {
 #[test]
 fn a_non_voxcpm2_directory_gets_no_companion() {
     let dir = tempfile::tempdir().expect("a temporary directory");
-    write_checkpoint(dir.path(), "{\"model_type\": \"llama\"}");
+    write_checkpoint(
+        dir.path(),
+        "{\"model_type\": \"llama\"}",
+        Some(TOKENIZER_JSON),
+    );
     let out = dir.path().join("model.gguf");
     convert(dir.path(), &out, OutputFormat::Gguf);
 
@@ -336,6 +371,7 @@ fn a_non_voxcpm2_directory_gets_no_companion() {
         .tensor_names()
         .all(|n| !n.starts_with(AUDIO_VAE_PREFIX)));
     assert_eq!(gguf.metadata().get_string(VOXCPM2_CONFIG_JSON_KEY), None);
+    assert_eq!(gguf.metadata().get_string(HF_TOKENIZER_JSON_KEY), None);
 }
 
 /// `--arch` outranks `config.json` for the companion rule, exactly as it
@@ -343,7 +379,7 @@ fn a_non_voxcpm2_directory_gets_no_companion() {
 #[test]
 fn the_arch_override_decides_the_companion() {
     let dir = tempfile::tempdir().expect("a temporary directory");
-    write_checkpoint(dir.path(), "{\"model_type\": \"llama\"}");
+    write_checkpoint(dir.path(), "{\"model_type\": \"llama\"}", None);
     let out = dir.path().join("model.gguf");
     let config = ConversionConfig::new(
         dir.path().to_string_lossy().to_string(),

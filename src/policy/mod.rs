@@ -46,8 +46,8 @@ pub mod tensor_role;
 pub(crate) use architecture::checkpoint_dir;
 pub use architecture::{model_name, resolve_architecture};
 pub use audio_vae::{
-    is_audio_vae_tensor, is_voxcpm2, plan_named_mixed_tensor, plan_named_tensor,
-    voxcpm2_config_json, AUDIO_VAE_PREFIX, VOXCPM2_CONFIG_JSON_KEY,
+    hf_tokenizer_json, is_audio_vae_tensor, is_voxcpm2, plan_named_mixed_tensor, plan_named_tensor,
+    voxcpm2_config_json, AUDIO_VAE_PREFIX, HF_TOKENIZER_JSON_KEY, VOXCPM2_CONFIG_JSON_KEY,
 };
 pub use config_facts::{find_config_usize, LayerCountSource, LAYER_COUNT_KEYS};
 pub use gguf_mix::{parse_gguf_mix, GgufMix, GGUF_MIX_NAMES};

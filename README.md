@@ -12,7 +12,7 @@ Implemented and tested:
 | GGUF input         | Read back for re-conversion                                |
 | TCF input          | Read back, verified and decoded, through boostr's reader   |
 | PyTorch input      | One `.pt` / `.pth` / `.bin` state dict, F32, F64, I32 and I64 tensors |
-| VoxCPM2 companion  | A `voxcpm2` checkpoint directory folds its `audiovae.pth` into the same GGUF/TCF under `vae.`, F32, with `config.json` as the `voxcpm2.config_json` key |
+| VoxCPM2 companion  | A `voxcpm2` checkpoint directory folds its `audiovae.pth` into the same GGUF/TCF under `vae.`, F32, with `config.json` as the `voxcpm2.config_json` key and `tokenizer.json` as the `tokenizer.huggingface.json` key |
 | SafeTensors output | Sharded at `--max-shard-size`, with a matching index       |
 | GGUF output        | GGUF v3, one self-contained file                           |
 | dtype cast         | `f32`, `f16`, `bf16`, round-to-nearest-even                |
