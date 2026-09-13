@@ -1256,26 +1256,10 @@ dependencies = [
  "rustc-hash",
  "serde",
  "serde_json",
- "splintr-vocab-whisper",
  "thiserror",
  "unicode-general-category",
  "unicode-normalization",
  "unicode-segmentation",
-]
-
-[[package]]
-name = "splintr-vocab-pack"
-version = "1.2.0"
-dependencies = [
- "base64",
- "serde_json",
-]
-
-[[package]]
-name = "splintr-vocab-whisper"
-version = "1.0.0"
-dependencies = [
- "splintr-vocab-pack",
 ]
 
 [[package]]
