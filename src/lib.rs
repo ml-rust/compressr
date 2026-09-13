@@ -125,7 +125,8 @@ pub use policy::{
     FormatUsage, GgufMix, LadderChoice, LadderMenu, LadderOption, LadderOutcome, LadderReport,
     LayerCountSource, MeasuredBump, MeasuredMixAllocation, MeasuredOption, MeasuredTensor,
     MixAllocation, MixEntry, MixModel, MixReport, PlanCounts, SensitivityBaseline,
-    SensitivityMeasurement, TensorPlan, TensorRole, GGUF_MIX_NAMES, UNLAYERED_COMPONENT,
+    SensitivityMeasurement, TensorPlan, TensorRole, AUDIO_VAE_PREFIX, GGUF_MIX_NAMES,
+    UNLAYERED_COMPONENT, VOXCPM2_CONFIG_JSON_KEY,
 };
 pub use quantization::{
     QuantType, QuantizationConfig, QuantizationMethod, QuantizedTensor, Quantizer,
@@ -666,6 +667,7 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
     // Step 1: Load the model
     log::info!("Loading model...");
     let mut model = ModelLoader::new(&config.input_path)
+        .with_arch_override(config.arch.as_deref())
         .load()
         .with_context(|| format!("Failed to load model from: {}", config.input_path))?;
 
@@ -766,25 +768,29 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
                 facts.n_expert,
                 if facts.is_70b { "on" } else { "off" }
             );
+            // The mix allocates the TRANSFORMER STACK. An embedded AudioVAE
+            // is pinned dense by name whatever a mix would assign, so it is
+            // left out of the allocation and of the report that describes
+            // it: its conv stacks are not layers llama.cpp's rule was
+            // written for, and counting them would misstate the model.
+            let stack: Vec<(&str, &[usize], UnifiedDType)> = tensor_info
+                .iter()
+                .filter(|(name, _)| !policy::is_audio_vae_tensor(name))
+                .map(|(name, info)| (name.as_str(), info.shape.as_slice(), info.dtype))
+                .collect();
             // Without --sensitivity this is llama.cpp's positional
             // allocation and nothing else, byte for byte.
             let (assigned, computed) = match config.gguf_sensitivity.as_ref() {
                 Some(measurement) => {
-                    let measured_tensors: Vec<policy::MeasuredTensor<'_>> = tensor_info
-                        .iter()
-                        .map(|(name, info)| (name.as_str(), info.shape.as_slice(), info.dtype))
-                        .collect();
                     let (assigned, positional, measured) =
-                        policy::assign_mix_measured(mix, &measured_tensors, &facts, measurement)?;
+                        policy::assign_mix_measured(mix, &stack, &facts, measurement)?;
                     log::info!("{measured}");
                     measured_allocation = Some(measured);
                     (assigned, positional)
                 }
                 None => policy::assign_mix_reported(
                     mix,
-                    tensor_info
-                        .iter()
-                        .map(|(name, info)| (name.as_str(), info.shape.as_slice())),
+                    stack.iter().map(|(name, shape, _)| (*name, *shape)),
                     &facts,
                 ),
             };
@@ -797,17 +803,26 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
             }
             log::info!("{computed}");
             allocation = Some(computed);
+            // `assigned` runs over the stack in order; every VAE tensor
+            // takes its own plan without consuming an assignment.
+            let mut assigned = assigned.into_iter();
             tensor_info
                 .iter()
-                .zip(&assigned)
-                .map(|((_, info), assigned)| {
-                    policy::plan_mixed_tensor(&info.shape, info.dtype, *assigned)
+                .map(|(name, info)| {
+                    let format = if policy::is_audio_vae_tensor(name) {
+                        None
+                    } else {
+                        assigned.next().flatten()
+                    };
+                    policy::plan_named_mixed_tensor(name, &info.shape, info.dtype, format)
                 })
                 .collect()
         }
         None => tensor_info
             .iter()
-            .map(|(_, info)| policy::plan_tensor(&info.shape, info.dtype, quant_type))
+            .map(|(name, info)| {
+                policy::plan_named_tensor(name, &info.shape, info.dtype, quant_type)
+            })
             .collect(),
     };
 
@@ -827,6 +842,18 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
         // checkpoint directory to take it from, no name is written.
         if let Some(name) = policy::model_name(input_path) {
             gguf_writer.set_name(&name);
+        }
+
+        // A VoxCPM2 GGUF carries its `config.json` verbatim, under the key
+        // boostr's loader reads first, so the file loads with no path beside
+        // it. Only this architecture: no other loader reads the key.
+        if policy::is_voxcpm2(arch) {
+            if let Some(text) = policy::voxcpm2_config_json(input_path)? {
+                gguf_writer.add_metadata(
+                    policy::VOXCPM2_CONFIG_JSON_KEY,
+                    formats::GgufValue::String(text),
+                );
+            }
         }
 
         // Add architecture-specific metadata

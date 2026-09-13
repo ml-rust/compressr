@@ -275,21 +275,41 @@ fn load_key(
 }
 
 /// Copy a host tensor out as little-endian bytes of its own element type.
+///
+/// Every element type boostr's `.pt` reader decodes is covered.
 fn tensor_bytes(tensor: &Tensor<CpuRuntime>, name: &str) -> Result<Vec<u8>> {
+    let le_f32 = |t: &Tensor<CpuRuntime>| -> Vec<u8> {
+        t.to_vec::<f32>()
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect()
+    };
+    let le_f64 = |t: &Tensor<CpuRuntime>| -> Vec<u8> {
+        t.to_vec::<f64>()
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect()
+    };
+    let le_i32 = |t: &Tensor<CpuRuntime>| -> Vec<u8> {
+        t.to_vec::<i32>()
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect()
+    };
+    let le_i64 = |t: &Tensor<CpuRuntime>| -> Vec<u8> {
+        t.to_vec::<i64>()
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect()
+    };
     match tensor.dtype() {
-        DType::F32 => Ok(tensor
-            .to_vec::<f32>()
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect()),
-        DType::F64 => Ok(tensor
-            .to_vec::<f64>()
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect()),
+        DType::F32 => Ok(le_f32(tensor)),
+        DType::F64 => Ok(le_f64(tensor)),
+        DType::I32 => Ok(le_i32(tensor)),
+        DType::I64 => Ok(le_i64(tensor)),
         other => Err(anyhow!(
             "PyTorch tensor '{}' is {:?}, which boostr's .pt reader does not decode. Its \
-             reader covers F32 and F64.",
+             reader covers F32, F64, I32 and I64.",
             name,
             other
         )),

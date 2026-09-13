@@ -22,7 +22,8 @@ This section is the SINGLE source of truth on what works. Everything below assum
 | SafeTensors input  | Single file, or sharded via `model.safetensors.index.json` |
 | GGUF input         | Read back for re-conversion                                |
 | TCF input          | Read back through boostr's reader: directory, and payloads verified and decoded |
-| PyTorch input      | One `.pt` / `.pth` / `.bin` state dict, F32 and F64 tensors |
+| PyTorch input      | One `.pt` / `.pth` / `.bin` state dict, F32, F64, I32 and I64 tensors |
+| VoxCPM2 companion  | A safetensors directory whose architecture is `voxcpm2` (by `config.json` or `--arch`) folds `audiovae.safetensors`, else `audiovae.pth`, into the same GGUF or TCF: every tensor under `vae.` (`vae.decoder.*`, `vae.encoder.*`), weight-norm pairs folded, float tensors stored F32 whatever the quantization or dtype cast, the I32 boundaries vector copied through. GGUF also carries `config.json` verbatim as the `voxcpm2.config_json` string key. boostr loads the VAE from that file and needs no separate `audiovae.pth` for it. No other architecture gains a companion |
 | SafeTensors output | Sharded at `--max-shard-size`, with a matching index       |
 | GGUF output        | GGUF v3, one self-contained file                           |
 | TCF output         | TCF v1, one self-contained file, written through `boostr::tcf`. `--format tcf` takes every `--quantization` method and mix and stores the GGML block streams a GGUF run writes, byte for byte, plus the container's records: the `GGML_REFERENCE` activation contract, a proof vector per tensor, a `fallback_reason` per tensor, and on a `--sensitivity` run the calibration record and per-tensor task delta. NEVER add a TCF-only quantizer or encoding: TCF's payload IS the GGUF payload |
@@ -44,7 +45,7 @@ This section is the SINGLE source of truth on what works. Everything below assum
 | EXL2                | The whole format driver                                                 |
 | ONNX input          | The `.onnx` reader                                                      |
 | Sharded PyTorch     | A `pytorch_model.bin.index.json` walk; one `.bin` per model today       |
-| PyTorch F16, BF16   | boostr's `.pt` reader decodes F32 and F64 only                          |
+| PyTorch F16, BF16   | boostr's `.pt` reader decodes F32, F64, I32 and I64 only                |
 | Python API          | The PyO3 module exports `__version__` only                              |
 | Triple-buffered I/O | A prefetch/compute/write pipeline; reads and writes are serial today    |
 | Parallel shard I/O  | Reads and writes are sequential                                         |

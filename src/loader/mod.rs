@@ -14,7 +14,15 @@
 //! into an owned buffer per call — it is not a memory map and the bytes are not
 //! shared with the file. Peak resident memory over a conversion is therefore
 //! roughly the largest tensor plus its converted copy, not the model size.
+//!
+//! # Companion files
+//!
+//! A VoxCPM2 checkpoint directory carries its `AudioVAE` as a second file.
+//! The loader opens it as a [`companion::Companion`] and exposes its tensors
+//! under `vae.` beside the primary's, so one conversion writes the whole
+//! model. No other input gains a companion.
 
+pub mod companion;
 pub mod tcf;
 pub mod torch;
 
@@ -24,6 +32,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
 
+pub use companion::Companion;
 pub use tcf::{TcfFileFacts, TcfModel, TcfModuleFacts, TcfTensorFacts};
 pub use torch::TorchModel;
 
@@ -38,6 +47,10 @@ pub use boostr::DType;
 pub struct ModelLoader {
     /// Path to the model (file or directory)
     path: String,
+    /// `--arch`, when given: it outranks the checkpoint's `config.json` in
+    /// the architecture test that decides whether a companion is opened,
+    /// exactly as it outranks it for `general.architecture`.
+    arch_override: Option<String>,
 }
 
 impl ModelLoader {
@@ -45,7 +58,14 @@ impl ModelLoader {
     pub fn new<P: AsRef<Path>>(path: P) -> Self {
         Self {
             path: path.as_ref().to_string_lossy().to_string(),
+            arch_override: None,
         }
+    }
+
+    /// Set the architecture override (`--arch`) the companion rule reads.
+    pub fn with_arch_override(mut self, arch: Option<&str>) -> Self {
+        self.arch_override = arch.map(str::to_string);
+        self
     }
 
     /// Get the path being loaded
@@ -147,7 +167,14 @@ impl ModelLoader {
         log::info!("Detected format: {:?}", format);
 
         match format {
-            crate::InputFormat::Safetensors => self.load_safetensors(),
+            crate::InputFormat::Safetensors => {
+                let mut model = self.load_safetensors()?;
+                let path = Path::new(&self.path);
+                if path.is_dir() {
+                    model.companion = Companion::for_voxcpm2(path, self.arch_override.as_deref())?;
+                }
+                Ok(model)
+            }
             crate::InputFormat::Gguf => self.load_gguf(),
             crate::InputFormat::Tcf => self.load_tcf(),
             crate::InputFormat::PyTorch => self.load_torch(),
@@ -163,6 +190,7 @@ impl ModelLoader {
         Ok(LoadedModel {
             inner: LoadedModelInner::Tcf(Box::new(model)),
             format: crate::InputFormat::Tcf,
+            companion: None,
         })
     }
 
@@ -198,6 +226,7 @@ impl ModelLoader {
         Ok(LoadedModel {
             inner: LoadedModelInner::Torch(Box::new(model)),
             format: crate::InputFormat::PyTorch,
+            companion: None,
         })
     }
 
@@ -215,6 +244,7 @@ impl ModelLoader {
             Ok(LoadedModel {
                 inner: LoadedModelInner::SafeTensors(vec![st]),
                 format: crate::InputFormat::Safetensors,
+                companion: None,
             })
         }
     }
@@ -256,6 +286,7 @@ impl ModelLoader {
             return Ok(LoadedModel {
                 inner: LoadedModelInner::SafeTensors(files),
                 format: crate::InputFormat::Safetensors,
+                companion: None,
             });
         }
 
@@ -267,6 +298,7 @@ impl ModelLoader {
             return Ok(LoadedModel {
                 inner: LoadedModelInner::SafeTensors(vec![st]),
                 format: crate::InputFormat::Safetensors,
+                companion: None,
             });
         }
 
@@ -307,6 +339,7 @@ impl ModelLoader {
         Ok(LoadedModel {
             inner: LoadedModelInner::SafeTensors(files),
             format: crate::InputFormat::Safetensors,
+            companion: None,
         })
     }
 
@@ -317,6 +350,7 @@ impl ModelLoader {
         Ok(LoadedModel {
             inner: LoadedModelInner::Gguf(gguf),
             format: crate::InputFormat::Gguf,
+            companion: None,
         })
     }
 }
@@ -337,6 +371,10 @@ enum LoadedModelInner {
 pub struct LoadedModel {
     inner: LoadedModelInner,
     format: crate::InputFormat,
+    /// A second file exposed under a prefix beside `inner` — the VoxCPM2
+    /// AudioVAE, see the module docs. Chained after the primary in every
+    /// enumeration and lookup.
+    companion: Option<Companion>,
 }
 
 impl LoadedModel {
@@ -345,14 +383,21 @@ impl LoadedModel {
         self.format
     }
 
-    /// Get the number of tensors in the model
+    /// Get the number of tensors in the model, the companion's included
     pub fn tensor_count(&self) -> usize {
-        match &self.inner {
+        let primary = match &self.inner {
             LoadedModelInner::SafeTensors(files) => files.iter().map(|f| f.len()).sum(),
             LoadedModelInner::Gguf(gguf) => gguf.len(),
             LoadedModelInner::Tcf(tcf) => tcf.len(),
             LoadedModelInner::Torch(torch) => torch.len(),
-        }
+        };
+        primary + self.companion.as_ref().map_or(0, Companion::tensor_count)
+    }
+
+    /// The companion file's tensors, when the input has one — see the
+    /// module docs.
+    pub fn companion(&self) -> Option<&Companion> {
+        self.companion.as_ref()
     }
 
     /// The file-level structure of a TCF input, or `None` for every other
@@ -373,8 +418,10 @@ impl LoadedModel {
     /// two conversions of one checkpoint differ in 99.5% of their bytes while
     /// decoding identically. Determinism is a TCF format guarantee, so the
     /// order is fixed here, at the one place that enumerates tensors.
+    ///
+    /// A companion's names follow the primary's, prefixed and sorted.
     pub fn tensor_names(&self) -> Vec<String> {
-        match &self.inner {
+        let mut names = match &self.inner {
             LoadedModelInner::SafeTensors(files) => files
                 .iter()
                 .flat_map(|f| {
@@ -389,12 +436,19 @@ impl LoadedModel {
             // `HashMap` exactly as the safetensors reader does.
             LoadedModelInner::Tcf(tcf) => tcf.tensor_names(),
             LoadedModelInner::Torch(torch) => torch.tensor_names(),
+        };
+        if let Some(companion) = &self.companion {
+            names.extend(companion.tensor_names());
         }
+        names
     }
 
     /// Get information about a specific tensor
+    ///
+    /// The primary answers first; a name it does not hold is asked of the
+    /// companion.
     pub fn tensor_info(&self, name: &str) -> Option<UnifiedTensorInfo> {
-        match &self.inner {
+        let primary = match &self.inner {
             LoadedModelInner::SafeTensors(files) => {
                 for file in files {
                     if let Ok(info) = file.tensor_info(name) {
@@ -409,7 +463,8 @@ impl LoadedModel {
                 .map(UnifiedTensorInfo::from_gguf),
             LoadedModelInner::Tcf(tcf) => tcf.tensor_info(name),
             LoadedModelInner::Torch(torch) => torch.tensor_info(name),
-        }
+        };
+        primary.or_else(|| self.companion.as_ref()?.tensor_info(name))
     }
 
     /// Iterate over all tensors with their info
@@ -425,6 +480,15 @@ impl LoadedModel {
     /// view into the file, so the caller owns it and it costs one tensor's
     /// worth of memory for as long as it is held.
     pub fn read_tensor_bytes(&mut self, name: &str) -> Result<Vec<u8>> {
+        // A companion name is the companion's to read: the primary never
+        // holds one, and asking it first would only phrase a not-found.
+        if let Some(bytes) = self
+            .companion
+            .as_mut()
+            .and_then(|companion| companion.read_tensor_bytes(name))
+        {
+            return bytes;
+        }
         match &mut self.inner {
             LoadedModelInner::SafeTensors(files) => {
                 for file in files.iter_mut() {
@@ -636,7 +700,7 @@ pub struct UnifiedTensorInfo {
 }
 
 impl UnifiedTensorInfo {
-    fn from_safetensors(info: &TensorInfo) -> Self {
+    pub(super) fn from_safetensors(info: &TensorInfo) -> Self {
         Self {
             name: info.name.clone(),
             shape: info.shape.clone(),

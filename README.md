@@ -11,7 +11,8 @@ Implemented and tested:
 | SafeTensors input  | Single file, or sharded via `model.safetensors.index.json` |
 | GGUF input         | Read back for re-conversion                                |
 | TCF input          | Read back, verified and decoded, through boostr's reader   |
-| PyTorch input      | One `.pt` / `.pth` / `.bin` state dict, F32 and F64 tensors |
+| PyTorch input      | One `.pt` / `.pth` / `.bin` state dict, F32, F64, I32 and I64 tensors |
+| VoxCPM2 companion  | A `voxcpm2` checkpoint directory folds its `audiovae.pth` into the same GGUF/TCF under `vae.`, F32, with `config.json` as the `voxcpm2.config_json` key |
 | SafeTensors output | Sharded at `--max-shard-size`, with a matching index       |
 | GGUF output        | GGUF v3, one self-contained file                           |
 | dtype cast         | `f32`, `f16`, `bf16`, round-to-nearest-even                |
@@ -27,7 +28,7 @@ Not implemented. Each errors out rather than writing a file:
 | EXL2                | The whole format driver                                                 |
 | ONNX input          | The `.onnx` reader                                                      |
 | Sharded PyTorch     | A `pytorch_model.bin.index.json` walk; one `.bin` per model today       |
-| PyTorch F16, BF16   | boostr's `.pt` reader decodes F32 and F64 only                          |
+| PyTorch F16, BF16   | boostr's `.pt` reader decodes F32, F64, I32 and I64 only                |
 | Python API          | The PyO3 module exports `__version__` only                              |
 
 The `optimize` subcommand parses its flags but every method it accepts is in the second table, so it always errors. It exists for the CLI surface, not for use.
