@@ -3,7 +3,7 @@
 //! Every byte of format knowledge here comes from `boostr::format::tcf`, which
 //! decodes through `tcf-core`'s reference codec. compressr holds no TCF bit
 //! position, tile order or plane order — the same rule that keeps the GGUF
-//! block layouts in boostr (AGENTS.md, MIGRATION.md Section 4.5.3).
+//! block layouts in boostr.
 //!
 //! # Memory
 //!

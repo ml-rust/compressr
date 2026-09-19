@@ -83,8 +83,8 @@ pub fn importance_source_line(matrix: &ImportanceMatrix, check: &ImportanceCheck
 
 /// The one sentence a run states about what an importance matrix changed.
 ///
-/// `format_name` names the output format, spelled as that format's own
-/// section of `AGENTS.md` spells it.
+/// `format_name` names the output format, spelled as the CLI's `--format`
+/// flag spells it (`gguf`, `tcf`, ...).
 pub fn importance_layout_line(format_name: &str) -> String {
     format!(
         "Importance: an importance matrix changes which values the encoder chooses and no bit \
