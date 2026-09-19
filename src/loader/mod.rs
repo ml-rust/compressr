@@ -760,6 +760,14 @@ pub enum UnifiedDType {
     IQ2S,
     IQ4XS,
     IQ1M,
+    /// PrismML-fork sign bits: 128 elements, 18 bytes.
+    Q1_0,
+    /// PrismML-fork 2-bit codes: 64 elements, 18 bytes.
+    Q2_0,
+    /// PrismML-fork 2-bit codes: 128 elements, 34 bytes.
+    PQ2_0,
+    /// PrismML-fork base-3 trits: 128 elements, 28 bytes.
+    PTQ1_0,
     /// Unknown type
     Unknown,
 }
@@ -811,6 +819,10 @@ impl UnifiedDType {
             GgmlType::IQ2S => Self::IQ2S,
             GgmlType::IQ4XS => Self::IQ4XS,
             GgmlType::IQ1M => Self::IQ1M,
+            GgmlType::Q1_0 => Self::Q1_0,
+            GgmlType::Q2_0 => Self::Q2_0,
+            GgmlType::PQ2_0 => Self::PQ2_0,
+            GgmlType::PTQ1_0 => Self::PTQ1_0,
         }
     }
 
@@ -839,6 +851,10 @@ impl UnifiedDType {
                 | Self::IQ2S
                 | Self::IQ4XS
                 | Self::IQ1M
+                | Self::Q1_0
+                | Self::Q2_0
+                | Self::PQ2_0
+                | Self::PTQ1_0
         )
     }
 
@@ -885,6 +901,11 @@ impl UnifiedDType {
             Self::IQ4NL => 4.5,
             // 136 bytes per 256-element super-block: 4.25 bpw, not IQ4_NL's 4.5.
             Self::IQ4XS => 4.25,
+            // Block bytes x 8 / block elements: 18/128, 18/64, 34/128, 28/128.
+            Self::Q1_0 => 1.125,
+            Self::Q2_0 => 2.25,
+            Self::PQ2_0 => 2.125,
+            Self::PTQ1_0 => 1.75,
             Self::I64 => 64.0,
             Self::Unknown => 32.0, // Assume F32
         }
@@ -926,6 +947,10 @@ impl std::fmt::Display for UnifiedDType {
             Self::IQ2S => write!(f, "IQ2_S"),
             Self::IQ4XS => write!(f, "IQ4_XS"),
             Self::IQ1M => write!(f, "IQ1_M"),
+            Self::Q1_0 => write!(f, "Q1_0"),
+            Self::Q2_0 => write!(f, "Q2_0"),
+            Self::PQ2_0 => write!(f, "PQ2_0"),
+            Self::PTQ1_0 => write!(f, "PTQ1_0"),
             Self::Unknown => write!(f, "Unknown"),
         }
     }
