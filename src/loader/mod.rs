@@ -760,13 +760,13 @@ pub enum UnifiedDType {
     IQ2S,
     IQ4XS,
     IQ1M,
-    /// PrismML-fork sign bits: 128 elements, 18 bytes.
+    /// Lowbit sign bits: 128 elements, 18 bytes.
     Q1_0,
-    /// PrismML-fork 2-bit codes: 64 elements, 18 bytes.
+    /// Lowbit 2-bit codes: 64 elements, 18 bytes.
     Q2_0,
-    /// PrismML-fork 2-bit codes: 128 elements, 34 bytes.
+    /// Lowbit 2-bit codes: 128 elements, 34 bytes.
     PQ2_0,
-    /// PrismML-fork base-3 trits: 128 elements, 28 bytes.
+    /// Lowbit base-3 trits: 128 elements, 28 bytes.
     PTQ1_0,
     /// Unknown type
     Unknown,
