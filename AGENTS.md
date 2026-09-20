@@ -27,8 +27,10 @@ This section is the SINGLE source of truth on what works. Everything below assum
 | SafeTensors output | Sharded at `--max-shard-size`, with a matching index       |
 | GGUF output        | GGUF v3, one self-contained file                           |
 | TCF output         | TCF v1, one self-contained file, written through `boostr::tcf`. `--format tcf` takes every `--quantization` method and mix and stores the GGML block streams a GGUF run writes, byte for byte, plus the container's records: the `GGML_REFERENCE` activation contract, a proof vector per tensor, a `fallback_reason` per tensor, and on a `--sensitivity` run the calibration record and per-tensor task delta. NEVER add a TCF-only quantizer or encoding: TCF's payload IS the GGUF payload |
-| dtype cast         | F32, F16, BF16, round-to-nearest-even                      |
+| dtype cast         | F32, F16, BF16, round-to-nearest-even. A block-quantized input tensor is decoded through boostr's reader first, then cast |
 | GGUF quantization  | Q4_0, Q4_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS |
+| Lowbit repack      | `--quantization pq2_0` on a PTQ1_0 GGUF, `--quantization ptq1_0` on a PQ2_0 GGUF: each source tensor's codes and scales move between the two layouts through `boostr::quant::repack`, no value rounded. Tensors already in the target format, float norms and every other type pass through unchanged. PQ2_0 code 3 has no trit, so that direction refuses the block by tensor and index. Neither format is quantized from float weights: a non-GGUF input, or a GGUF holding no source tensor, is refused before any output file is created |
+| GGUF header carry  | A GGUF input's key-value pairs are written whole into a GGUF output (tokenizer, chat template, hyperparameters, `prism.hadamard.*`); only `general.architecture`, `general.file_type` and `general.quantization_version` are the writer's |
 | Sidecar copying    | Tokenizer and config files follow the weights              |
 | GGUF mixed precision | Q4_K_S, Q4_K_M, Q5_K_S, Q5_K_M — llama.cpp's per-tensor allocation, reproduced from `llama_tensor_get_type` |
 | GGUF measured allocation | `--sensitivity` ranks a mix's promotions by measured task damage per element, spending the byte budget llama.cpp's positional rules would have spent on the same checkpoint |
@@ -90,7 +92,7 @@ compressr info ./llama-3-8b --verbose
 
 - The per-tensor plan is computed ONCE and read by both the registration loop and the write loop. If they disagreed by one tensor, every later offset in the file would be wrong with no error raised. A mixed-precision run puts a DIFFERENT block type in that plan per tensor, so the write loop takes its format from the plan and never from the configuration.
 - `general.file_type` is llama.cpp's `llama_ftype` enum, NOT a GGML type id. A reader takes each tensor's format from the tensor directory and reads this key only to name the file, so a wrong value mislabels the model everywhere it is displayed.
-- GGUF stores dimensions REVERSED, so the row length `ne[0]` is the LAST dimension of a standard-order shape. A rank-1 tensor or a row that is not a whole number of blocks is stored as F32, as llama.cpp does.
+- GGUF stores dimensions REVERSED, so the row length `ne[0]` is the LAST dimension of a standard-order shape. The loader reverses a GGUF input's dimensions into standard order and the writer reverses them back. A rank-1 tensor or a row that is not a whole number of blocks is stored as F32, as llama.cpp does.
 - `ConversionConfig::validate` rejects every unwritable configuration BEFORE a file is opened. A mismatch caught by the writer instead aborts mid-loop and leaves a truncated file.
 - SafeTensors headers are padded with spaces to a multiple of 8 bytes, so the data block starts 8-byte aligned and a reader can map an F32 tensor in place.
 - The loader COPIES tensor bytes out of the file. NEVER describe it as zero-copy or memory-mapped.

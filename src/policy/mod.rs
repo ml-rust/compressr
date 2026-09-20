@@ -81,6 +81,12 @@ use crate::quantization::QuantType;
 pub enum TensorPlan {
     /// Quantize into this type
     Quantize(QuantType),
+    /// Repack an already-quantized tensor's codes into this type
+    ///
+    /// Only the lowbit pair: PTQ1_0 and PQ2_0 store the same codes under the
+    /// same block size, so the move is byte-level and rounds nothing. The
+    /// source is the tensor's own dtype, see [`repack_source`].
+    Repack(QuantType),
     /// Quantization was requested but is not possible: store as F32
     StoreF32(FallbackReason),
     /// Store as the conversion's own dtype, unquantized
@@ -135,9 +141,23 @@ pub fn tcf_fallback_reason(reason: FallbackReason) -> boostr::tcf::FallbackReaso
     }
 }
 
+/// The stored dtype a repack-only type is produced from, or `None` when the
+/// type is quantized from float weights.
+pub fn repack_source(target: QuantType) -> Option<UnifiedDType> {
+    match target {
+        QuantType::PQ2_0 => Some(UnifiedDType::PTQ1_0),
+        QuantType::PTQ1_0 => Some(UnifiedDType::PQ2_0),
+        _ => None,
+    }
+}
+
 /// Decide what to do with one tensor.
 ///
 /// `shape` is in standard order, so the row length is its LAST dimension.
+///
+/// A repack-only type moves every tensor stored in its source format and
+/// passes every other tensor through unchanged: the float norms, the tensors
+/// already in the target format, and anything else the file holds.
 pub fn plan_tensor(
     shape: &[usize],
     dtype: UnifiedDType,
@@ -146,6 +166,14 @@ pub fn plan_tensor(
     let Some(quant_type) = quant_type else {
         return TensorPlan::StoreAsIs;
     };
+
+    if let Some(source) = repack_source(quant_type) {
+        return if dtype == source {
+            TensorPlan::Repack(quant_type)
+        } else {
+            TensorPlan::StoreAsIs
+        };
+    }
 
     if !dtype.is_float() {
         return TensorPlan::StoreAsIs;
@@ -167,6 +195,8 @@ pub fn plan_tensor(
 pub struct PlanCounts {
     /// Tensors actually quantized
     pub quantized: usize,
+    /// Tensors repacked between the two lowbit layouts
+    pub repacked: usize,
     /// Float tensors stored as F32 because their rank is below 2
     pub fallback_rank: usize,
     /// Float tensors stored as F32 because their row length is not block-aligned
@@ -185,6 +215,7 @@ impl PlanCounts {
     pub fn record(&mut self, plan: TensorPlan) {
         match plan {
             TensorPlan::Quantize(_) => self.quantized += 1,
+            TensorPlan::Repack(_) => self.repacked += 1,
             TensorPlan::StoreF32(FallbackReason::Rank) => self.fallback_rank += 1,
             TensorPlan::StoreF32(FallbackReason::RowLength) => self.fallback_row_length += 1,
             TensorPlan::StoreF32(FallbackReason::SourceDtype)
@@ -199,9 +230,10 @@ impl std::fmt::Display for PlanCounts {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} tensors quantized, {} stored unquantized ({} rank < 2, {} row length not \
-             block-aligned, {} source dtype or values), {} non-float passed through",
+            "{} tensors quantized, {} repacked, {} stored unquantized ({} rank < 2, {} row \
+             length not block-aligned, {} source dtype or values), {} non-float passed through",
             self.quantized,
+            self.repacked,
             self.fallback_rank + self.fallback_row_length + self.fallback_source,
             self.fallback_rank,
             self.fallback_row_length,
@@ -253,6 +285,29 @@ mod tests {
         );
     }
 
+    /// A repack-only type moves its source format and nothing else.
+    #[test]
+    fn test_repack_type_moves_its_source_and_passes_the_rest_through() {
+        let target = Some(QuantType::PQ2_0);
+        assert_eq!(
+            plan_tensor(&[64, 5120], UnifiedDType::PTQ1_0, target),
+            TensorPlan::Repack(QuantType::PQ2_0)
+        );
+        // Already in the target format, a float norm, and another block type.
+        for dtype in [UnifiedDType::PQ2_0, UnifiedDType::F32, UnifiedDType::Q8_0] {
+            assert_eq!(
+                plan_tensor(&[64, 5120], dtype, target),
+                TensorPlan::StoreAsIs,
+                "{dtype}"
+            );
+        }
+        assert_eq!(
+            plan_tensor(&[64, 5120], UnifiedDType::PQ2_0, Some(QuantType::PTQ1_0)),
+            TensorPlan::Repack(QuantType::PTQ1_0)
+        );
+        assert_eq!(repack_source(QuantType::Q4K), None);
+    }
+
     #[test]
     fn test_plan_counts_summary() {
         let mut counts = PlanCounts::default();
@@ -265,6 +320,7 @@ mod tests {
             counts,
             PlanCounts {
                 quantized: 1,
+                repacked: 0,
                 fallback_rank: 1,
                 fallback_row_length: 1,
                 fallback_source: 0,

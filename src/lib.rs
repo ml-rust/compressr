@@ -15,6 +15,13 @@
 //! - Element-type casts between F32, F16 and BF16, round-to-nearest-even
 //! - GGUF block quantization: Q4_0, Q4_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K,
 //!   IQ4_NL, IQ4_XS
+//! - Lowbit repack: `--quantization pq2_0` on a PTQ1_0 GGUF and
+//!   `--quantization ptq1_0` on a PQ2_0 GGUF move each tensor's codes between
+//!   the two layouts through boostr, byte for byte in value; every other
+//!   tensor passes through, and the input header is carried whole. Neither
+//!   format is quantized from float weights.
+//! - A `--dtype` cast on a GGUF input decodes every block-quantized tensor
+//!   through boostr's reader before casting it
 //! - GGUF mixed precision: Q4_K_S, Q4_K_M, Q5_K_S and Q5_K_M, which assign a
 //!   different block format per tensor by role and by layer, reproducing
 //!   llama.cpp's `llama_tensor_get_type`. The Q2_K/Q3_K mixes and the I-quant
@@ -120,11 +127,11 @@ pub use loader::{
 pub use policy::{
     assign_mix, assign_mix_measured, assign_mix_reported, check_measurement_encoding,
     mix_model_facts, parse_gguf_mix, parse_sensitivity, partition_components, plan_format_label,
-    plan_mixed_tensor, plan_tensor, principal_component, quant_type_label, select_bumped_measured,
-    split_component, use_more_bits, BumpCandidate, ComponentAllocation, FallbackReason,
-    FormatUsage, GgufMix, LadderChoice, LadderMenu, LadderOption, LadderOutcome, LadderReport,
-    LayerCountSource, MeasuredBump, MeasuredMixAllocation, MeasuredOption, MeasuredTensor,
-    MixAllocation, MixEntry, MixModel, MixReport, PlanCounts, SensitivityBaseline,
+    plan_mixed_tensor, plan_tensor, principal_component, quant_type_label, repack_source,
+    select_bumped_measured, split_component, use_more_bits, BumpCandidate, ComponentAllocation,
+    FallbackReason, FormatUsage, GgufMix, LadderChoice, LadderMenu, LadderOption, LadderOutcome,
+    LadderReport, LayerCountSource, MeasuredBump, MeasuredMixAllocation, MeasuredOption,
+    MeasuredTensor, MixAllocation, MixEntry, MixModel, MixReport, PlanCounts, SensitivityBaseline,
     SensitivityMeasurement, TensorPlan, TensorRole, AUDIO_VAE_PREFIX, GGUF_MIX_NAMES,
     HF_TOKENIZER_JSON_KEY, UNLAYERED_COMPONENT, VOXCPM2_CONFIG_JSON_KEY,
 };
@@ -423,6 +430,19 @@ impl ConversionConfig {
             policy::check_measurement_encoding(mix, measurement)?;
         }
         if self.output_format == OutputFormat::Tcf {
+            // A repack moves already-quantized codes, and TCF takes
+            // full-precision sources only.
+            if self
+                .quantization
+                .as_ref()
+                .is_some_and(|q| q.method.is_repack_only())
+            {
+                bail!(
+                    "--format tcf cannot take a lowbit repack: PQ2_0 and PTQ1_0 are produced \
+                     by repacking a lowbit GGUF, and TCF is written from a full-precision \
+                     source only. Use --format gguf."
+                );
+            }
             // A TCF run stores GGML block encodings, planned and quantized as
             // a GGUF run is, so it needs the quantization a GGUF run needs.
             if self.quantization.is_none() {
@@ -504,11 +524,13 @@ impl ConversionConfig {
 
     /// The element type a tensor of `source` dtype is stored as.
     ///
-    /// Only float tensors follow the cast target. Integer buffers, boolean
-    /// masks and already-quantized blocks keep their own type.
+    /// Float tensors follow the cast target, and so do block-quantized
+    /// tensors: a cast names the element type every weight is stored as, so
+    /// blocks are decoded through boostr's reader and then cast. Integer
+    /// buffers and boolean masks keep their own type.
     pub fn stored_dtype(&self, source: UnifiedDType) -> UnifiedDType {
         match self.target_dtype {
-            Some(target) if source.is_float() => target,
+            Some(target) if source.is_float() || source.is_quantized() => target,
             _ => source,
         }
     }
@@ -687,6 +709,27 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
         );
     }
 
+    // A repack moves codes the checkpoint already holds. Producing those
+    // codes from float weights is the training-aware pipeline that made the
+    // checkpoint, which compressr does not carry, so any other input is
+    // refused here, before any output file exists.
+    if let Some(quant) = config
+        .quantization
+        .as_ref()
+        .filter(|q| q.method.is_repack_only())
+    {
+        if model.format() != InputFormat::Gguf {
+            bail!(
+                "--quantization {:?} repacks a lowbit GGUF, and '{}' is {:?}. Quantizing \
+                 float weights to {:?} is not a conversion compressr performs.",
+                quant.method,
+                config.input_path,
+                model.format(),
+                quant.method
+            );
+        }
+    }
+
     let tensor_count = model.tensor_count();
     let input_size = model.total_size_bytes();
 
@@ -826,6 +869,26 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
             .collect(),
     };
 
+    // A repack that moves nothing would write the input back under a new
+    // file type. The source format is the one the target is repacked from.
+    if let Some(target) = quant_type.filter(|qt| qt.is_repack_only()) {
+        if !plans
+            .iter()
+            .any(|plan| matches!(plan, TensorPlan::Repack(_)))
+        {
+            let source = policy::repack_source(target)
+                .context("Internal error: a repack-only type has no source format")?;
+            bail!(
+                "--quantization {:?} repacks {} tensors, and '{}' holds none. Quantizing \
+                 float weights to {:?} is not a conversion compressr performs.",
+                target,
+                source,
+                config.input_path,
+                target
+            );
+        }
+    }
+
     // Configure writer based on format
     if config.output_format == OutputFormat::Gguf {
         let input_path = Path::new(&config.input_path);
@@ -838,10 +901,21 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
         let mut gguf_writer = GgufFormatWriter::new();
         gguf_writer.set_architecture(arch);
 
+        // A GGUF input's header comes through whole: tokenizer, chat
+        // template, hyperparameters and producer keys. The keys the writer
+        // owns are set below; every derived key defers to a carried one.
+        if let Some(header) = model.gguf_metadata() {
+            for (key, value) in formats::carry_gguf_metadata(header)? {
+                gguf_writer.add_metadata(&key, value);
+            }
+        }
+
         // The name is the checkpoint's own name, not its architecture. With no
         // checkpoint directory to take it from, no name is written.
-        if let Some(name) = policy::model_name(input_path) {
-            gguf_writer.set_name(&name);
+        if !gguf_writer.has_metadata("general.name") {
+            if let Some(name) = policy::model_name(input_path) {
+                gguf_writer.set_name(&name);
+            }
         }
 
         // A VoxCPM2 GGUF carries its `config.json` and `tokenizer.json`
@@ -849,38 +923,37 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
         // with nothing beside it. Only this architecture: no other loader
         // reads the keys.
         if policy::is_voxcpm2(arch) {
-            if let Some(text) = policy::voxcpm2_config_json(input_path)? {
-                gguf_writer.add_metadata(
+            let sidecars = [
+                (
                     policy::VOXCPM2_CONFIG_JSON_KEY,
-                    formats::GgufValue::String(text),
-                );
-            }
-            if let Some(text) = policy::hf_tokenizer_json(input_path)? {
-                gguf_writer.add_metadata(
+                    policy::voxcpm2_config_json(input_path)?,
+                ),
+                (
                     policy::HF_TOKENIZER_JSON_KEY,
-                    formats::GgufValue::String(text),
-                );
+                    policy::hf_tokenizer_json(input_path)?,
+                ),
+            ];
+            for (key, text) in sidecars {
+                if let Some(text) = text {
+                    if !gguf_writer.has_metadata(key) {
+                        gguf_writer.add_metadata(key, formats::GgufValue::String(text));
+                    }
+                }
             }
         }
 
         // Add architecture-specific metadata
-        if let Some(vocab_size) = metadata.vocab_size {
-            gguf_writer.add_metadata(
-                &format!("{}.vocab_size", arch),
-                formats::GgufValue::Uint32(vocab_size as u32),
-            );
-        }
-        if let Some(hidden_size) = metadata.hidden_size {
-            gguf_writer.add_metadata(
-                &format!("{}.embedding_length", arch),
-                formats::GgufValue::Uint32(hidden_size as u32),
-            );
-        }
-        if let Some(num_layers) = metadata.num_layers {
-            gguf_writer.add_metadata(
-                &format!("{}.block_count", arch),
-                formats::GgufValue::Uint32(num_layers as u32),
-            );
+        let derived = [
+            (format!("{}.vocab_size", arch), metadata.vocab_size),
+            (format!("{}.embedding_length", arch), metadata.hidden_size),
+            (format!("{}.block_count", arch), metadata.num_layers),
+        ];
+        for (key, value) in derived {
+            if let Some(value) = value {
+                if !gguf_writer.has_metadata(&key) {
+                    gguf_writer.add_metadata(&key, formats::GgufValue::Uint32(value as u32));
+                }
+            }
         }
 
         // `general.file_type` names the file, and only that: a reader takes
@@ -912,6 +985,10 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
                 // `llama_ftype` value: see `LLAMA_FTYPE_MOSTLY_IQ4_XS` in
                 // llama.cpp's `llama.h`.
                 QuantType::IQ4XS => 30,
+                // llama.cpp names no ftype for the lowbit formats. These are
+                // the values the shipped lowbit files carry.
+                QuantType::PQ2_0 => 141,
+                QuantType::PTQ1_0 => 143,
                 _ => 1, // F16 default
             };
             gguf_writer.set_file_type(file_type);
@@ -981,7 +1058,7 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
     log::info!("Registering tensors...");
     for ((name, info), plan) in tensor_info.iter().zip(&plans) {
         match *plan {
-            TensorPlan::Quantize(qt) => {
+            TensorPlan::Quantize(qt) | TensorPlan::Repack(qt) => {
                 writer.register_tensor(name, &info.shape, info.dtype, Some(qt))?
             }
             // A tensor that cannot be quantized is stored as F32, so that is
@@ -1045,6 +1122,11 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
                 )?;
                 quantized.packed_data
             }
+            // A byte-level move between the two lowbit layouts; boostr owns
+            // both and rounds nothing.
+            TensorPlan::Repack(target) => {
+                quantization::repack_lowbit(name, &tensor_data, info.dtype, target, info.numel)?
+            }
             TensorPlan::StoreF32(_) => {
                 cast::cast_bytes(&tensor_data, info.dtype, UnifiedDType::F32)
                     .with_context(|| format!("Failed to cast tensor '{}' to f32", name))?
@@ -1052,8 +1134,17 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
             TensorPlan::StoreAsIs => {
                 let stored = config.stored_dtype(info.dtype);
                 if stored == info.dtype {
-                    // Non-float tensors land here and pass through byte-for-byte.
+                    // Non-float tensors, and every tensor of a run with no
+                    // cast target, pass through byte-for-byte.
                     tensor_data
+                } else if info.dtype.is_quantized() {
+                    // A cast names the element type every weight is stored
+                    // as: blocks are decoded through boostr's reader first.
+                    let f32_bytes =
+                        cast::dequant_to_f32_bytes(&tensor_data, info.dtype, info.numel)
+                            .with_context(|| format!("Failed to decode tensor '{}'", name))?;
+                    cast::cast_bytes(&f32_bytes, UnifiedDType::F32, stored)
+                        .with_context(|| format!("Failed to cast tensor '{}'", name))?
                 } else {
                     cast::cast_bytes(&tensor_data, info.dtype, stored)
                         .with_context(|| format!("Failed to cast tensor '{}'", name))?
@@ -1563,7 +1654,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stored_dtype_casts_floats_and_passes_others_through() {
+    fn test_stored_dtype_casts_floats_and_blocks_and_passes_others_through() {
         let config =
             ConversionConfig::new("input/".into(), "out/".into(), OutputFormat::Safetensors)
                 .with_target_dtype(UnifiedDType::BF16);
@@ -1575,7 +1666,12 @@ mod tests {
         assert_eq!(config.stored_dtype(UnifiedDType::I64), UnifiedDType::I64);
         assert_eq!(config.stored_dtype(UnifiedDType::U8), UnifiedDType::U8);
         assert_eq!(config.stored_dtype(UnifiedDType::Bool), UnifiedDType::Bool);
-        assert_eq!(config.stored_dtype(UnifiedDType::Q4K), UnifiedDType::Q4K);
+        // A block-quantized source is decoded and cast like a float.
+        assert_eq!(config.stored_dtype(UnifiedDType::Q4K), UnifiedDType::BF16);
+        assert_eq!(
+            config.stored_dtype(UnifiedDType::PTQ1_0),
+            UnifiedDType::BF16
+        );
     }
 
     #[test]

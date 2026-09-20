@@ -513,6 +513,14 @@ impl LoadedModel {
         }
     }
 
+    /// The GGUF header's key-value pairs, or `None` for every other format.
+    pub fn gguf_metadata(&self) -> Option<&boostr::format::gguf::GgufMetadata> {
+        match &self.inner {
+            LoadedModelInner::Gguf(gguf) => Some(gguf.metadata()),
+            _ => None,
+        }
+    }
+
     /// Get model metadata (tries to extract from GGUF or infer from tensor names)
     pub fn metadata(&self) -> ModelMetadata {
         match &self.inner {
@@ -711,10 +719,15 @@ impl UnifiedTensorInfo {
         }
     }
 
+    /// GGUF lists dimensions innermost first, so the file's `ne[0]` is the
+    /// LAST dimension of the standard-order shape every other loader reports
+    /// and the writers reverse again on output.
     fn from_gguf(info: &GgufTensorInfo) -> Self {
+        let mut shape = info.shape.clone();
+        shape.reverse();
         Self {
             name: info.name.clone(),
-            shape: info.shape.clone(),
+            shape,
             dtype: UnifiedDType::from_ggml(info.ggml_type),
             size_bytes: info.size_bytes(),
             numel: info.numel(),

@@ -15,8 +15,9 @@ Implemented and tested:
 | VoxCPM2 companion  | A `voxcpm2` checkpoint directory folds its `audiovae.pth` into the same GGUF/TCF under `vae.`, F32, with `config.json` as the `voxcpm2.config_json` key and `tokenizer.json` as the `tokenizer.huggingface.json` key |
 | SafeTensors output | Sharded at `--max-shard-size`, with a matching index       |
 | GGUF output        | GGUF v3, one self-contained file                           |
-| dtype cast         | `f32`, `f16`, `bf16`, round-to-nearest-even                |
-| GGUF quantization  | `q4_0`, `q4_1`, `q8_0`, `q4_k`, `q5_k`, `q6_k`             |
+| dtype cast         | `f32`, `f16`, `bf16`, round-to-nearest-even; block-quantized input tensors are decoded through boostr first |
+| GGUF quantization  | `q4_0`, `q4_1`, `q8_0`, `q2_k`, `q3_k`, `q4_k`, `q5_k`, `q6_k`, `iq4_nl`, `iq4_xs` |
+| Lowbit repack      | `pq2_0` from a PTQ1_0 GGUF, `ptq1_0` from a PQ2_0 GGUF: codes and scales move between the two layouts, nothing is rounded, the header is carried whole |
 | Sidecar copying    | Tokenizer and config files follow the weights              |
 
 Not implemented. Each errors out rather than writing a file:
@@ -59,13 +60,22 @@ GGUF records the architecture in `general.architecture`, and every consumer keys
 compressr convert ./voxcpm2 --format gguf --quantization q4_k --arch voxcpm2
 ```
 
+### Repack a lowbit GGUF
+
+```bash
+compressr convert model-PTQ1_0.gguf --format gguf --quantization pq2_0
+compressr convert model-PQ2_0.gguf --format gguf --quantization ptq1_0
+```
+
+PTQ1_0 and PQ2_0 store the same ternary codes in two block layouts. A repack moves each source tensor's codes and scales through boostr and rounds nothing; tensors already in the target format, float norms and every other type pass through. A PQ2_0 block holding code 3 (`2 * d`) has no trit, so `ptq1_0` refuses it by tensor and block. Neither format is quantized from float weights: a SafeTensors or F16 input is refused.
+
 ### Cast the element type
 
 ```bash
 compressr convert ./llama-3-8b --format safetensors --dtype bf16
 ```
 
-Only float tensors are cast. Integer buffers, boolean masks and already-quantized blocks pass through byte for byte. The output `config.json` has its `torch_dtype` rewritten to match the weights beside it.
+Float tensors are cast. Block-quantized tensors of a GGUF input are decoded through boostr's reader, then cast, so a lowbit GGUF becomes an F16 GGUF or SafeTensors checkpoint. Integer buffers and boolean masks pass through byte for byte. The output `config.json` has its `torch_dtype` rewritten to match the weights beside it.
 
 `--dtype` and `--quantization` are mutually exclusive. Quantization already fixes the stored representation.
 

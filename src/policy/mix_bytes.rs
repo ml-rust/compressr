@@ -57,7 +57,7 @@ pub fn format_bytes(shape: &[usize], dtype: UnifiedDType, elements: u64, format:
 /// GGUF writer's own block table rather than from a nominal bit width.
 pub fn plan_bytes(plan: TensorPlan, elements: u64, dtype: UnifiedDType) -> u64 {
     match plan {
-        TensorPlan::Quantize(format) => {
+        TensorPlan::Quantize(format) | TensorPlan::Repack(format) => {
             GgmlType::from_quant_type(format).tensor_bytes(elements as usize) as u64
         }
         // An unquantizable tensor is stored as F32, which is what the

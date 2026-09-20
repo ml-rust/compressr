@@ -57,23 +57,30 @@ impl QuantizedTensor {
     ///
     /// Dispatches to boostr's dequantization functions where available.
     pub fn dequantize(&self) -> Vec<f32> {
-        match self.quant_type {
-            QuantType::NF4 => self.dequantize_nf4_boostr(),
-            QuantType::Q4_0 => self.dequantize_ggml(32, 18, dequant::dequant_q4_0),
-            QuantType::Q8_0 => self.dequantize_ggml(32, 34, dequant::dequant_q8_0),
-            QuantType::Q4_1 => self.dequantize_ggml(32, 20, dequant::dequant_q4_1),
-            QuantType::Q2K => self.dequantize_ggml(256, 84, dequant::dequant_q2k),
-            QuantType::Q3K => self.dequantize_ggml(256, 110, dequant::dequant_q3k),
-            QuantType::Q4K => self.dequantize_ggml(256, 144, dequant::dequant_q4k),
-            QuantType::Q5K => self.dequantize_ggml(256, 176, dequant::dequant_q5k),
-            QuantType::Q6K => self.dequantize_ggml(256, 210, dequant::dequant_q6k),
-            QuantType::IQ4NL => self.dequantize_ggml(32, 18, dequant_iq4::dequant_iq4_nl),
-            QuantType::IQ4XS => self.dequantize_ggml(256, 136, dequant_iq4::dequant_iq4_xs),
+        let kernel: fn(&[u8], &mut [f32]) = match self.quant_type {
+            QuantType::NF4 => return self.dequantize_nf4_boostr(),
+            QuantType::Q4_0 => dequant::dequant_q4_0,
+            QuantType::Q8_0 => dequant::dequant_q8_0,
+            QuantType::Q4_1 => dequant::dequant_q4_1,
+            QuantType::Q2K => dequant::dequant_q2k,
+            QuantType::Q3K => dequant::dequant_q3k,
+            QuantType::Q4K => dequant::dequant_q4k,
+            QuantType::Q5K => dequant::dequant_q5k,
+            QuantType::Q6K => dequant::dequant_q6k,
+            QuantType::IQ4NL => dequant_iq4::dequant_iq4_nl,
+            QuantType::IQ4XS => dequant_iq4::dequant_iq4_xs,
+            QuantType::PQ2_0 => dequant::dequant_pq2_0,
+            QuantType::PTQ1_0 => dequant::dequant_ptq1_0,
             _ => {
                 log::warn!("Dequantization not implemented for {:?}", self.quant_type);
-                vec![0.0; self.original_numel]
+                return vec![0.0; self.original_numel];
             }
-        }
+        };
+        let Some(format) = self.quant_type.ggml_format() else {
+            log::warn!("Dequantization not implemented for {:?}", self.quant_type);
+            return vec![0.0; self.original_numel];
+        };
+        self.dequantize_ggml(format.block_size(), format.block_bytes(), kernel)
     }
 
     /// Compute quantization error (RMSE)

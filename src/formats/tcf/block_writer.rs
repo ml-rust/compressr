@@ -248,7 +248,9 @@ impl TcfBlockFormatWriter {
                 boostr::tcf::FallbackReason::TaskSensitivity
             }
             Some(TensorPlan::Quantize(_)) => boostr::tcf::FallbackReason::ProducerPolicy,
-            Some(TensorPlan::StoreAsIs) | None => boostr::tcf::FallbackReason::UnsupportedEncoding,
+            Some(TensorPlan::StoreAsIs) | Some(TensorPlan::Repack(_)) | None => {
+                boostr::tcf::FallbackReason::UnsupportedEncoding
+            }
         }
     }
 

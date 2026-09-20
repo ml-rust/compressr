@@ -10,6 +10,7 @@
 
 pub mod checkpoint;
 pub mod gguf;
+pub mod gguf_metadata;
 pub mod safetensors;
 pub mod shard;
 pub mod tcf;
@@ -32,6 +33,7 @@ pub use safetensors::{
     TensorEntry,
 };
 
+pub use gguf_metadata::{carry_gguf_metadata, WRITER_OWNED_KEYS};
 pub use tcf::TcfBlockFormatWriter;
 
 use anyhow::{bail, Context, Result};
@@ -128,6 +130,11 @@ impl GgufFormatWriter {
     /// Add custom metadata
     pub fn add_metadata(&mut self, key: &str, value: GgufValue) {
         self.pending_metadata.push((key.into(), value));
+    }
+
+    /// Whether `key` is already queued for the header.
+    pub fn has_metadata(&self, key: &str) -> bool {
+        self.pending_metadata.iter().any(|(k, _)| k == key)
     }
 }
 
@@ -523,6 +530,19 @@ fn ggml_type_for(dtype: UnifiedDType, name: &str) -> Result<GgmlType> {
         UnifiedDType::Q5K => Ok(GgmlType::Q5K),
         UnifiedDType::Q6K => Ok(GgmlType::Q6K),
         UnifiedDType::Q8K => Ok(GgmlType::Q8K),
+        UnifiedDType::IQ2XXS => Ok(GgmlType::Iq2Xxs),
+        UnifiedDType::IQ2XS => Ok(GgmlType::Iq2Xs),
+        UnifiedDType::IQ3XXS => Ok(GgmlType::Iq3Xxs),
+        UnifiedDType::IQ1S => Ok(GgmlType::Iq1S),
+        UnifiedDType::IQ4NL => Ok(GgmlType::Iq4Nl),
+        UnifiedDType::IQ3S => Ok(GgmlType::Iq3S),
+        UnifiedDType::IQ2S => Ok(GgmlType::Iq2S),
+        UnifiedDType::IQ4XS => Ok(GgmlType::Iq4Xs),
+        UnifiedDType::IQ1M => Ok(GgmlType::Iq1M),
+        UnifiedDType::Q1_0 => Ok(GgmlType::Q1_0),
+        UnifiedDType::Q2_0 => Ok(GgmlType::Q2_0),
+        UnifiedDType::PQ2_0 => Ok(GgmlType::Pq2_0),
+        UnifiedDType::PTQ1_0 => Ok(GgmlType::Ptq1_0),
         other => anyhow::bail!(
             "Tensor '{}' has dtype {} which has no GGUF equivalent",
             name,

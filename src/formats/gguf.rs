@@ -18,6 +18,7 @@ use std::io::{BufWriter, Seek, Write};
 use std::path::Path;
 
 use crate::quantization::QuantType;
+use boostr::quant::QuantFormat;
 
 // ============================================================================
 // GGUF Constants
@@ -94,6 +95,14 @@ pub enum GgmlType {
     F64 = 28,
     Iq1M = 29,
     Bf16 = 30,
+    /// Lowbit sign bits; not assigned by upstream ggml, the id the files carry
+    Q1_0 = 41,
+    /// Lowbit 2-bit at group 64; not assigned by upstream ggml
+    Q2_0 = 42,
+    /// Lowbit 2-bit at group 128; not assigned by upstream ggml
+    Pq2_0 = 142,
+    /// Lowbit ternary at group 128; not assigned by upstream ggml
+    Ptq1_0 = 143,
 }
 
 impl GgmlType {
@@ -129,6 +138,11 @@ impl GgmlType {
             | GgmlType::Iq2S
             | GgmlType::Iq4Xs
             | GgmlType::Iq1M => 256,
+            // The lowbit geometry is boostr's, read rather than restated.
+            GgmlType::Q1_0 => QuantFormat::Q1_0.block_size(),
+            GgmlType::Q2_0 => QuantFormat::Q2_0.block_size(),
+            GgmlType::Pq2_0 => QuantFormat::PQ2_0.block_size(),
+            GgmlType::Ptq1_0 => QuantFormat::PTQ1_0.block_size(),
         }
     }
 
@@ -164,6 +178,10 @@ impl GgmlType {
             GgmlType::I64 => 8,
             GgmlType::F64 => 8,
             GgmlType::Iq1M => 56,
+            GgmlType::Q1_0 => QuantFormat::Q1_0.block_bytes(),
+            GgmlType::Q2_0 => QuantFormat::Q2_0.block_bytes(),
+            GgmlType::Pq2_0 => QuantFormat::PQ2_0.block_bytes(),
+            GgmlType::Ptq1_0 => QuantFormat::PTQ1_0.block_bytes(),
         }
     }
 
@@ -190,6 +208,8 @@ impl GgmlType {
             QuantType::Q6K => GgmlType::Q6K,
             QuantType::IQ4NL => GgmlType::Iq4Nl,
             QuantType::IQ4XS => GgmlType::Iq4Xs,
+            QuantType::PQ2_0 => GgmlType::Pq2_0,
+            QuantType::PTQ1_0 => GgmlType::Ptq1_0,
             QuantType::FP8 => GgmlType::F16, // FP8 stored as F16 in GGUF (closest supported)
             QuantType::NF4 => GgmlType::Q4_0, // NF4 approximated as Q4_0 in GGUF
             QuantType::FP4 => GgmlType::Q4_0, // FP4 approximated as Q4_0 in GGUF
@@ -1236,6 +1256,13 @@ mod tests {
 
         assert_eq!(GgmlType::Q4K.block_size(), 256);
         assert_eq!(GgmlType::Q4K.bytes_per_block(), 144);
+
+        assert_eq!(GgmlType::Pq2_0 as u32, 142);
+        assert_eq!(GgmlType::Ptq1_0 as u32, 143);
+        assert_eq!(GgmlType::Pq2_0.block_size(), 128);
+        assert_eq!(GgmlType::Pq2_0.bytes_per_block(), 34);
+        assert_eq!(GgmlType::Ptq1_0.block_size(), 128);
+        assert_eq!(GgmlType::Ptq1_0.bytes_per_block(), 28);
     }
 
     #[test]

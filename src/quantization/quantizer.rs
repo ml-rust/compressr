@@ -147,6 +147,18 @@ impl Quantizer {
                     quant_type
                 )
             }
+            // The lowbit codes come from the training-aware pipeline that
+            // made the checkpoint; compressr only repacks them between the
+            // two layouts, and `convert` routes a lowbit source there.
+            QuantType::PQ2_0 | QuantType::PTQ1_0 => {
+                anyhow::bail!(
+                    "{:?} cannot be produced from {} weights: compressr has no quantizer \
+                     for the lowbit formats, only a repack between PTQ1_0 and PQ2_0. Give \
+                     it a GGUF whose tensors are already in the other lowbit format.",
+                    quant_type,
+                    dtype
+                )
+            }
             QuantType::Q4_0 => {
                 quantize_gguf(&f32_data, shape, QuantFormat::Q4_0, QuantType::Q4_0, None)
             }

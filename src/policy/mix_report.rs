@@ -142,7 +142,9 @@ impl std::fmt::Display for MixReport {
 /// already resolved from the conversion's cast target.
 pub fn plan_format_label(plan: TensorPlan, stored: UnifiedDType) -> String {
     match plan {
-        TensorPlan::Quantize(quant_type) => quant_type_label(quant_type).to_string(),
+        TensorPlan::Quantize(quant_type) | TensorPlan::Repack(quant_type) => {
+            quant_type_label(quant_type).to_string()
+        }
         TensorPlan::StoreF32(_) => "F32".to_string(),
         TensorPlan::StoreAsIs => stored.to_string(),
     }
@@ -167,6 +169,8 @@ pub fn quant_type_label(quant_type: QuantType) -> &'static str {
         QuantType::Q6K => "Q6_K",
         QuantType::IQ4NL => "IQ4_NL",
         QuantType::IQ4XS => "IQ4_XS",
+        QuantType::PQ2_0 => "PQ2_0",
+        QuantType::PTQ1_0 => "PTQ1_0",
         QuantType::NF4 => "NF4",
         QuantType::FP4 => "FP4",
         QuantType::FP8 => "FP8",

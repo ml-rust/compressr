@@ -18,6 +18,12 @@
 //! # Cast an fp32 checkpoint to bf16, keeping it loadable
 //! compressr convert model/ --format safetensors --dtype bf16
 //!
+//! # Repack a PTQ1_0 GGUF into PQ2_0 (or a PQ2_0 one into PTQ1_0)
+//! compressr convert model-PTQ1_0.gguf --format gguf --quantization pq2_0
+//!
+//! # Decode a lowbit GGUF to F16 through boostr's reader
+//! compressr convert model-PTQ1_0.gguf --format gguf --dtype f16
+//!
 //! # Quantize a full-precision checkpoint into TCF v1 carrying GGML block
 //! # encodings: the same bytes a GGUF q4_k_m run writes, in TCF's container
 //! compressr convert model/ --format tcf --quantization q4_k_m
@@ -117,15 +123,21 @@ enum Commands {
         /// different tensors by role and by layer. GGUF output, or TCF output
         /// carrying the same GGML block encodings.
         ///
+        /// pq2_0 and ptq1_0 repack a lowbit GGUF between the two layouts:
+        /// pq2_0 takes a PTQ1_0 input, ptq1_0 takes a PQ2_0 input. Every other
+        /// tensor passes through and the header is carried whole. Neither is
+        /// quantized from float weights.
+        ///
         /// Mutually exclusive with --dtype.
         #[arg(long, value_name = "LEVEL", conflicts_with = "dtype")]
         quantization: Option<String>,
 
         /// Cast every float tensor to this element type (f32, f16, bf16)
         ///
-        /// Non-float tensors pass through untouched. This is a change of
-        /// element type, not quantization, so it cannot be combined with
-        /// --quantization.
+        /// A block-quantized tensor is decoded through boostr's reader and
+        /// then cast. Integer and boolean tensors pass through untouched.
+        /// This is a change of element type, not quantization, so it cannot
+        /// be combined with --quantization.
         #[arg(long, value_name = "DTYPE", conflicts_with = "quantization")]
         dtype: Option<String>,
 
@@ -440,7 +452,9 @@ fn main() -> Result<()> {
                 | QuantizationMethod::Q5K
                 | QuantizationMethod::Q6K
                 | QuantizationMethod::IQ4NL
-                | QuantizationMethod::IQ4XS => OutputFormat::Gguf,
+                | QuantizationMethod::IQ4XS
+                | QuantizationMethod::PQ2_0
+                | QuantizationMethod::PTQ1_0 => OutputFormat::Gguf,
             };
 
             let quant_config = QuantizationConfig {

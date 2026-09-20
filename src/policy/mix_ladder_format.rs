@@ -53,6 +53,8 @@ pub(super) fn nominal_bits(format: QuantType) -> u8 {
         QuantType::Q5_0 | QuantType::Q5_1 | QuantType::Q5K => 5,
         QuantType::Q6K => 6,
         QuantType::Q8_0 | QuantType::Q8_1 => 8,
+        // A trit occupies a 2-bit code slot.
+        QuantType::PQ2_0 | QuantType::PTQ1_0 => 2,
         QuantType::NF4 | QuantType::FP4 => 4,
         QuantType::FP8 => 8,
         QuantType::GPTQ | QuantType::AWQ => 4,

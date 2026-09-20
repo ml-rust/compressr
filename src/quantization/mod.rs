@@ -32,11 +32,13 @@
 mod config;
 mod gguf_kernel;
 mod quantizer;
+mod repack;
 mod tensor;
 mod types;
 
 // Re-export main types
 pub use config::{QuantizationConfig, QuantizationMethod};
 pub use quantizer::Quantizer;
+pub use repack::repack_lowbit;
 pub use tensor::QuantizedTensor;
 pub use types::QuantType;

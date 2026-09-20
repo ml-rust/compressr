@@ -53,11 +53,14 @@ pub fn parse_quantization(s: &str) -> Result<QuantizationChoice> {
         "q6_k" | "q6k" => QuantizationMethod::Q6K,
         "iq4_nl" | "iq4nl" => QuantizationMethod::IQ4NL,
         "iq4_xs" | "iq4xs" => QuantizationMethod::IQ4XS,
+        "pq2_0" | "pq2.0" => QuantizationMethod::PQ2_0,
+        "ptq1_0" | "ptq1.0" => QuantizationMethod::PTQ1_0,
         "nf4" => QuantizationMethod::Nf4,
         "fp8" => QuantizationMethod::Fp8,
         _ => anyhow::bail!(
             "Unsupported quantization: {}. Flat formats: q4_0, q4_1, q8_0, q2_k, q3_k, \
-             q4_k, q5_k, q6_k, iq4_nl, iq4_xs, nf4, fp8. Mixed precision: {}.",
+             q4_k, q5_k, q6_k, iq4_nl, iq4_xs, nf4, fp8. Repack of a lowbit GGUF: pq2_0 \
+             (from PTQ1_0), ptq1_0 (from PQ2_0). Mixed precision: {}.",
             s,
             GGUF_MIX_NAMES.join(", ")
         ),
@@ -89,6 +92,8 @@ fn method_config(method: QuantizationMethod) -> QuantizationConfig {
         QuantizationMethod::Q6K => (6, 256),
         QuantizationMethod::IQ4NL => (4, 32),
         QuantizationMethod::IQ4XS => (4, 256),
+        // A trit occupies a 2-bit code slot in both layouts.
+        QuantizationMethod::PQ2_0 | QuantizationMethod::PTQ1_0 => (2, 128),
         QuantizationMethod::Fp8 => (8, 1),
         QuantizationMethod::Gptq | QuantizationMethod::Awq => (4, 128),
     };
@@ -160,6 +165,18 @@ mod tests {
             assert_eq!(choice.config.bits, 4);
             assert_eq!(choice.config.group_size, 32);
         }
+    }
+
+    /// The lowbit names resolve to the repack-only methods at group 128.
+    #[test]
+    fn lowbit_names_parse_as_repack_methods() {
+        let choice = parse_quantization("PQ2_0").unwrap();
+        assert_eq!(choice.config.method, QuantizationMethod::PQ2_0);
+        assert!(choice.config.method.is_repack_only());
+        assert_eq!(choice.config.group_size, 128);
+        let choice = parse_quantization("ptq1_0").unwrap();
+        assert_eq!(choice.config.method, QuantizationMethod::PTQ1_0);
+        assert!(choice.mix.is_none());
     }
 
     /// Both spellings resolve to the same method, at IQ4_XS's super-block

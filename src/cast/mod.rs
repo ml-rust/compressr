@@ -9,6 +9,10 @@
 //! by the `half` crate. Truncating the low 16 bits of an f32 is *not* a bf16
 //! cast: it loses up to a full ulp and biases every result toward zero.
 
+pub mod dequant;
+
+pub use dequant::{dequant_to_f32, dequant_to_f32_bytes, quant_format_of};
+
 use crate::loader::UnifiedDType;
 use anyhow::{bail, Result};
 use half::{bf16, f16};
