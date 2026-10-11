@@ -4,9 +4,10 @@
 //!
 //! llama.cpp's mixed-precision rules are written against GGUF tensor names:
 //! `output.weight`, `blk.7.attn_v.weight`, `blk.7.ffn_down.weight`. compressr
-//! writes the names its INPUT carried, so a SafeTensors checkpoint keeps
-//! HuggingFace names: `lm_head.weight`, `model.layers.7.self_attn.v_proj.weight`,
-//! `model.layers.7.mlp.down_proj.weight`.
+//! plans each tensor under the name its INPUT carried, so a SafeTensors
+//! checkpoint is planned under HuggingFace names: `lm_head.weight`,
+//! `model.layers.7.self_attn.v_proj.weight`, `model.layers.7.mlp.down_proj.weight`.
+//! The GGUF writer renames afterwards, for the architectures llama.cpp names.
 //!
 //! Both spellings map onto the same role here, so one rule table drives both
 //! inputs. The GGUF spellings are matched exactly as llama.cpp matches them.

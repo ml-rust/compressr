@@ -39,6 +39,13 @@ boostr = { path = "../boostr" }
 # JSON: config.json sidecars and the SafeTensors shard index
 serde_json = "1.0"
 
+# Tokenizer: encodes llama.cpp's fingerprint text with the checkpoint's own
+# tokenizer.json, to name the BPE pre-tokenizer in a GGUF header.
+splintr = "0.21"
+
+# SHA-256 of that encoding, which is the fingerprint llama.cpp's table keys on.
+sha2 = "0.10"
+
 # Error handling
 anyhow = "1.0"
 

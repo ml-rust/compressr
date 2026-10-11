@@ -15,6 +15,7 @@ Implemented and tested:
 | VoxCPM2 companion  | A `voxcpm2` checkpoint directory folds its `audiovae.pth` into the same GGUF/TCF under `vae.`, F32, with `config.json` as the `voxcpm2.config_json` key and `tokenizer.json` as the `tokenizer.huggingface.json` key |
 | SafeTensors output | Sharded at `--max-shard-size`, with a matching index       |
 | GGUF output        | GGUF v3, one self-contained file                           |
+| GGUF header from a HuggingFace checkpoint | `config.json` hyperparameters and the `tokenizer.json` / `tokenizer.model` vocabulary, under llama.cpp's key names and types. `llama`, `qwen2` and `qwen3` tensors take llama.cpp's names. A file of these loads in llama.cpp and blazr with nothing beside it |
 | dtype cast         | `f32`, `f16`, `bf16`, round-to-nearest-even; block-quantized input tensors are decoded through boostr first |
 | GGUF quantization  | `q4_0`, `q4_1`, `q8_0`, `q2_k`, `q3_k`, `q4_k`, `q5_k`, `q6_k`, `iq4_nl`, `iq4_xs` |
 | Lowbit repack      | `pq2_0` from a PTQ1_0 GGUF, `ptq1_0` from a PQ2_0 GGUF: codes and scales move between the two layouts, nothing is rounded, the header is carried whole |
@@ -59,6 +60,20 @@ GGUF records the architecture in `general.architecture`, and every consumer keys
 ```bash
 compressr convert ./voxcpm2 --format gguf --quantization q4_k --arch voxcpm2
 ```
+
+A HuggingFace checkpoint of a llama.cpp architecture gets the header `convert_hf_to_gguf.py` writes:
+
+| Architecture (`model_type`)            | `general.architecture` | Tensor names              |
+| -------------------------------------- | ---------------------- | ------------------------- |
+| `llama`, `mistral`, `mixtral`          | `llama`                | llama.cpp's, Q/K rows reordered |
+| `qwen2`, `qwen3`                       | as named               | llama.cpp's               |
+| `qwen2_moe`, `qwen3_moe`, `gemma`, `gemma2`, `gemma3`, `phi3` | `qwen2moe`, `qwen3moe`, as named | HuggingFace's |
+
+- Hyperparameters: `{arch}.context_length`, `.embedding_length`, `.block_count`, `.feed_forward_length`, `.attention.head_count`, `.attention.head_count_kv`, the norm epsilon, `.rope.*` (with scaling), expert counts, and `.attention.key_length` / `.value_length` when `head_dim` is stated. A key whose `config.json` field is absent is omitted.
+- RoPE tensors: llama3 scaling writes `rope_freqs.weight`, LongRoPE writes `rope_factors_long.weight` and `rope_factors_short.weight`.
+- Tokenizer: `tokenizer.model` gives `tokenizer.ggml.model = "llama"`. A byte-level BPE `tokenizer.json` gives `"gpt2"`, with merges and `tokenizer.ggml.pre` named by llama.cpp's fingerprint table. An unknown fingerprint omits `pre` with a warning. Special ids, add-token flags and `tokenizer.chat_template` follow llama.cpp's `SpecialVocab`.
+- llama.cpp's `llama` architecture rotates adjacent pairs, so `q_proj` and `k_proj` rows are reordered as the converter reorders them. boostr's GGUF loader puts them back.
+- The architectures in the last row keep HuggingFace tensor names: llama.cpp's converter changes their values (Gemma norms, Phi-3 fused projections, merged MoE experts), and llama.cpp cannot load those files.
 
 ### Repack a lowbit GGUF
 

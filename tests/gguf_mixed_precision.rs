@@ -108,9 +108,14 @@ fn convert_and_read(mix: GgufMix) -> HashMap<String, String> {
 
     let info = compressr::get_model_info(&out_path.to_string_lossy())
         .expect("the finished file must read back");
+    // A `llama` GGUF stores llama.cpp's names. boostr's map gives back the
+    // checkpoint names the mix assigned by.
     info.tensors
         .into_iter()
-        .map(|tensor| (tensor.name, tensor.dtype))
+        .map(|tensor| {
+            let name = boostr::format::gguf::gguf_to_hf_name(&tensor.name);
+            (name, tensor.dtype)
+        })
         .collect()
 }
 

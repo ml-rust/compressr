@@ -892,9 +892,11 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
     // Configure writer based on format
     if config.output_format == OutputFormat::Gguf {
         let input_path = Path::new(&config.input_path);
-        let arch = gguf_arch
+        let resolved = gguf_arch
             .as_deref()
             .context("Internal error: a GGUF output has no resolved architecture")?;
+        // llama.cpp's name for the architecture: Mistral and Mixtral are `llama`.
+        let arch = formats::gguf_hf::llama_cpp_arch(resolved).unwrap_or(resolved);
 
         // We need to configure the writer before initialization
         // Since we can't easily downcast, we'll create a new GGUF-specific writer
@@ -942,7 +944,24 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
             }
         }
 
-        // Add architecture-specific metadata
+        // A HuggingFace checkpoint's hyperparameters and tokenizer, and the
+        // tensor names and row order llama.cpp reads. A GGUF input already
+        // carries all of these.
+        if model.gguf_metadata().is_none() {
+            let names: Vec<String> = tensor_info.iter().map(|(name, _)| name.clone()).collect();
+            let dir = policy::checkpoint_dir(input_path).unwrap_or_else(|| input_path.into());
+            if let Some(header) = formats::gguf_hf::hf_gguf_header(arch, &dir, &names)? {
+                for (key, value) in header.metadata {
+                    if !gguf_writer.has_metadata(&key) {
+                        gguf_writer.add_metadata(&key, value);
+                    }
+                }
+                gguf_writer.set_tensor_layout(header.layout);
+            }
+        }
+
+        // The architecture keys the weights alone imply, for a file whose
+        // config supplied none of them.
         let derived = [
             (format!("{}.vocab_size", arch), metadata.vocab_size),
             (format!("{}.embedding_length", arch), metadata.hidden_size),
