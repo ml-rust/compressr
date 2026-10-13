@@ -34,7 +34,7 @@ python = ["dep:pyo3"]
 # This includes: GPTQ Hessian computation, AWQ scale search, NF4 codebook generation,
 # FP8 conversion, cross-layer equalization, etc.
 # Both CPU and GPU implementations live in boostr
-boostr = { path = "../boostr", version = "0.8" }
+boostr = { path = "../boostr", version = "0.9" }
 
 # JSON: config.json sidecars and the SafeTensors shard index
 serde_json = "1.0"

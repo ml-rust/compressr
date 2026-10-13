@@ -144,7 +144,7 @@ dependencies = [
 
 [[package]]
 name = "boostr"
-version = "0.7.0"
+version = "0.9.0"
 dependencies = [
  "blake3",
  "cudarc",
@@ -153,6 +153,7 @@ dependencies = [
  "memmap2",
  "numr",
  "rayon",
+ "regexr",
  "serde",
  "serde-saphyr",
  "serde_json",
@@ -833,7 +834,9 @@ dependencies = [
 
 [[package]]
 name = "numr"
-version = "0.12.0"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae7051738770b875a102b10275d9c96b7866cd2a741298707fba15a957ab27ca"
 dependencies = [
  "bytemuck",
  "cudarc",
@@ -1126,6 +1129,8 @@ checksum = "7a2d987857b319362043e95f5353c0535c1f58eec5336fdfcf626430af7def58"
 [[package]]
 name = "regexr"
 version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6fa953a1fb9a2cdc9f76b09db3ba4391707a547fadf6d072909e0c01ec1a1b8"
 dependencies = [
  "aho-corasick",
  "dynasm",
@@ -1306,7 +1311,9 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "splintr"
-version = "0.21.1"
+version = "0.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "21a0cca20510b5fad3a3fdd55557839da2b839b2ac38e776726379f7c2ad54ea"
 dependencies = [
  "aho-corasick",
  "base64",
@@ -1656,7 +1663,3 @@ checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
 dependencies = [
  "zune-core",
 ]
-
-[[patch.unused]]
-name = "nexar"
-version = "0.1.2"
