@@ -24,10 +24,11 @@
 //!
 //! # What lives in boostr (heavy lifting)
 //!
-//! - All quantization algorithms (NF4, GPTQ, AWQ, K-quants)
-//! - SIMD-optimized dequantization (AVX2, NEON)
-//! - GPU kernels for quantization
+//! - The GGML block quantizers and their importance-weighted variants
+//! - Dequantization and lowbit repack kernels
 //! - Block structures (BlockQ4K, BlockQ5K, etc.)
+//!
+//! compressr calls these on boostr's CPU runtime only.
 
 mod config;
 mod gguf_kernel;

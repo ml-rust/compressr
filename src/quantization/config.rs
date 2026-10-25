@@ -43,6 +43,105 @@ pub enum QuantizationMethod {
 }
 
 impl QuantizationMethod {
+    /// Every method, in the order error messages list them.
+    pub const ALL: [Self; 16] = [
+        Self::Q4_0,
+        Self::Q4_1,
+        Self::Q8_0,
+        Self::Q2K,
+        Self::Q3K,
+        Self::Q4K,
+        Self::Q5K,
+        Self::Q6K,
+        Self::IQ4NL,
+        Self::IQ4XS,
+        Self::PQ2_0,
+        Self::PTQ1_0,
+        Self::Nf4,
+        Self::Fp8,
+        Self::Gptq,
+        Self::Awq,
+    ];
+
+    /// The canonical command-line name of this method, as `--quantization`
+    /// takes it.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Q4_0 => "q4_0",
+            Self::Q4_1 => "q4_1",
+            Self::Q8_0 => "q8_0",
+            Self::Q2K => "q2_k",
+            Self::Q3K => "q3_k",
+            Self::Q4K => "q4_k",
+            Self::Q5K => "q5_k",
+            Self::Q6K => "q6_k",
+            Self::IQ4NL => "iq4_nl",
+            Self::IQ4XS => "iq4_xs",
+            Self::PQ2_0 => "pq2_0",
+            Self::PTQ1_0 => "ptq1_0",
+            Self::Nf4 => "nf4",
+            Self::Fp8 => "fp8",
+            Self::Gptq => "gptq",
+            Self::Awq => "awq",
+        }
+    }
+
+    /// Resolve a method name, case-insensitively.
+    ///
+    /// Takes the canonical [`Self::name`] and the alternate spellings in use:
+    /// `q4k` for `q4_k`, `q4.0` for `q4_0`, `iq4nl` for `iq4_nl`. Returns
+    /// `None` for any other name. A name that resolves is not always
+    /// writable: see [`Self::is_writable`].
+    pub fn from_name(name: &str) -> Option<Self> {
+        let lowered = name.to_lowercase();
+        let canonical = match lowered.as_str() {
+            "q4.0" => "q4_0",
+            "q4.1" => "q4_1",
+            "q8.0" => "q8_0",
+            "q2k" => "q2_k",
+            "q3k" => "q3_k",
+            "q4k" => "q4_k",
+            "q5k" => "q5_k",
+            "q6k" => "q6_k",
+            "iq4nl" => "iq4_nl",
+            "iq4xs" => "iq4_xs",
+            "pq2.0" => "pq2_0",
+            "ptq1.0" => "ptq1_0",
+            other => other,
+        };
+        Self::ALL
+            .into_iter()
+            .find(|method| method.name() == canonical)
+    }
+
+    /// Names of the methods compressr quantizes float weights with, in
+    /// [`Self::ALL`] order: writable and not repack-only.
+    pub fn quantize_names() -> Vec<&'static str> {
+        Self::ALL
+            .into_iter()
+            .filter(|method| method.is_writable() && !method.is_repack_only())
+            .map(|method| method.name())
+            .collect()
+    }
+
+    /// Names of the methods that repack a lowbit GGUF, in [`Self::ALL`] order.
+    pub fn repack_names() -> Vec<&'static str> {
+        Self::ALL
+            .into_iter()
+            .filter(|method| method.is_repack_only())
+            .map(|method| method.name())
+            .collect()
+    }
+
+    /// Names of every method compressr writes, in [`Self::ALL`] order.
+    pub fn writable_names() -> Vec<&'static str> {
+        Self::ALL
+            .into_iter()
+            .filter(|method| method.is_writable())
+            .map(|method| method.name())
+            .collect()
+    }
+
     /// Check if this method requires calibration data
     pub fn requires_calibration(&self) -> bool {
         matches!(self, Self::Gptq | Self::Awq)
@@ -366,6 +465,40 @@ mod tests {
                 "{method:?} has no on-disk layout in compressr"
             );
         }
+    }
+
+    /// Every canonical name resolves back to its method, and the name lists
+    /// partition the writable methods.
+    #[test]
+    fn test_names_round_trip_and_partition_the_writable_methods() {
+        for method in QuantizationMethod::ALL {
+            assert_eq!(QuantizationMethod::from_name(method.name()), Some(method));
+            assert_eq!(
+                QuantizationMethod::from_name(&method.name().to_uppercase()),
+                Some(method)
+            );
+        }
+        assert_eq!(
+            QuantizationMethod::from_name("q4k"),
+            Some(QuantizationMethod::Q4K)
+        );
+        assert_eq!(
+            QuantizationMethod::from_name("ptq1.0"),
+            Some(QuantizationMethod::PTQ1_0)
+        );
+        assert_eq!(QuantizationMethod::from_name("q4_k_m"), None);
+        assert_eq!(QuantizationMethod::from_name("exl2"), None);
+
+        assert_eq!(
+            QuantizationMethod::quantize_names(),
+            vec![
+                "q4_0", "q4_1", "q8_0", "q2_k", "q3_k", "q4_k", "q5_k", "q6_k", "iq4_nl", "iq4_xs"
+            ]
+        );
+        assert_eq!(QuantizationMethod::repack_names(), vec!["pq2_0", "ptq1_0"]);
+        let mut both = QuantizationMethod::quantize_names();
+        both.extend(QuantizationMethod::repack_names());
+        assert_eq!(QuantizationMethod::writable_names(), both);
     }
 
     /// IQ4_NL packs as `QuantType::IQ4NL`, at 4.5 bits per weight and a

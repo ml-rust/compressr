@@ -102,7 +102,11 @@ impl SafeTensorsDType {
     /// Deliberately NOT `std::str::FromStr`: that returns `Result` and forces an
     /// error type, while an unrecognised dtype name here is an ordinary absence
     /// the callers branch on.
-    #[allow(clippy::should_implement_trait)]
+    #[allow(
+        clippy::should_implement_trait,
+        reason = "an unknown dtype name is an absence callers branch on, so this returns \
+                  Option, which std::str::FromStr cannot"
+    )]
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_uppercase().as_str() {
             "F32" | "FLOAT32" => Some(Self::F32),

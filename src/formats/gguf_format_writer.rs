@@ -1,7 +1,9 @@
 //! The GGUF [`FormatWriter`]: header keys, tensor names and row orders over a
 //! [`StreamingGgufWriter`].
 
-use super::gguf::{GgmlType, GgufValue, StreamingGgufWriter, GGUF_DEFAULT_ALIGNMENT};
+use super::gguf::{
+    check_alignment, GgmlType, GgufValue, StreamingGgufWriter, GGUF_DEFAULT_ALIGNMENT,
+};
 use super::gguf_hf::{reorder_rows, GgufTensorLayout};
 use super::{ggml_type_for, FormatWriter};
 use crate::loader::UnifiedDType;
@@ -64,9 +66,16 @@ impl GgufFormatWriter {
             .push(("general.file_type".into(), GgufValue::Uint32(file_type)));
     }
 
-    /// Set alignment
-    pub fn set_alignment(&mut self, alignment: usize) {
+    /// Set the data alignment
+    ///
+    /// Checked here, before `initialize` opens a file.
+    ///
+    /// # Errors
+    /// `alignment` fails [`check_alignment`].
+    pub fn set_alignment(&mut self, alignment: usize) -> Result<()> {
+        check_alignment(alignment)?;
         self.alignment = alignment;
+        Ok(())
     }
 
     /// Add custom metadata
@@ -113,7 +122,7 @@ impl FormatWriter for GgufFormatWriter {
 
         // Apply alignment if custom
         if self.alignment != GGUF_DEFAULT_ALIGNMENT {
-            writer = writer.with_alignment(self.alignment);
+            writer = writer.with_alignment(self.alignment)?;
         }
 
         // Add pending metadata

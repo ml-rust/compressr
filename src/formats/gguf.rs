@@ -33,6 +33,31 @@ pub const GGUF_VERSION: u32 = 3;
 /// Default data alignment (power of 2)
 pub const GGUF_DEFAULT_ALIGNMENT: usize = 32;
 
+/// Check a caller's GGUF data alignment.
+///
+/// Every offset is rounded up to a multiple of the alignment, so it must be
+/// a power of two. The header stores it as the `u32` key `general.alignment`,
+/// so it must also fit in a `u32`.
+///
+/// # Errors
+/// `alignment` is zero, not a power of two, or larger than `u32::MAX`.
+pub fn check_alignment(alignment: usize) -> Result<()> {
+    if !alignment.is_power_of_two() {
+        bail!(
+            "GGUF alignment {alignment} is not a power of two. Pass a power of two, such as \
+             the default {GGUF_DEFAULT_ALIGNMENT}."
+        );
+    }
+    if u32::try_from(alignment).is_err() {
+        bail!(
+            "GGUF alignment {alignment} does not fit the u32 key general.alignment. Pass a \
+             power of two no larger than {}.",
+            1u64 << 31
+        );
+    }
+    Ok(())
+}
+
 // ============================================================================
 // GGUF Value Types
 // ============================================================================
@@ -420,11 +445,14 @@ impl GgufWriter {
         }
     }
 
-    /// Set data alignment (must be power of 2)
-    pub fn with_alignment(mut self, alignment: usize) -> Self {
-        assert!(alignment.is_power_of_two(), "Alignment must be power of 2");
+    /// Set data alignment
+    ///
+    /// # Errors
+    /// `alignment` fails [`check_alignment`].
+    pub fn with_alignment(mut self, alignment: usize) -> Result<Self> {
+        check_alignment(alignment)?;
         self.alignment = alignment;
-        self
+        Ok(self)
     }
 
     /// Add a metadata key-value pair
@@ -485,9 +513,13 @@ impl GgufWriter {
 
     /// Set LLaMA-specific metadata
     ///
-    /// The GGUF spec names these nine fields individually; bundling them into a
-    /// struct that exists only to satisfy a lint would obscure that mapping.
-    #[allow(clippy::too_many_arguments)]
+    /// Each parameter is one `llama.*` key of the GGUF spec, in the order the
+    /// keys are written.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one parameter per GGUF key keeps the call site a 1:1 map of the eight \
+                  llama.* keys it writes"
+    )]
     pub fn set_llama_metadata(
         &mut self,
         vocab_size: u32,
@@ -875,10 +907,13 @@ impl StreamingGgufWriter {
     }
 
     /// Set data alignment
-    pub fn with_alignment(mut self, alignment: usize) -> Self {
-        assert!(alignment.is_power_of_two());
+    ///
+    /// # Errors
+    /// `alignment` fails [`check_alignment`].
+    pub fn with_alignment(mut self, alignment: usize) -> Result<Self> {
+        check_alignment(alignment)?;
         self.alignment = alignment;
-        self
+        Ok(self)
     }
 
     /// Add metadata (same API as GgufWriter)
@@ -1245,6 +1280,47 @@ impl StreamingGgufWriter {
 mod tests {
     use super::*;
     use std::io::Read;
+
+    /// A bad caller alignment is an error that names the value, never a
+    /// panic, for both writers.
+    #[test]
+    fn test_with_alignment_refuses_a_non_power_of_two() {
+        for alignment in [0usize, 3, 48] {
+            let err = GgufWriter::new()
+                .with_alignment(alignment)
+                .err()
+                .expect("a non-power-of-two alignment is refused")
+                .to_string();
+            assert!(err.contains(&alignment.to_string()), "{err}");
+            assert!(err.contains("power of two"), "{err}");
+
+            let err = StreamingGgufWriter::new("unused.gguf")
+                .with_alignment(alignment)
+                .err()
+                .expect("a non-power-of-two alignment is refused")
+                .to_string();
+            assert!(err.contains("power of two"), "{err}");
+        }
+
+        let writer = GgufWriter::new()
+            .with_alignment(64)
+            .expect("64 is a power of two");
+        assert_eq!(writer.alignment, 64);
+        let writer = StreamingGgufWriter::new("unused.gguf")
+            .with_alignment(1)
+            .expect("1 is a power of two");
+        assert_eq!(writer.alignment, 1);
+    }
+
+    /// The header stores the alignment as a u32, so a larger power of two is
+    /// refused rather than truncated.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn test_check_alignment_refuses_more_than_a_u32() {
+        assert!(check_alignment(1usize << 31).is_ok());
+        let err = check_alignment(1usize << 32).unwrap_err().to_string();
+        assert!(err.contains("u32"), "{err}");
+    }
 
     #[test]
     fn test_ggml_type_sizes() {

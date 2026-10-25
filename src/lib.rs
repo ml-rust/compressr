@@ -9,7 +9,10 @@
 //! - GGUF in, for re-conversion
 //! - TCF in, read back through boostr's reader: every payload is verified
 //!   against its digests and proof vector, then decoded to f32
-//! - PyTorch in, one `.pt` / `.pth` / `.bin` state dict, F32 and F64 tensors
+//! - PyTorch in, one `.pt` / `.pth` / `.bin` state dict, F32, F64, I32 and
+//!   I64 tensors. A sharded PyTorch checkpoint is refused
+//! - An explicit [`ConversionConfig::input_format`] skips auto-detection, and
+//!   the input's content is checked against it
 //! - SafeTensors out, sharded at a byte limit with a matching index
 //! - GGUF v3 out, one self-contained file
 //! - Element-type casts between F32, F16 and BF16, round-to-nearest-even
@@ -201,7 +204,11 @@ pub struct ConversionConfig {
     pub input_path: String,
     /// Output path
     pub output_path: String,
-    /// Input format (auto-detected if None)
+    /// Input format
+    ///
+    /// `None` auto-detects it. `Some` skips detection, and [`convert`] errors
+    /// before any output file is created when the input does not hold that
+    /// format. See [`ModelLoader::with_format`].
     pub input_format: Option<InputFormat>,
     /// Target output format
     pub output_format: OutputFormat,
@@ -295,6 +302,14 @@ impl ConversionConfig {
         self
     }
 
+    /// Set the input format, skipping auto-detection
+    ///
+    /// The conversion errors when the input does not hold `format`.
+    pub fn with_input_format(mut self, format: InputFormat) -> Self {
+        self.input_format = Some(format);
+        self
+    }
+
     /// Set the architecture written to GGUF's `general.architecture`
     pub fn with_arch(mut self, arch: impl Into<String>) -> Self {
         self.arch = Some(arch.into());
@@ -336,17 +351,16 @@ impl ConversionConfig {
     ///   has no meaning; there is no precedence rule.
     /// - The quantization method has no on-disk layout in compressr. See
     ///   [`QuantizationMethod::is_writable`].
-    /// - Quantization was requested for a non-GGUF output format.
+    /// - Quantization or a mix was requested for an output other than GGUF
+    ///   or TCF.
     /// - The target dtype is not a supported float type.
-    /// - `--format tcf` was given with both `--tcf-profile` and
-    ///   `--tcf-encoding`, or with neither. A profile already fixes the base
-    ///   encoding, so the two flags cannot both describe the same file.
-    /// - `--sensitivity` was given without a TCF profile that names a bump
-    ///   encoding, or with a measurement taken at another encoding. A ranking
-    ///   measured at one encoding does not transfer to another.
-    /// - `--sensitivity` was given for a GGUF output with no mixed-precision
-    ///   quantization, or with a measurement whose bit width does not suit the
-    ///   mix's base format. See [`policy::check_measurement_encoding`].
+    /// - `--format tcf` was given without `--quantization`, with a lowbit
+    ///   repack, or with `--dtype`.
+    /// - `--sensitivity` was given with no mixed-precision quantization, or
+    ///   with a measurement whose bit width does not suit the mix's base
+    ///   format. See [`policy::check_measurement_encoding`].
+    /// - `--imatrix` was given for a quantization with no importance-weighted
+    ///   writer, or for an output that runs no quantizer.
     ///
     /// Every check runs BEFORE any output file is created, because a mismatch
     /// caught by the writer instead surfaces halfway through the tensor loop
@@ -368,9 +382,10 @@ impl ConversionConfig {
                 bail!(
                     "Quantization method {:?} is not implemented: compressr has no on-disk \
                      layout for its scales, so the output would carry packed weights that \
-                     nothing can dequantize. Implemented: q4_0, q4_1, q8_0, q2_k, q3_k, \
-                     q4_k, q5_k, q6_k, iq4_nl, iq4_xs.",
-                    quant.method
+                     nothing can dequantize. Implemented: {} (pq2_0 and ptq1_0 repack a \
+                     lowbit GGUF only).",
+                    quant.method,
+                    QuantizationMethod::writable_names().join(", ")
                 );
             }
             // A block-quantized tensor is a run of whole blocks, not a run of
@@ -690,6 +705,7 @@ pub fn convert(config: ConversionConfig) -> Result<ConversionStats> {
     log::info!("Loading model...");
     let mut model = ModelLoader::new(&config.input_path)
         .with_arch_override(config.arch.as_deref())
+        .with_format(config.input_format)
         .load()
         .with_context(|| format!("Failed to load model from: {}", config.input_path))?;
 
@@ -1600,6 +1616,11 @@ mod tests {
 
             assert!(err.contains("not implemented"), "{method:?}: {err}");
             assert!(err.contains(&format!("{method:?}")), "{method:?}: {err}");
+            // The list is built from `is_writable`, so it names every method
+            // that writes, the lowbit repacks included.
+            for name in QuantizationMethod::writable_names() {
+                assert!(err.contains(name), "{method:?} omits {name}: {err}");
+            }
         }
     }
 

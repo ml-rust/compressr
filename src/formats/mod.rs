@@ -26,7 +26,7 @@ pub use shard::{
 
 // Re-export main types
 pub use gguf::{
-    GgmlType, GgufArray, GgufTensorInfo, GgufValue, GgufWriter as GgufBatchWriter,
+    check_alignment, GgmlType, GgufArray, GgufTensorInfo, GgufValue, GgufWriter as GgufBatchWriter,
     StreamingGgufWriter, GGUF_DEFAULT_ALIGNMENT, GGUF_MAGIC, GGUF_VERSION,
 };
 

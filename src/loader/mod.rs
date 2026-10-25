@@ -27,6 +27,7 @@ pub mod tcf;
 pub mod torch;
 
 use crate::formats::shard::read_index_shard_files;
+use crate::formats::GGUF_MAGIC;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::io::Read;
@@ -51,6 +52,9 @@ pub struct ModelLoader {
     /// the architecture test that decides whether a companion is opened,
     /// exactly as it outranks it for `general.architecture`.
     arch_override: Option<String>,
+    /// The caller's input format. `Some` skips [`Self::detect_format`], and
+    /// [`Self::load`] errors when the input does not hold that format.
+    format: Option<crate::InputFormat>,
 }
 
 impl ModelLoader {
@@ -59,12 +63,23 @@ impl ModelLoader {
         Self {
             path: path.as_ref().to_string_lossy().to_string(),
             arch_override: None,
+            format: None,
         }
     }
 
     /// Set the architecture override (`--arch`) the companion rule reads.
     pub fn with_arch_override(mut self, arch: Option<&str>) -> Self {
         self.arch_override = arch.map(str::to_string);
+        self
+    }
+
+    /// Set the input format, or `None` to auto-detect it.
+    ///
+    /// An explicit format skips the extension and directory rules of
+    /// [`Self::detect_format`]. [`Self::load`] then checks the input's content
+    /// against that format and errors on a mismatch, before any reader opens.
+    pub fn with_format(mut self, format: Option<crate::InputFormat>) -> Self {
+        self.format = format;
         self
     }
 
@@ -161,10 +176,119 @@ impl ModelLoader {
         anyhow::bail!("Could not detect model format for: {}", self.path)
     }
 
+    /// Check that the input holds `format`, by content where the format has
+    /// a magic.
+    ///
+    /// No extension decides here: the caller named the format, so only the
+    /// bytes can contradict it.
+    ///
+    /// # Errors
+    /// The input is not `format`. The message names the format, the path and
+    /// what was found instead.
+    pub fn check_format(&self, format: crate::InputFormat) -> Result<()> {
+        use crate::InputFormat;
+
+        let path = Path::new(&self.path);
+        let mismatch = |found: String| {
+            anyhow::anyhow!(
+                "The input format is given as {format:?}, but '{}' {found}. Pass the \
+                 format the input holds, or leave it unset to auto-detect it.",
+                self.path
+            )
+        };
+        if !path.exists() {
+            anyhow::bail!("Input '{}' does not exist", self.path);
+        }
+
+        match format {
+            InputFormat::Tcf | InputFormat::Gguf => {
+                if !path.is_file() {
+                    return Err(mismatch(format!(
+                        "is a directory, and {format:?} is one file"
+                    )));
+                }
+                let magic = read_magic(path)?;
+                let matches = match format {
+                    InputFormat::Tcf => magic == Some(boostr::tcf::MAGIC),
+                    _ => magic.is_some_and(|m| m[..4] == GGUF_MAGIC.to_le_bytes()),
+                };
+                if !matches {
+                    let expected = match format {
+                        InputFormat::Tcf => "the TCF magic 54 43 46 00 00 00 00 00",
+                        _ => "the GGUF magic 47 47 55 46",
+                    };
+                    return Err(mismatch(format!(
+                        "starts with {}, not {expected}",
+                        describe_magic(magic)
+                    )));
+                }
+            }
+            InputFormat::PyTorch => {
+                if path.is_dir() {
+                    if !path.join("pytorch_model.bin").is_file()
+                        && !path.join("pytorch_model.bin.index.json").is_file()
+                    {
+                        return Err(mismatch(
+                            "is a directory with no pytorch_model.bin and no \
+                             pytorch_model.bin.index.json"
+                                .to_string(),
+                        ));
+                    }
+                } else {
+                    let magic = read_magic(path)?;
+                    if magic.map(|m| m.starts_with(&ZIP_MAGIC)) != Some(true) {
+                        return Err(mismatch(format!(
+                            "starts with {}, not the ZIP magic 50 4b 03 04 of a torch.save \
+                             archive",
+                            describe_magic(magic)
+                        )));
+                    }
+                }
+            }
+            InputFormat::Safetensors => {
+                if path.is_dir() {
+                    let has_safetensors = path.join(SAFETENSORS_INDEX_FILE).is_file()
+                        || std::fs::read_dir(path)
+                            .with_context(|| format!("Failed to list directory: {}", self.path))?
+                            .filter_map(|entry| entry.ok())
+                            .any(|entry| {
+                                entry
+                                    .path()
+                                    .extension()
+                                    .is_some_and(|ext| ext == "safetensors")
+                            });
+                    if !has_safetensors {
+                        return Err(mismatch(format!(
+                            "is a directory with no .safetensors file and no {SAFETENSORS_INDEX_FILE}"
+                        )));
+                    }
+                } else if let Some(found) = safetensors_header_mismatch(path)? {
+                    return Err(mismatch(found));
+                }
+            }
+            // ONNX has no reader, and `load` refuses it with the reason.
+            InputFormat::Onnx => {}
+        }
+        Ok(())
+    }
+
     /// Open the model, reading its headers only
+    ///
+    /// The format is the one set by [`Self::with_format`], checked against
+    /// the input by [`Self::check_format`], else [`Self::detect_format`].
     pub fn load(&self) -> Result<LoadedModel> {
-        let format = self.detect_format()?;
-        log::info!("Detected format: {:?}", format);
+        let format = match self.format {
+            Some(format) => {
+                self.check_format(format)?;
+                log::info!("Input format given: {:?}", format);
+                format
+            }
+            None => {
+                let format = self.detect_format()?;
+                log::info!("Detected format: {:?}", format);
+                format
+            }
+        };
 
         match format {
             crate::InputFormat::Safetensors => {
@@ -179,7 +303,11 @@ impl ModelLoader {
             crate::InputFormat::Tcf => self.load_tcf(),
             crate::InputFormat::PyTorch => self.load_torch(),
             crate::InputFormat::Onnx => {
-                anyhow::bail!("ONNX format not yet supported")
+                anyhow::bail!(
+                    "ONNX input '{}' is not implemented: compressr has no .onnx reader. \
+                     Convert the checkpoint from its SafeTensors or PyTorch copy.",
+                    self.path
+                )
             }
         }
     }
@@ -654,6 +782,41 @@ fn read_magic(path: &Path) -> Result<Option<[u8; 8]>> {
     Ok(Some(magic))
 }
 
+/// Why `path` is not a SafeTensors file, or `None` when its header holds up.
+///
+/// A SafeTensors file opens with a little-endian `u64` header length, then a
+/// JSON object of that length. The check reads nine bytes: the length must
+/// fit the file, and the header must open with `{`.
+fn safetensors_header_mismatch(path: &Path) -> Result<Option<String>> {
+    let len = std::fs::metadata(path)
+        .with_context(|| format!("Failed to read the metadata of: {}", path.display()))?
+        .len();
+    if len < 9 {
+        return Ok(Some(format!(
+            "holds {len} bytes, fewer than the 9 a SafeTensors header needs"
+        )));
+    }
+    let mut head = [0u8; 9];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut head))
+        .with_context(|| format!("Failed to read the first bytes of: {}", path.display()))?;
+    let mut length = [0u8; 8];
+    length.copy_from_slice(&head[..8]);
+    let header_len = u64::from_le_bytes(length);
+    if header_len == 0 || header_len > len - 8 {
+        return Ok(Some(format!(
+            "declares a {header_len}-byte SafeTensors header in a {len}-byte file"
+        )));
+    }
+    if head[8] != b'{' {
+        return Ok(Some(format!(
+            "has a SafeTensors header that opens with byte {:02x}, not '{{'",
+            head[8]
+        )));
+    }
+    Ok(None)
+}
+
 /// Render a file's first bytes for an error message.
 fn describe_magic(magic: Option<[u8; 8]>) -> String {
     match magic {
@@ -1002,6 +1165,88 @@ pub struct LayerGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::formats::{FormatWriter, SafeTensorsFormatWriter};
+    use crate::InputFormat;
+
+    /// Write a one-tensor SafeTensors file at `path`.
+    fn write_safetensors(path: &Path) {
+        let mut writer = SafeTensorsFormatWriter::new();
+        writer
+            .register_tensor("w", &[2, 2], UnifiedDType::F32, None)
+            .unwrap();
+        writer.initialize(path).unwrap();
+        let bytes: Vec<u8> = [1.0f32, 2.0, 3.0, 4.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        writer.write_tensor_data(&bytes).unwrap();
+        writer.finalize().unwrap();
+    }
+
+    /// An explicit format skips detection: a SafeTensors file named `.bin`
+    /// is detected as PyTorch by its extension, and loads when the caller
+    /// names SafeTensors.
+    #[test]
+    fn test_explicit_format_skips_detection() {
+        let dir = tempfile::tempdir().unwrap();
+        let written = dir.path().join("weights.safetensors");
+        write_safetensors(&written);
+        let path = dir.path().join("weights.bin");
+        std::fs::rename(&written, &path).unwrap();
+
+        assert_eq!(
+            ModelLoader::new(&path).detect_format().unwrap(),
+            InputFormat::PyTorch
+        );
+        let model = ModelLoader::new(&path)
+            .with_format(Some(InputFormat::Safetensors))
+            .load()
+            .unwrap();
+        assert_eq!(model.format(), InputFormat::Safetensors);
+        assert_eq!(model.tensor_count(), 1);
+    }
+
+    /// An explicit format the input does not hold is an error that names the
+    /// format and what the input holds instead.
+    #[test]
+    fn test_explicit_format_mismatch_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.safetensors");
+        write_safetensors(&path);
+
+        for (format, found) in [
+            (InputFormat::Gguf, "GGUF magic"),
+            (InputFormat::Tcf, "TCF magic"),
+            (InputFormat::PyTorch, "ZIP magic"),
+        ] {
+            let err = ModelLoader::new(&path)
+                .with_format(Some(format))
+                .load()
+                .err()
+                .expect("the input is SafeTensors")
+                .to_string();
+            assert!(err.contains(&format!("{format:?}")), "{err}");
+            assert!(err.contains(found), "{err}");
+        }
+
+        let text = dir.path().join("notes.safetensors");
+        std::fs::write(&text, b"plain text, no header").unwrap();
+        let err = ModelLoader::new(&text)
+            .with_format(Some(InputFormat::Safetensors))
+            .load()
+            .err()
+            .expect("the file holds no SafeTensors header")
+            .to_string();
+        assert!(err.contains("SafeTensors header"), "{err}");
+
+        let err = ModelLoader::new(dir.path())
+            .with_format(Some(InputFormat::Gguf))
+            .load()
+            .err()
+            .expect("a directory is not one GGUF file")
+            .to_string();
+        assert!(err.contains("is a directory"), "{err}");
+    }
 
     #[test]
     fn test_extract_layer_index() {

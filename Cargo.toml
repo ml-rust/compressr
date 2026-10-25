@@ -8,13 +8,15 @@ license = "Apache-2.0"
 repository = "https://github.com/ml-rust/compressr"
 homepage = "https://github.com/ml-rust/compressr"
 readme = "README.md"
-keywords = ["llm", "quantization", "compression", "gguf", "gptq"]
+keywords = ["llm", "quantization", "compression", "gguf", "safetensors"]
 categories = ["command-line-utilities", "compression", "science"]
 exclude = [
     "tmp/",
     "research/",
     "benchmarks/",
     ".github/",
+    "CLAUDE.md",
+    "AGENTS.md",
 ]
 
 [lib]
@@ -23,18 +25,14 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = []
-# CUDA GPU acceleration (via boostr)
-cuda = ["boostr/cuda"]
 # Python bindings via PyO3
 python = ["dep:pyo3"]
 
 [dependencies]
-# boostr: ML framework providing ALL quantization kernels and algorithms
-# compressr is just a thin user-friendly layer - all heavy lifting happens in boostr
-# This includes: GPTQ Hessian computation, AWQ scale search, NF4 codebook generation,
-# FP8 conversion, cross-layer equalization, etc.
-# Both CPU and GPU implementations live in boostr
-boostr = { path = "../boostr", version = "0.9" }
+# boostr: every quantization kernel, block layout and model-format reader.
+# compressr calls them on the CPU runtime. The integration tests use this same
+# entry to decode with boostr's reader kernels.
+boostr ={ path = "../boostr", version = "0.9" }
 
 # JSON: config.json sidecars and the SafeTensors shard index
 serde_json = "1.0"
@@ -66,13 +64,6 @@ tempfile = "3.23"
 
 # Python bindings (optional)
 pyo3 = { version = "0.23", features = ["extension-module"], optional = true }
-
-[dev-dependencies]
-# boostr is a normal dependency, but integration tests are separate crates and
-# need it declared here to call its dequant kernels as an independent reader.
-boostr = { path = "../boostr" }
-half = "2.7"
-tempfile = "3.23"
 
 [profile.release]
 opt-level = 3

@@ -42,34 +42,33 @@ pub fn parse_quantization(s: &str) -> Result<QuantizationChoice> {
         }
     }
 
-    let method = match lowered.as_str() {
-        "q4_0" | "q4.0" => QuantizationMethod::Q4_0,
-        "q4_1" | "q4.1" => QuantizationMethod::Q4_1,
-        "q8_0" | "q8.0" => QuantizationMethod::Q8_0,
-        "q2_k" | "q2k" => QuantizationMethod::Q2K,
-        "q3_k" | "q3k" => QuantizationMethod::Q3K,
-        "q4_k" | "q4k" => QuantizationMethod::Q4K,
-        "q5_k" | "q5k" => QuantizationMethod::Q5K,
-        "q6_k" | "q6k" => QuantizationMethod::Q6K,
-        "iq4_nl" | "iq4nl" => QuantizationMethod::IQ4NL,
-        "iq4_xs" | "iq4xs" => QuantizationMethod::IQ4XS,
-        "pq2_0" | "pq2.0" => QuantizationMethod::PQ2_0,
-        "ptq1_0" | "ptq1.0" => QuantizationMethod::PTQ1_0,
-        "nf4" => QuantizationMethod::Nf4,
-        "fp8" => QuantizationMethod::Fp8,
-        _ => anyhow::bail!(
-            "Unsupported quantization: {}. Flat formats: q4_0, q4_1, q8_0, q2_k, q3_k, \
-             q4_k, q5_k, q6_k, iq4_nl, iq4_xs, nf4, fp8. Repack of a lowbit GGUF: pq2_0 \
-             (from PTQ1_0), ptq1_0 (from PQ2_0). Mixed precision: {}.",
-            s,
-            GGUF_MIX_NAMES.join(", ")
-        ),
+    // A roadmap name (nf4, fp8, gptq, awq) resolves here so that
+    // `ConversionConfig::validate` refuses it with the reason, before any
+    // output file is created.
+    let Some(method) = QuantizationMethod::from_name(&lowered) else {
+        anyhow::bail!("{}", unknown_quantization_message(s));
     };
 
     Ok(QuantizationChoice {
         config: method_config(method),
         mix: None,
     })
+}
+
+/// The error for a `--quantization` value that names no method or mix.
+///
+/// Lists exactly the names that convert, built from
+/// [`QuantizationMethod::quantize_names`], [`QuantizationMethod::repack_names`]
+/// and [`GGUF_MIX_NAMES`].
+pub fn unknown_quantization_message(value: &str) -> String {
+    format!(
+        "Unsupported quantization: {}. Flat formats: {}. Repack of a lowbit GGUF: {} \
+         (pq2_0 takes a PTQ1_0 input, ptq1_0 takes a PQ2_0 input). Mixed precision: {}.",
+        value,
+        QuantizationMethod::quantize_names().join(", "),
+        QuantizationMethod::repack_names().join(", "),
+        GGUF_MIX_NAMES.join(", ")
+    )
 }
 
 /// The base format a mix falls back to for every tensor no rule moves.
@@ -153,6 +152,33 @@ mod tests {
         assert!(err.contains("q4_0"), "{err}");
         assert!(err.contains("iq4_nl"), "{err}");
         assert!(err.contains("iq4_xs"), "{err}");
+        assert!(err.contains("pq2_0"), "{err}");
+    }
+
+    /// The list of accepted names holds no roadmap method: each of those is
+    /// refused by `ConversionConfig::validate`.
+    #[test]
+    fn the_accepted_list_omits_roadmap_methods() {
+        let err = parse_quantization("q4_9").unwrap_err().to_string();
+        for roadmap in ["nf4", "fp8", "gptq", "awq"] {
+            assert!(!err.contains(roadmap), "{roadmap} listed: {err}");
+        }
+    }
+
+    /// A roadmap name resolves to its method, so the refusal that follows
+    /// names the reason instead of calling the name unknown.
+    #[test]
+    fn a_roadmap_name_resolves_for_validate_to_refuse() {
+        for (name, method) in [
+            ("nf4", QuantizationMethod::Nf4),
+            ("fp8", QuantizationMethod::Fp8),
+            ("gptq", QuantizationMethod::Gptq),
+            ("awq", QuantizationMethod::Awq),
+        ] {
+            let choice = parse_quantization(name).unwrap();
+            assert_eq!(choice.config.method, method);
+            assert!(!choice.config.method.is_writable(), "{name}");
+        }
     }
 
     /// Both spellings resolve to the same method, at IQ4_NL's real bpw.

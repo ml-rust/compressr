@@ -404,3 +404,48 @@ fn a_pytorch_state_dict_converts_to_safetensors() {
     let names: Vec<&str> = info.tensors.iter().map(|t| t.name.as_str()).collect();
     assert_eq!(names, vec!["norm.bias", "norm.weight", "proj.weight"]);
 }
+
+/// `ConversionConfig::input_format` is honored: a named format skips
+/// auto-detection, and a format the input does not hold fails before any
+/// output file is created.
+#[test]
+fn an_explicit_input_format_is_honored() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let tensors = sources();
+    // `.bin` makes auto-detection claim PyTorch, so only the explicit format
+    // can open this file.
+    let written = dir.path().join("weights.safetensors");
+    write_source(&written, &tensors);
+    let source = dir.path().join("weights.bin");
+    std::fs::rename(&written, &source).expect("renames the fixture");
+
+    let out = dir.path().join("explicit");
+    let stats = compressr::convert(
+        ConversionConfig::new(
+            source.to_string_lossy().to_string(),
+            out.to_string_lossy().to_string(),
+            OutputFormat::Safetensors,
+        )
+        .with_input_format(InputFormat::Safetensors),
+    )
+    .expect("converts under the explicit format");
+    assert_eq!(stats.tensor_count, tensors.len());
+
+    let refused = dir.path().join("refused.gguf");
+    let err = compressr::convert(
+        ConversionConfig::new(
+            source.to_string_lossy().to_string(),
+            refused.to_string_lossy().to_string(),
+            OutputFormat::Gguf,
+        )
+        .with_input_format(InputFormat::Gguf),
+    )
+    .expect_err("the input is not GGUF");
+    let err = format!("{err:#}");
+    assert!(err.contains("given as Gguf"), "{err}");
+    assert!(err.contains("GGUF magic"), "{err}");
+    assert!(
+        !refused.exists(),
+        "the refusal must precede any output file"
+    );
+}

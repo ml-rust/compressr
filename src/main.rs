@@ -28,41 +28,16 @@
 //! # encodings: the same bytes a GGUF q4_k_m run writes, in TCF's container
 //! compressr convert model/ --format tcf --quantization q4_k_m
 //!
-//! # Or into TCF's native encodings
-//! compressr convert model/ --format tcf --tcf-encoding q4s32t64 \
-//!     --tcf-preferred-encoding q4s32t64
-//!
-//! # Or let a profile allocate the encodings, mixed precision
-//! compressr convert model/ --format tcf --tcf-profile balanced
-//!
-//! # Override every encoding's default objective with one of your own
-//! compressr convert model/ --format tcf --tcf-profile balanced \
-//!     --tcf-objective rms-plus-abs
-//!
 //! # Weight the quantizer by an importance matrix. OPTIONAL: without the flag
 //! # the conversion writes exactly the bytes it always wrote
 //! compressr convert model/ --format gguf --quantization q4_k_m \
 //!     --imatrix model.imatrix
-//! compressr convert model/ --format tcf --tcf-profile balanced \
+//! compressr convert model/ --format tcf --quantization q4_k_m \
 //!     --imatrix model.imatrix
 //!
-//! # A TCF importance defaults to the product ggml's K-quant imatrix path
-//! # minimizes. Name the other form to score a measured tensor by the
-//! # importance alone, which is what ggml's Q6_K path does
-//! compressr convert model/ --format tcf --tcf-profile balanced \
-//!     --imatrix model.imatrix --tcf-importance combined
-//!
-//! # Widen the TCF quantizer's candidate-scale search. A wider search tries
-//! # every candidate the standard search tries, plus more, so it can only
-//! # match or improve the fit under the encoder's error objective, at the
-//! # cost of conversion time only. That is not a promise of a better model:
-//! # measure before pairing it with --imatrix
-//! compressr convert model/ --format tcf --tcf-profile balanced \
-//!     --tcf-search wide
-//!
-//! # Rank that profile's bump set by a measured task-metric delta instead of
-//! # by the weight-error screen
-//! compressr convert model/ --format tcf --tcf-profile balanced \
+//! # Rank a mix's promotions by a measured task-metric delta instead of by
+//! # llama.cpp's positional rules, at the same byte budget
+//! compressr convert model/ --format tcf --quantization q4_k_m \
 //!     --sensitivity sensitivity.jsonl
 //!
 //! # Shard the output at 2 GB instead of the 5 GB default
@@ -77,17 +52,17 @@
 //! compressr info model.tcf --verbose
 //! ```
 //!
-//! The `optimize` subcommand parses its flags but every method it accepts —
-//! GPTQ, AWQ, NF4, FP8 — is unimplemented, so it always errors. It exists for
-//! the CLI surface, not for use.
+//! The `optimize` subcommand always errors and writes nothing. Every method it
+//! names (GPTQ, AWQ, EXL2, NF4, FP8) is a roadmap item. A flat GGUF method
+//! passed to it is refused with the `convert` command that writes it.
 
 mod quant_arg;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use compressr::{
-    parse_sensitivity, ConversionConfig, ImportanceMatrix, OutputFormat, QuantizationConfig,
-    QuantizationMethod, SensitivityMeasurement,
+    parse_sensitivity, ConversionConfig, ImportanceMatrix, OutputFormat, QuantizationMethod,
+    SensitivityMeasurement, GGUF_MIX_NAMES,
 };
 use quant_arg::parse_quantization;
 
@@ -108,7 +83,7 @@ enum Commands {
         #[arg(value_name = "INPUT")]
         input: String,
 
-        /// Output format (gguf, safetensors, tcf, awq, gptq, exl2, fp8)
+        /// Output format (gguf, safetensors, tcf). awq, gptq, exl2 and fp8 are roadmap and error
         #[arg(long, value_name = "FORMAT")]
         format: String,
 
@@ -116,7 +91,7 @@ enum Commands {
         #[arg(short, long, value_name = "PATH")]
         output: Option<String>,
 
-        /// Quantization level (q4_0, q4_1, q8_0, q2_k, q3_k, q4_k, q5_k, q6_k, iq4_nl, iq4_xs, nf4, fp8)
+        /// Quantization level (q4_0, q4_1, q8_0, q2_k, q3_k, q4_k, q5_k, q6_k, iq4_nl, iq4_xs)
         ///
         /// Also accepts llama.cpp's mixed-precision names — q4_k_s, q4_k_m,
         /// q5_k_s, q5_k_m — which assign a different GGUF block format to
@@ -207,49 +182,19 @@ enum Commands {
         verbose: bool,
     },
 
-    /// Advanced calibration-based compression (GPTQ, AWQ)
+    /// Calibration-based compression (GPTQ, AWQ, EXL2, NF4, FP8). Roadmap: always errors
+    ///
+    /// Every method is a roadmap item, so this subcommand writes nothing and
+    /// exits with an error that names the method. Flat GGUF quantization
+    /// (q4_0, q4_k, ...) runs through `convert --quantization`.
     Optimize {
         /// Input model path
         #[arg(value_name = "INPUT")]
         input: String,
 
-        /// Quantization method (gptq, awq, nf4, fp8)
+        /// Quantization method (gptq, awq, exl2, nf4, fp8). Each one errors
         #[arg(long, value_name = "METHOD")]
         method: String,
-
-        /// Number of bits (2, 3, 4, 8)
-        #[arg(long, value_name = "BITS", default_value = "4")]
-        bits: u8,
-
-        /// Group size for quantization
-        #[arg(long, value_name = "SIZE", default_value = "128")]
-        group_size: usize,
-
-        /// Calibration dataset (wikitext2, c4, ptb)
-        #[arg(long, value_name = "DATASET")]
-        calib_dataset: Option<String>,
-
-        /// Number of calibration samples
-        #[arg(long, value_name = "N", default_value = "128")]
-        calib_samples: usize,
-
-        /// Output path
-        #[arg(long, value_name = "PATH")]
-        out: String,
-
-        /// Device for calibration (cpu, cuda:0, etc.)
-        #[arg(long, value_name = "DEVICE", default_value = "cpu")]
-        device: String,
-
-        /// Largest size of one output shard (e.g. 5GB, 500MB, 1GiB)
-        ///
-        /// Pass "none" to write one file however large.
-        #[arg(long, value_name = "SIZE", default_value = "5GB")]
-        max_shard_size: String,
-
-        /// Verbose output
-        #[arg(short, long)]
-        verbose: bool,
     },
 
     /// Display model information
@@ -424,57 +369,8 @@ fn main() -> Result<()> {
             }
         }
 
-        Commands::Optimize {
-            input,
-            method,
-            bits,
-            group_size,
-            calib_dataset,
-            calib_samples,
-            out,
-            device,
-            max_shard_size,
-            verbose,
-        } => {
-            let method = parse_method(&method)?;
-            let max_shard_size = compressr::parse_shard_size(&max_shard_size)?;
-            let output_format = match method {
-                QuantizationMethod::Gptq => OutputFormat::Gptq,
-                QuantizationMethod::Awq => OutputFormat::Awq,
-                QuantizationMethod::Nf4 => OutputFormat::Safetensors,
-                QuantizationMethod::Fp8 => OutputFormat::Fp8,
-                QuantizationMethod::Q4_0
-                | QuantizationMethod::Q4_1
-                | QuantizationMethod::Q8_0
-                | QuantizationMethod::Q2K
-                | QuantizationMethod::Q3K
-                | QuantizationMethod::Q4K
-                | QuantizationMethod::Q5K
-                | QuantizationMethod::Q6K
-                | QuantizationMethod::IQ4NL
-                | QuantizationMethod::IQ4XS
-                | QuantizationMethod::PQ2_0
-                | QuantizationMethod::PTQ1_0 => OutputFormat::Gguf,
-            };
-
-            let quant_config = QuantizationConfig {
-                method,
-                bits,
-                group_size,
-                calibration_dataset: calib_dataset,
-                calibration_samples: calib_samples,
-            };
-
-            let config = ConversionConfig::new(input, out, output_format)
-                .with_quantization(quant_config)
-                .with_max_shard_size(max_shard_size)
-                .with_verbose(verbose);
-
-            log::info!("Optimization method: {:?}", method);
-            log::info!("Target device: {}", device);
-
-            let stats = compressr::convert(config)?;
-            println!("\n{}", stats);
+        Commands::Optimize { input, method } => {
+            return Err(optimize_refusal(&input, &method));
         }
 
         Commands::Info {
@@ -617,7 +513,8 @@ fn parse_format(s: &str) -> Result<OutputFormat> {
         "safetensors" | "st" => Ok(OutputFormat::Safetensors),
         "tcf" => Ok(OutputFormat::Tcf),
         _ => anyhow::bail!(
-            "Unsupported format: {}. Supported: gguf, safetensors, tcf, awq, gptq, exl2, fp8",
+            "Unsupported format: {}. Supported: gguf, safetensors, tcf. Roadmap, refused \
+             before any file is written: awq, gptq, exl2, fp8",
             s
         ),
     }
@@ -638,22 +535,63 @@ fn read_imatrix(path: &str) -> Result<ImportanceMatrix> {
     compressr::read_importance_matrix(std::path::Path::new(path))
 }
 
-fn parse_method(s: &str) -> Result<QuantizationMethod> {
-    match s.to_lowercase().as_str() {
-        "gptq" => Ok(QuantizationMethod::Gptq),
-        "awq" => Ok(QuantizationMethod::Awq),
-        "nf4" => Ok(QuantizationMethod::Nf4),
-        "fp8" => Ok(QuantizationMethod::Fp8),
-        "q4_0" => Ok(QuantizationMethod::Q4_0),
-        "q4_1" => Ok(QuantizationMethod::Q4_1),
-        "q8_0" => Ok(QuantizationMethod::Q8_0),
-        "q2_k" | "q2k" => Ok(QuantizationMethod::Q2K),
-        "q3_k" | "q3k" => Ok(QuantizationMethod::Q3K),
-        "q4_k" | "q4k" => Ok(QuantizationMethod::Q4K),
-        "q5_k" | "q5k" => Ok(QuantizationMethod::Q5K),
-        "q6_k" | "q6k" => Ok(QuantizationMethod::Q6K),
-        _ => anyhow::bail!("Unsupported method: {}. Supported: gptq, awq, nf4, fp8, q4_0, q4_1, q8_0, q2_k, q3_k, q4_k, q5_k, q6_k", s),
+/// The roadmap methods `optimize` names, each with what it is missing.
+const OPTIMIZE_ROADMAP: [(&str, &str); 5] = [
+    (
+        "gptq",
+        "calibration, plus the qweight/scales/qzeros/g_idx tensor layout",
+    ),
+    (
+        "awq",
+        "calibration, plus the qweight/scales/qzeros/g_idx tensor layout",
+    ),
+    ("exl2", "the whole format driver"),
+    (
+        "nf4",
+        "an on-disk home for the side-band scales the packed payload omits",
+    ),
+    (
+        "fp8",
+        "an on-disk home for the side-band scales the packed payload omits",
+    ),
+];
+
+/// The error `optimize` returns for every method.
+///
+/// `optimize` writes nothing. A roadmap method is refused with what it is
+/// missing. A flat GGUF method, a lowbit repack or a mix is pointed at the
+/// `convert` command that writes it. Any other name is refused with the
+/// roadmap list and the same pointer.
+fn optimize_refusal(input: &str, method: &str) -> anyhow::Error {
+    let lowered = method.to_lowercase();
+    let convert_hint = format!(
+        "Flat GGUF quantization runs through convert: `compressr convert {input} --format \
+         gguf --quantization <LEVEL>`, with LEVEL one of {}, or a mix: {}.",
+        QuantizationMethod::quantize_names().join(", "),
+        GGUF_MIX_NAMES.join(", ")
+    );
+
+    if let Some((name, missing)) = OPTIMIZE_ROADMAP.iter().find(|(name, _)| *name == lowered) {
+        return anyhow::anyhow!(
+            "optimize --method {name} is not implemented: compressr is missing {missing}. \
+             No output was written. {convert_hint}"
+        );
     }
+
+    if parse_quantization(&lowered).is_ok() {
+        return anyhow::anyhow!(
+            "optimize --method {method} is refused: optimize runs calibration-based methods \
+             only, and every one of them is a roadmap item. No output was written. Run \
+             `compressr convert {input} --format gguf --quantization {lowered}` instead."
+        );
+    }
+
+    let roadmap: Vec<&str> = OPTIMIZE_ROADMAP.iter().map(|(name, _)| *name).collect();
+    anyhow::anyhow!(
+        "optimize --method {method} names no method. optimize names {}, and each is a \
+         roadmap item that errors. No output was written. {convert_hint}",
+        roadmap.join(", ")
+    )
 }
 
 #[cfg(test)]
@@ -816,6 +754,68 @@ mod tests {
             }
             _ => panic!("expected the convert subcommand"),
         }
+    }
+
+    /// `optimize` refuses every method, and the error names it. A flat GGUF
+    /// method used to map onto `convert` and run with --bits, --group-size
+    /// and --device silently ignored.
+    #[test]
+    fn test_optimize_refuses_every_method() {
+        let mut methods: Vec<String> = QuantizationMethod::ALL
+            .iter()
+            .map(|method| method.name().to_string())
+            .collect();
+        methods.extend(["exl2", "Q4_K", "q4_k_m", "q3_k_l", "bogus"].map(String::from));
+
+        for method in &methods {
+            let err = optimize_refusal("model/", method).to_string();
+            assert!(err.contains(method.as_str()), "{method}: {err}");
+            assert!(err.contains("No output was written"), "{method}: {err}");
+            assert!(err.contains("compressr convert model/"), "{method}: {err}");
+        }
+    }
+
+    /// A roadmap method names what it is missing. A flat method names the
+    /// exact `convert` command that writes it.
+    #[test]
+    fn test_optimize_refusal_names_the_reason() {
+        let err = optimize_refusal("model/", "GPTQ").to_string();
+        assert!(err.contains("not implemented"), "{err}");
+        assert!(err.contains("qweight"), "{err}");
+
+        let err = optimize_refusal("model/", "exl2").to_string();
+        assert!(err.contains("format driver"), "{err}");
+
+        let err = optimize_refusal("model/", "Q4_K").to_string();
+        assert!(
+            err.contains("compressr convert model/ --format gguf --quantization q4_k"),
+            "{err}"
+        );
+    }
+
+    /// The CLI takes `optimize --method` and no flag it ignores.
+    #[test]
+    fn test_optimize_parses_input_and_method_only() {
+        let cli =
+            Cli::try_parse_from(["compressr", "optimize", "model/", "--method", "gptq"]).unwrap();
+        match cli.command {
+            Commands::Optimize { input, method } => {
+                assert_eq!(input, "model/");
+                assert_eq!(method, "gptq");
+            }
+            _ => panic!("expected the optimize subcommand"),
+        }
+
+        let rejected = Cli::try_parse_from([
+            "compressr",
+            "optimize",
+            "model/",
+            "--method",
+            "gptq",
+            "--bits",
+            "4",
+        ]);
+        assert!(rejected.is_err(), "--bits has no effect and is not a flag");
     }
 
     #[test]
