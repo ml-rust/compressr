@@ -46,7 +46,8 @@ Implemented:
 | SafeTensors input  | Single file, or sharded via `model.safetensors.index.json` |
 | GGUF input         | Read back for re-conversion                                |
 | TCF input          | Read back, verified and decoded, through boostr's reader. Used for `info` and for conversion to another format |
-| PyTorch input      | One `.pt`, `.pth`, or `.bin` state dict with F32, F64, I32, or I64 tensors |
+| PyTorch input      | One `.pt`, `.pth`, or `.bin` state dict with F32, F64, I32, or I64 tensors, as a file or as `pytorch_model.bin` in a directory. Sharded PyTorch and ONNX input are refused |
+| Explicit input format | `ConversionConfig::input_format` skips auto-detection. compressr checks the input's content against it and errors on a mismatch |
 | VoxCPM2 companion  | A safetensors directory with architecture `voxcpm2` folds its audio VAE into the output under `vae.`. Float tensors are stored as F32 |
 | SafeTensors output | Sharded at `--max-shard-size`, with a matching index       |
 | GGUF output        | GGUF v3, one self-contained file                           |
@@ -77,7 +78,7 @@ Roadmap. Each capability below has an enum variant. compressr refuses each one b
 | Parallel shard I/O  | Reads and writes are sequential                                         |
 | Q2_K/Q3_K and IQ mixes, other I-quants | Mix rules for Q2_K and Q3_K, and boostr writers for IQ2, IQ3, IQ1 formats. The mixes `q2_k_s`, `q3_k_s`, `q3_k_m`, and `q3_k_l` are refused by name. Flat `q2_k` and `q3_k` are written |
 
-The `optimize` subcommand parses its flags. Every method it accepts is on the roadmap, so it always errors.
+The `optimize` subcommand takes `--method` only. It always errors and writes no file. Every method it names (GPTQ, AWQ, EXL2, NF4, FP8) is on the roadmap. A flat GGUF method passed to it is refused with the `convert` command that writes it.
 
 SafeTensors output is never quantized. Block quantization writes GGUF, or TCF with `--format tcf`.
 
@@ -92,7 +93,7 @@ cp .cargo/config.toml.example .cargo/config.toml
 cargo install --path .
 ```
 
-Add `--features cuda` to `cargo install` for GPU-accelerated quantization through boostr.
+compressr runs every boostr kernel on the CPU. It has no GPU path.
 
 Convert a checkpoint to a quantized GGUF file:
 

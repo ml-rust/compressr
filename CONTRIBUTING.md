@@ -17,7 +17,6 @@ Then run these commands from the `compressr` directory:
 ```bash
 cargo build --release
 cargo test
-cargo test --features cuda
 ```
 
 ## Conventions

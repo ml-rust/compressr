@@ -9,7 +9,7 @@ compressr converts LLM checkpoints between SafeTensors and GGUF, casts their ele
 - **Unified Pipeline**: Single entry point for all conversion needs (no switching between llama.cpp scripts, AutoGPTQ Python modules, exllamav2 converters)
 - **Performance First**: Pure Rust for bare-metal performance, no Python runtime in the conversion path
 - **Minimal Footprint**: One tensor is read, converted and written at a time, so peak memory is bounded by the largest tensor plus its converted copy, not by the model size
-- **Hardware Acceleration**: Direct boostr integration for GPU-accelerated quantization
+- **CPU only**: every boostr call runs on `CpuRuntime`. There is no GPU path and no `cuda` feature
 
 ## Implemented vs Roadmap
 
@@ -22,7 +22,8 @@ This section is the SINGLE source of truth on what works. Everything below assum
 | SafeTensors input  | Single file, or sharded via `model.safetensors.index.json` |
 | GGUF input         | Read back for re-conversion                                |
 | TCF input          | Read back through boostr's reader: directory, and payloads verified and decoded |
-| PyTorch input      | One `.pt` / `.pth` / `.bin` state dict, F32, F64, I32 and I64 tensors |
+| PyTorch input      | One `.pt` / `.pth` / `.bin` state dict, as a file or as `pytorch_model.bin` in a directory, F32, F64, I32 and I64 tensors. Sharded PyTorch and ONNX input are refused (roadmap) |
+| Explicit input format | `ConversionConfig::input_format` skips auto-detection. `load` checks the input's content against it and errors on a mismatch, before any output file is created |
 | VoxCPM2 companion  | A safetensors directory whose architecture is `voxcpm2` (by `config.json` or `--arch`) folds `audiovae.safetensors`, else `audiovae.pth`, into the same GGUF or TCF: every tensor under `vae.` (`vae.decoder.*`, `vae.encoder.*`), weight-norm pairs folded, float tensors stored F32 whatever the quantization or dtype cast, the I32 boundaries vector copied through. GGUF also carries `config.json` verbatim as the `voxcpm2.config_json` string key and `tokenizer.json` verbatim as the `tokenizer.huggingface.json` string key, each only when the file exists. boostr loads the VAE, config and tokenizer from that one file and needs nothing beside it. No other architecture gains a companion |
 | SafeTensors output | Sharded at `--max-shard-size`, with a matching index       |
 | GGUF output        | GGUF v3, one self-contained file                           |
@@ -52,9 +53,9 @@ This section is the SINGLE source of truth on what works. Everything below assum
 | Python API          | The PyO3 module exports `__version__` only                              |
 | Triple-buffered I/O | A prefetch/compute/write pipeline; reads and writes are serial today    |
 | Parallel shard I/O  | Reads and writes are sequential                                         |
-| Q2_K/Q3_K mixes, IQ mixes, other I-quants | Mix rules for Q2_K/Q3_K and for IQ mixes, and boostr WRITERS for IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S and IQ1_M. IQ4_NL and IQ4_XS are written flat; `q2_k`, `q2_k_s`, `q3_k_s`, `q3_k_m` and `q3_k_l` are refused by name |
+| Q2_K/Q3_K mixes, IQ mixes, other I-quants | Mix rules for Q2_K/Q3_K and for IQ mixes, and boostr WRITERS for IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S and IQ1_M. IQ4_NL and IQ4_XS are written flat, and so are `q2_k` and `q3_k`; the mixes `q2_k_s`, `q3_k_s`, `q3_k_m` and `q3_k_l` are refused by name |
 
-The `optimize` subcommand parses its flags but every method it accepts is a roadmap item, so it always errors.
+The `optimize` subcommand takes `--method` only and ALWAYS errors without writing a file. Every method it names (GPTQ, AWQ, EXL2, NF4, FP8) is a roadmap item. A flat GGUF method passed to it is refused with the `convert` command that writes it.
 
 SafeTensors output is NEVER quantized: its header records an element type and a shape, which cannot describe a block-quantized tensor. Block quantization writes GGUF, or TCF with `--format tcf`.
 
@@ -64,10 +65,8 @@ TCF is produced from a full-precision source ONLY. NEVER add a GGUF-to-TCF or TC
 
 ```bash
 cd compressr
-cargo build --release                            # CPU-only build
-cargo build --release --features cuda            # With CUDA support
+cargo build --release                            # Build
 cargo test                                       # Run tests
-cargo test --features cuda                       # CUDA tests
 
 # CLI usage
 compressr convert ./llama-3-8b --format gguf --quantization q4_k_m
@@ -108,7 +107,6 @@ Tensors are processed one at a time: read, quantize or cast, write, drop both bu
 
 ## Feature Flags
 
-- `cuda` - Enable CUDA GPU acceleration
 - `python` - Build Python bindings via PyO3
 
 ## Architecture Philosophy: Thin Layer on boostr
@@ -143,12 +141,11 @@ Targets, not measurements. NEVER quote one as an achieved result.
 
 ```bash
 cargo test                    # Rust unit and integration tests
-cargo test --features cuda    # CUDA-accelerated tests
 ```
 
 ## Integration with Ecosystem
 
 - **Input**: Models trained with oxidizr or HuggingFace
 - **Output**: GGUF for blazr or llama.cpp; SafeTensors checkpoints for HuggingFace loaders; TCF for boostr, which reads TCF and never writes it
-- **Compute**: boostr's multi-backend GPU acceleration
+- **Compute**: boostr's CPU kernels
 - **Tokenization**: Compatible with splintr vocabularies
