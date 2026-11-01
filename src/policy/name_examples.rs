@@ -8,7 +8,7 @@
 /// How many names one list shows before it is summarized.
 const EXAMPLE_NAMES: usize = 5;
 
-/// Up to [`EXAMPLE_NAMES`] names, quoted, with a count of the rest.
+/// Up to `EXAMPLE_NAMES` names, quoted, with a count of the rest.
 pub fn examples(names: &[&str]) -> String {
     let shown: Vec<String> = names
         .iter()

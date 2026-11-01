@@ -6,7 +6,7 @@
 //! the same output, so the loader opens the companion when the input is a
 //! safetensors directory whose architecture is VoxCPM2 and chains it into
 //! enumeration and lookup with every name under
-//! [`AUDIO_VAE_PREFIX`](crate::policy::AUDIO_VAE_PREFIX). The
+//! [`AUDIO_VAE_PREFIX`]. The
 //! output writer's duplicate-name check stays the guard against a
 //! collision; the prefix keeps one from happening.
 //!

@@ -53,7 +53,7 @@ impl Quantizer {
     ///
     /// # Arguments
     /// * `data` - Raw tensor bytes (F32, F16, or BF16)
-    /// * `shape` - Tensor shape [rows, cols] or [numel]
+    /// * `shape` - Tensor shape `[rows, cols]` or `[numel]`
     /// * `dtype` - Original data type
     pub fn quantize_tensor(
         &self,
@@ -74,7 +74,7 @@ impl Quantizer {
     ///
     /// # Arguments
     /// * `data` - Raw tensor bytes (F32, F16, or BF16)
-    /// * `shape` - Tensor shape [rows, cols] or [numel]
+    /// * `shape` - Tensor shape `[rows, cols]` or `[numel]`
     /// * `dtype` - Original data type
     /// * `quant_type` - The format to pack into
     pub fn quantize_tensor_as(

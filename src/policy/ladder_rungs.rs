@@ -4,7 +4,7 @@
 //! A menu arrives in any order and may hold options no allocation should ever
 //! choose. What the greedy in [`super::ladder`] needs is a LADDER: bytes
 //! strictly increasing, damage strictly decreasing, so that every step has a
-//! defined and positive marginal ratio. [`prune`] is what turns one into the
+//! defined and positive marginal ratio. `prune` is what turns one into the
 //! other, and the count it returns is the number of steps refused for buying
 //! nothing.
 

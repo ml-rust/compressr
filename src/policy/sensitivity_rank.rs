@@ -79,7 +79,7 @@ pub struct MeasuredBump {
 /// Rank the candidates by measured damage per element and spend the budget.
 ///
 /// The budget is `fraction` of every candidate's elements, including the ones
-/// the measurement excludes, which is how [`super::allocation::select_bumped`]
+/// the measurement excludes, which is how `allocation::select_bumped`
 /// counts it. The tensor that crosses the budget is taken, for the same
 /// reason: a single tensor larger than the whole budget must still be bumped
 /// rather than rounded away.

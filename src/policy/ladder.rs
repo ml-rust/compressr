@@ -33,7 +33,7 @@
 //!
 //! A DOMINATED option — one costing at least as many bytes as another option
 //! of the same tensor for at least as much damage — is dropped by
-//! [`super::ladder_rungs::prune`] before any ranking, so it can never occupy a
+//! `ladder_rungs::prune` before any ranking, so it can never occupy a
 //! step. That is also where a step whose damage reduction is not positive is
 //! counted and refused: spending bytes to make the metric worse is wrong with
 //! any budget left. What remains per tensor is a strictly increasing byte
