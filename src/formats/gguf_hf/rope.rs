@@ -185,12 +185,14 @@ fn llama3_factors(config: &HfConfig, params: &Map<String, Value>) -> Option<Vec<
     let low_wavelen = old_context / low;
     let high_wavelen = old_context / high;
     // llama.cpp runs this loop over float32 torch tensors, so every step is
-    // float32 arithmetic. The same steps in f32 give the same bits.
+    // float32 arithmetic. The power runs in f64 and rounds once to f32, because
+    // the platform `powf` differs by one ulp between libm implementations.
     let two_pi = (2.0 * std::f64::consts::PI) as f32;
     let factors = (0..dim / 2)
         .map(|i| {
             let exponent = (2 * i) as f32 / dim as f32;
-            let freq = 1.0f32 / (base as f32).powf(exponent);
+            let power = f64::from(base as f32).powf(f64::from(exponent)) as f32;
+            let freq = 1.0f32 / power;
             let wavelen = two_pi / freq;
             if wavelen < high_wavelen {
                 1.0
