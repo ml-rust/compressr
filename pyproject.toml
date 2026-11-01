@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "compressr"
-version = "0.1.0"
+version = "0.2.0"
 description = "High-performance model conversion and compression suite"
 authors = [{name = "Farhan Syah"}]
 license = {text = "Apache-2.0"}
