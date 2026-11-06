@@ -4,6 +4,12 @@ All notable changes to compressr are documented here. The format follows [Keep a
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-06
+
+### Changed
+
+- `README`, crate description: state what the crate does.
+
 ## [0.2.0] - 2026-11-01
 
 compressr writes TCF, reads TCF and PyTorch input, and adds GGUF formats, mixes and allocation controls.

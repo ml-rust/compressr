@@ -1,6 +1,6 @@
 [package]
 name = "compressr"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 authors = ["Farhan Syah"]
 description = "GGUF quantization and LLM model conversion in Rust: converts SafeTensors, GGUF, TCF and PyTorch checkpoints, with no Python"
