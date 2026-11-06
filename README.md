@@ -2,7 +2,7 @@
 
 # compressr
 
-<h3>Model conversion and quantization for LLM checkpoints.</h3>
+<h3>GGUF quantization and model conversion for LLM checkpoints, in Rust.</h3>
 
 <p>
 Converts SafeTensors, GGUF, TCF, and PyTorch checkpoints to GGUF, TCF, or SafeTensors, and quantizes to GGUF block formats. It reads one tensor at a time.
@@ -35,7 +35,13 @@ Converts SafeTensors, GGUF, TCF, and PyTorch checkpoints to GGUF, TCF, or SafeTe
 
 </div>
 
-compressr is a Rust CLI and library. It converts LLM checkpoints between formats, casts their element type, and quantizes them into GGUF block formats. Its kernels and block layouts live in [boostr](https://github.com/ml-rust/boostr). compressr handles file I/O, planning, and the command line.
+compressr is a Rust CLI and library. It converts LLM checkpoints between formats, casts their element type, and quantizes them into GGUF block formats. It writes the GGUF header that llama.cpp's `convert_hf_to_gguf.py` writes, for the architectures listed under [GGUF headers](#gguf-headers-from-huggingface-checkpoints).
+
+- Language: the conversion path is Rust. It needs no Python. The optional `python` feature builds a PyO3 module that exports `__version__` only.
+- Hardware: CPU only. There is no GPU path.
+- Built on: [boostr](https://github.com/ml-rust/boostr) holds the kernels and block layouts. compressr handles file I/O, planning, and the command line.
+- Used for: models that [blazr](https://github.com/ml-rust/blazr) serves.
+- Not supported yet: GPTQ, AWQ, EXL2, NF4, FP8, ONNX input, sharded PyTorch input, and PyTorch F16 and BF16 tensors. See [Status](#status).
 
 ## Status
 
@@ -86,7 +92,7 @@ TCF comes from a full-precision checkpoint only. A GGUF or TCF input is refused 
 
 ## Quick Start
 
-compressr depends on `boostr` by path, so it builds inside the `rust-llm` monorepo checkout, not standalone. Copy the local build overrides first. The file is gitignored.
+compressr needs a Rust toolchain. `Cargo.toml` takes `boostr` from crates.io. A checkout beside unreleased sibling crates needs the local build overrides first. The file is gitignored.
 
 ```bash
 cp .cargo/config.toml.example .cargo/config.toml
